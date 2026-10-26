@@ -1,0 +1,403 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>createmoney — strategy-flow viewer</title>
+<link rel="icon" href="data:,">
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #05070f;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; color: #dbe4f3; }
+  #scene { position: fixed; inset: 0; width: 100%; height: 100%; display: block; }
+  #hud { position: fixed; top: 12px; left: 12px; max-width: min(360px, 70vw);
+    background: rgba(8, 12, 24, .78); border: 1px solid #1e293b; border-radius: 10px;
+    padding: 10px 12px; font-size: 12px; line-height: 1.5; backdrop-filter: blur(4px); }
+  #hud h1 { margin: 0 0 4px; font-size: 13px; letter-spacing: .04em; color: #7dd3fc; }
+  #hud .row { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
+  #hud button { background: #0f172a; color: #dbe4f3; border: 1px solid #334155;
+    border-radius: 6px; font: inherit; font-size: 11px; padding: 4px 8px; cursor: pointer; }
+  #hud button[aria-pressed="true"] { border-color: currentColor; background: #1e293b; }
+  #detail { position: fixed; top: 12px; right: 12px; width: min(300px, 70vw);
+    background: rgba(8, 12, 24, .82); border: 1px solid #1e293b; border-radius: 10px;
+    padding: 10px 12px; font-size: 12px; line-height: 1.6; }
+  #detail h2 { margin: 0 0 4px; font-size: 13px; color: #fcd34d; text-transform: capitalize; }
+  #replay { position: fixed; left: 50%; transform: translateX(-50%); bottom: 12px;
+    width: min(560px, 92vw); background: rgba(8, 12, 24, .78);
+    border: 1px solid #1e293b; border-radius: 10px; padding: 8px 12px;
+    display: flex; gap: 10px; align-items: center; font-size: 12px; }
+  #replay input[type="range"] { flex: 1; }
+  #err { position: fixed; left: 50%; transform: translateX(-50%); top: 12px;
+    background: #7f1d1d; color: #fecaca; border-radius: 8px; padding: 8px 14px;
+    font-size: 12px; display: none; max-width: 92vw; }
+  @media (max-width: 640px) {
+    #detail { display: none; }
+    #detail.open { display: block; top: auto; bottom: 76px; }
+    #hud { font-size: 11px; padding: 8px 10px; }
+  }
+</style>
+<script type="importmap">
+  { "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+  } }
+</script>
+</head>
+<body>
+<canvas id="scene"></canvas>
+<div id="hud">
+  <h1>strategy-flow</h1>
+  <div id="status">connecting…</div>
+  <div class="row" id="filters"></div>
+  <div class="row"><button id="liveBtn" aria-pressed="true">live</button></div>
+</div>
+<div id="detail"><h2>venues</h2><div id="detailBody">Click a venue node for detail. Drag to orbit, scroll to zoom.</div></div>
+<div id="replay">
+  <span id="replayLabel">all</span>
+  <input id="replayRange" type="range" min="0" max="0" value="0" aria-label="replay position">
+</div>
+<div id="err" role="alert"></div>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+
+// ---------- config ----------
+const STRATS = {
+  cross_exchange: 0x22d3ee,
+  triangular: 0xe879f9,
+  funding_rate: 0xfbbf24,
+  cex_dex: 0x34d399,
+};
+const CEX = ['binance', 'bybit', 'okx', 'indodax'];
+const DEX = ['uniswap', 'pancakeswap', 'jupiter'];
+const RENDER_CAP = 80; // newest trades drawn when replay is at head
+const POLL_MS = 2500;
+const REDUCED = matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+// ---------- helpers ----------
+const $ = (id) => document.getElementById(id);
+function showErr(msg) { const e = $('err'); e.style.display = 'block'; e.textContent = msg; }
+window.addEventListener('error', (ev) => showErr('viewer error: ' + (ev.message || 'unknown')));
+window.addEventListener('unhandledrejection', (ev) => showErr('viewer error: ' + (ev.reason || 'unknown')));
+function venuePos(name, out) {
+  const ci = CEX.indexOf(name), di = DEX.indexOf(name);
+  if (ci >= 0) { const a = ci * Math.PI / 2; return out.set(Math.cos(a) * 9, 0, Math.sin(a) * 9); }
+  if (di >= 0) { const a = di * Math.PI * 2 / 3 + Math.PI / 6; return out.set(Math.cos(a) * 4.5, 2.5, Math.sin(a) * 4.5); }
+  return out.set(0, 5, 0);
+}
+// ---------- renderer and scene ----------
+const canvas = $('scene');
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x05070f);
+scene.fog = new THREE.FogExp2(0x05070f, 0.016);
+const pmrem = new THREE.PMREMGenerator(renderer);
+scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
+const camera = new THREE.PerspectiveCamera(55, innerWidth / innerHeight, 0.1, 300);
+camera.position.set(14, 12, 18);
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.maxPolarAngle = Math.PI * 0.495;
+controls.minDistance = 6;
+controls.maxDistance = 60;
+if (!REDUCED) controls.autoRotate = true;
+controls.autoRotateSpeed = 0.5;
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+
+// ---------- light ----------
+scene.add(new THREE.HemisphereLight(0x8fb8ff, 0x0b1020, 0.55));
+const key = new THREE.DirectionalLight(0xffffff, 1.6);
+key.position.set(12, 20, 8);
+key.castShadow = true;
+key.shadow.mapSize.set(2048, 2048);
+key.shadow.camera.left = -20; key.shadow.camera.right = 20;
+key.shadow.camera.top = 20; key.shadow.camera.bottom = -20;
+scene.add(key);
+const rim = new THREE.DirectionalLight(0x67e8f9, 0.5);
+rim.position.set(-14, 6, -12);
+scene.add(rim);
+
+// ---------- world layers: ground, grid, far silhouettes, drift ----------
+{
+  const c = document.createElement('canvas'); c.width = c.height = 256;
+  const g = c.getContext('2d');
+  const grad = g.createRadialGradient(128, 128, 8, 128, 128, 128);
+  grad.addColorStop(0, '#16213c'); grad.addColorStop(0.55, '#0a1122'); grad.addColorStop(1, '#05070f');
+  g.fillStyle = grad; g.fillRect(0, 0, 256, 256);
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  const disc = new THREE.Mesh(
+    new THREE.CircleGeometry(34, 72),
+    new THREE.MeshStandardMaterial({ map: tex, roughness: 0.95, metalness: 0 }));
+  disc.rotation.x = -Math.PI / 2; disc.position.y = -0.6; disc.receiveShadow = true;
+  scene.add(disc);
+}
+{
+  const grid = new THREE.GridHelper(60, 60, 0x1e3a5f, 0x111c33);
+  grid.position.y = -0.55;
+  grid.material.transparent = true; grid.material.opacity = 0.5;
+  scene.add(grid);
+}
+const drift = (() => {
+  const n = 220, pos = new Float32Array(n * 3);
+  for (let i = 0; i < n; i++) {
+    pos[i * 3] = (Math.random() - 0.5) * 60;
+    pos[i * 3 + 1] = Math.random() * 14 + 0.5;
+    pos[i * 3 + 2] = (Math.random() - 0.5) * 60;
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  const c = document.createElement('canvas'); c.width = c.height = 64;
+  const g = c.getContext('2d');
+  const grad = g.createRadialGradient(32, 32, 2, 32, 32, 30);
+  grad.addColorStop(0, 'rgba(148,197,255,1)'); grad.addColorStop(1, 'rgba(148,197,255,0)');
+  g.fillStyle = grad; g.fillRect(0, 0, 64, 64);
+  const mat = new THREE.PointsMaterial({ size: 0.5, map: new THREE.CanvasTexture(c),
+    transparent: true, opacity: 0.55, depthWrite: false });
+  const pts = new THREE.Points(geo, mat);
+  scene.add(pts);
+  return pts;
+})();
+{ // far silhouette ring: dark venue towers fading into haze
+  const mat = new THREE.MeshStandardMaterial({ color: 0x0d1730, roughness: 1 });
+  const geo = new THREE.BoxGeometry(1.4, 1, 1.4);
+  for (let i = 0; i < 40; i++) {
+    const a = i / 40 * Math.PI * 2, h = 2 + (i * 37 % 7);
+    const m = new THREE.Mesh(geo, mat);
+    m.position.set(Math.cos(a) * 27, h / 2 - 0.6, Math.sin(a) * 27);
+    m.scale.y = h; m.rotation.y = a;
+    scene.add(m);
+  }
+}
+// ---------- venue nodes ----------
+const nodeGroup = new THREE.Group();
+scene.add(nodeGroup);
+const pickables = [];
+function labelSprite(text, color) {
+  const c = document.createElement('canvas'); c.width = 256; c.height = 64;
+  const g = c.getContext('2d');
+  g.font = 'bold 30px ui-monospace, monospace';
+  g.textAlign = 'center'; g.textBaseline = 'middle';
+  g.shadowColor = '#000'; g.shadowBlur = 8;
+  g.fillStyle = color; g.fillText(text.toUpperCase(), 128, 32);
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  const sp = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, transparent: true, depthWrite: false }));
+  sp.scale.set(3.4, 0.85, 1);
+  return sp;
+}
+{
+  const v = new THREE.Vector3();
+  for (const name of [...CEX, ...DEX]) {
+    venuePos(name, v);
+    const isDex = DEX.includes(name);
+    const body = new THREE.Mesh(
+      new THREE.CylinderGeometry(isDex ? 0.55 : 0.9, isDex ? 0.75 : 1.15, isDex ? 1.5 : 2.2, 24),
+      new THREE.MeshStandardMaterial({ color: isDex ? 0x0f766e : 0x1d4ed8,
+        roughness: 0.35, metalness: 0.75 }));
+    body.position.copy(v); body.position.y += isDex ? 0.75 : 1.1;
+    body.castShadow = true; body.receiveShadow = true;
+    body.userData.venue = name;
+    const ring = new THREE.Mesh(
+      new THREE.TorusGeometry(isDex ? 1.0 : 1.5, 0.06, 10, 48),
+      new THREE.MeshStandardMaterial({ color: isDex ? 0x2dd4bf : 0x60a5fa,
+        roughness: 0.4, metalness: 0.4, emissive: isDex ? 0x0d3b37 : 0x0c1e4b }));
+    ring.position.copy(v); ring.position.y += 0.05;
+    ring.rotation.x = -Math.PI / 2;
+    const label = labelSprite(name, isDex ? '#5eead4' : '#93c5fd');
+    label.position.copy(v); label.position.y += isDex ? 2.6 : 3.4;
+    nodeGroup.add(body, ring, label);
+    pickables.push(body);
+  }
+}
+// ---------- picking + detail ----------
+const raycaster = new THREE.Raycaster();
+const pointer = new THREE.Vector2();
+let selected = null;
+function venueStats(name) {
+  const rel = state.flows.filter((t) =>
+    (t.intent.legs || []).some((l) => String(l.venue || '').toLowerCase() === name));
+  const byStrat = {};
+  let lastEdge = null;
+  for (const t of rel) {
+    const s = t.intent.strategy;
+    byStrat[s] = (byStrat[s] || 0) + 1;
+    lastEdge = t.intent.expected_edge_bps;
+  }
+  return { n: rel.length, byStrat, lastEdge };
+}
+function selectVenue(name) {
+  selected = name;
+  const box = $('detail');
+  if (innerWidth <= 640) box.classList.add('open');
+  if (!name) { $('detailBody').textContent = 'Click a venue node for detail. Drag to orbit, scroll to zoom.'; return; }
+  const s = venueStats(name);
+  const rows = Object.entries(s.byStrat).map(([k, v]) => `${k}: ${v}`).join('<br>') || 'no flows yet';
+  $('detailBody').innerHTML = `<b>${name}</b> — ${DEX.includes(name) ? 'DEX' : 'CEX'}<br>` +
+    `flows: ${s.n}<br>${rows}<br>last edge: ${s.lastEdge ?? '—'} bps`;
+}
+renderer.domElement.addEventListener('pointerdown', (ev) => {
+  pointer.x = (ev.clientX / innerWidth) * 2 - 1;
+  pointer.y = -(ev.clientY / innerHeight) * 2 + 1;
+  raycaster.setFromCamera(pointer, camera);
+  const hit = raycaster.intersectObjects(pickables, false)[0];
+  selectVenue(hit ? hit.object.userData.venue : null);
+});
+renderer.domElement.addEventListener('touchstart', (ev) => {
+  if (ev.touches.length !== 1) return;
+  const t = ev.touches[0];
+  pointer.x = (t.clientX / innerWidth) * 2 - 1;
+  pointer.y = -(t.clientY / innerHeight) * 2 + 1;
+  raycaster.setFromCamera(pointer, camera);
+  const hit = raycaster.intersectObjects(pickables, false)[0];
+  if (hit) selectVenue(hit.object.userData.venue);
+}, { passive: true });
+// ---------- state, flows, filters, replay ----------
+const state = { flows: [], total: 0, enabled: new Set(Object.keys(STRATS)), replayHead: -1, live: true };
+const flowGroup = new THREE.Group();
+scene.add(flowGroup);
+const pulses = [];
+const pulseGeo = new THREE.SphereGeometry(0.14, 12, 12);
+const pulseMats = Object.fromEntries(
+  Object.entries(STRATS).map(([k, v]) => [k, new THREE.MeshBasicMaterial({ color: v })]));
+const tmpA = new THREE.Vector3(), tmpB = new THREE.Vector3(), tmpM = new THREE.Vector3();
+function legCurve(aName, bName) {
+  venuePos(aName, tmpA); venuePos(bName, tmpB);
+  const a = tmpA.clone(), b = tmpB.clone();
+  a.y += 2.2; b.y += 2.2;
+  if (a.distanceToSquared(b) < 0.01) { // same-venue loop (funding legs)
+    tmpM.copy(a); tmpM.y += 3.2;
+    return new THREE.QuadraticBezierCurve3(a, tmpM, b.clone().add(new THREE.Vector3(0.9, 0.4, 0)));
+  }
+  tmpM.addVectors(a, b).multiplyScalar(0.5);
+  tmpM.y += a.distanceTo(b) * 0.22 + 1.0;
+  return new THREE.QuadraticBezierCurve3(a, tmpM.clone(), b);
+}
+function clearFlows() {
+  flowGroup.traverse((o) => { if (o.geometry && o.geometry !== pulseGeo) o.geometry.dispose(); });
+  flowGroup.clear();
+  pulses.length = 0;
+}
+function tradeVisible(t) { return state.enabled.has(t.intent.strategy); }
+function rebuildFlows() {
+  clearFlows();
+  let list = state.flows.filter(tradeVisible);
+  if (state.replayHead >= 0) list = list.slice(0, state.replayHead + 1);
+  list = list.slice(-RENDER_CAP);
+  for (const t of list) {
+    const strat = t.intent.strategy;
+    const color = STRATS[strat] ?? 0x94a3b8;
+    const edge = parseFloat(t.intent.expected_edge_bps || '0');
+    const radius = 0.03 + Math.min(edge, 150) / 150 * 0.09;
+    const mat = new THREE.MeshStandardMaterial({ color, roughness: 0.35, metalness: 0.2,
+      emissive: color, emissiveIntensity: 0.35 });
+    const legs = t.intent.legs || [];
+    for (let i = 0; i + 1 < legs.length; i++) {
+      const a = String(legs[i].venue || '').toLowerCase();
+      const b = String(legs[i + 1].venue || '').toLowerCase();
+      const curve = legCurve(a, b);
+      const tube = new THREE.Mesh(new THREE.TubeGeometry(curve, 32, radius, 8), mat);
+      flowGroup.add(tube);
+      if (!REDUCED && pulses.length < 240) {
+        const p = new THREE.Mesh(pulseGeo, pulseMats[strat] ?? pulseMats.cross_exchange);
+        p.userData = { curve, t: Math.random() };
+        flowGroup.add(p);
+        pulses.push(p);
+      }
+    }
+  }
+  const range = $('replayRange');
+  range.max = String(Math.max(state.flows.length - 1, 0));
+  if (state.replayHead < 0) range.value = range.max;
+  $('replayLabel').textContent = state.replayHead < 0
+    ? `all · ${list.length} shown`
+    : `#${state.replayHead + 1}/${state.flows.length}`;
+}
+{ // filter chips
+  const box = $('filters');
+  for (const [name, hex] of Object.entries(STRATS)) {
+    const b = document.createElement('button');
+    const css = '#' + hex.toString(16).padStart(6, '0');
+    b.textContent = name; b.style.color = css;
+    b.setAttribute('aria-pressed', 'true');
+    b.addEventListener('click', () => {
+      if (state.enabled.has(name)) { state.enabled.delete(name); b.setAttribute('aria-pressed', 'false'); }
+      else { state.enabled.add(name); b.setAttribute('aria-pressed', 'true'); }
+      rebuildFlows();
+    });
+    box.appendChild(b);
+  }
+}
+$('replayRange').addEventListener('input', (ev) => {
+  const v = parseInt(ev.target.value, 10);
+  state.replayHead = v >= state.flows.length - 1 ? -1 : v;
+  state.live = state.replayHead < 0;
+  $('liveBtn').setAttribute('aria-pressed', String(state.live));
+  rebuildFlows();
+});
+$('liveBtn').addEventListener('click', () => {
+  state.live = !state.live;
+  if (state.live) state.replayHead = -1;
+  $('liveBtn').setAttribute('aria-pressed', String(state.live));
+  rebuildFlows();
+});
+async function loadFlows() {
+  const res = await fetch('/flows', { cache: 'no-store' });
+  if (!res.ok) throw new Error('GET /flows -> ' + res.status);
+  const data = await res.json();
+  state.flows = (data.flows || []).slice().sort((a, b) => (a.ts_ms || 0) - (b.ts_ms || 0));
+  state.total = data.count ?? state.flows.length;
+  if (state.replayHead >= state.flows.length) state.replayHead = -1;
+  rebuildFlows();
+  if (selected) selectVenue(selected);
+}
+async function loadStatus() {
+  try {
+    const res = await fetch('/status', { cache: 'no-store' });
+    if (!res.ok) return;
+    const s = await res.json();
+    $('status').textContent =
+      `mode=${s.mode} killed=${s.killed} trades=${s.trades} opps=${s.opportunities_seen} flows=${state.total}`;
+  } catch { /* status is best-effort; flows carry the scene */ }
+}
+// ---------- main loop and boot ----------
+const clock = new THREE.Clock();
+function animate() {
+  requestAnimationFrame(animate);
+  const dt = Math.min(clock.getDelta(), 0.05);
+  for (const p of pulses) {
+    p.userData.t = (p.userData.t + dt * 0.35) % 1;
+    p.userData.curve.getPoint(p.userData.t, p.position);
+  }
+  if (!REDUCED) drift.rotation.y += dt * 0.01;
+  controls.update();
+  renderer.render(scene, camera);
+}
+(async function boot() {
+  try {
+    await loadFlows();
+  } catch (e) {
+    showErr('flows unavailable (' + e.message + '): serve via the engine at http://127.0.0.1:8787/viewer');
+  }
+  await loadStatus();
+  setInterval(async () => {
+    if (!state.live) return;
+    try { await loadFlows(); await loadStatus(); } catch { /* keep last frame */ }
+  }, POLL_MS);
+  animate();
+})();
+</script>
+</body>
+</html>

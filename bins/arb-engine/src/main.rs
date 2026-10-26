@@ -1,6 +1,9 @@
 mod config;
 
-use arb_api::{render_metrics, route, ConnectorHealth, Control, EngineStatus};
+use arb_api::{
+    render_flows_envelope, render_metrics, route, route_viewer, ConnectorHealth, Control,
+    EngineStatus,
+};
 use arb_core::{now_ms, Symbol, Venue};
 use arb_dex_evm::{to_dex_quote, DexKind, V2Pool};
 use arb_exec::{keys_from_env, ExecMode, LiveExecutor};
@@ -34,7 +37,12 @@ struct Shared {
     control: Mutex<Control>,
     status: Mutex<EngineStatus>,
     per_strategy: Mutex<BTreeMap<String, u64>>,
+    /// Pre-rendered `/flows` snapshot (last `FLOWS_SNAPSHOT` trades).
+    flows: Mutex<String>,
 }
+
+/// Trades kept in the `/flows` snapshot served to the 3D viewer.
+const FLOWS_SNAPSHOT: usize = 200;
 
 struct Engine {
     cfg: config::Config,
@@ -107,6 +115,7 @@ impl Engine {
                 paused_strategies: vec![],
             }),
             per_strategy: Mutex::new(BTreeMap::new()),
+            flows: Mutex::new(render_flows_envelope(&[], 0)),
         });
         let mode = ExecMode::parse(&cfg.engine.mode).unwrap_or(ExecMode::Paper);
         let keys = keys_from_env();
@@ -341,6 +350,15 @@ impl Engine {
         if let Ok(mut p) = self.shared.per_strategy.lock() {
             *p = self.per_strategy.clone();
         }
+        if let Ok(mut f) = self.shared.flows.lock() {
+            let trades = self.store.trades();
+            let from = trades.len().saturating_sub(FLOWS_SNAPSHOT);
+            let items: Vec<serde_json::Value> = trades[from..]
+                .iter()
+                .filter_map(|t| serde_json::to_value(t).ok())
+                .collect();
+            *f = render_flows_envelope(&items, trades.len());
+        }
     }
 
     fn status(&self) -> EngineStatus {
@@ -382,7 +400,7 @@ async fn serve_api(addr: String, shared: Arc<Shared>) {
             return;
         }
     };
-    tracing::info!(addr, "control API listening (GET /health /status /metrics, POST /kill /revive /pause/<s> /resume/<s>)");
+    tracing::info!(addr, "control API listening (GET /health /status /metrics /flows /viewer, POST /kill /revive /pause/<s> /resume/<s>)");
     loop {
         let Ok((mut sock, _)) = listener.accept().await else {
             continue;
@@ -417,21 +435,30 @@ async fn serve_api(addr: String, shared: Arc<Shared>) {
                     .map(|p| p.clone())
                     .unwrap_or_default();
                 let metrics = render_metrics(&status, &per);
-                match shared.control.lock() {
-                    Ok(mut ctl) => {
-                        let (code, body) = route(method, path, &mut ctl, &status, &metrics);
-                        let ctype = if path == "/metrics" {
-                            "text/plain"
-                        } else {
-                            "application/json"
-                        };
-                        (code, body, ctype)
+                let flows = shared
+                    .flows
+                    .lock()
+                    .map(|f| f.clone())
+                    .unwrap_or_else(|_| render_flows_envelope(&[], 0));
+                if let Some(hit) = route_viewer(method, path, &flows) {
+                    hit
+                } else {
+                    match shared.control.lock() {
+                        Ok(mut ctl) => {
+                            let (code, body) = route(method, path, &mut ctl, &status, &metrics);
+                            let ctype = if path == "/metrics" {
+                                "text/plain"
+                            } else {
+                                "application/json"
+                            };
+                            (code, body, ctype)
+                        }
+                        Err(_) => (
+                            500,
+                            "{\"error\":\"lock poisoned\"}".into(),
+                            "application/json",
+                        ),
                     }
-                    Err(_) => (
-                        500,
-                        "{\"error\":\"lock poisoned\"}".into(),
-                        "application/json",
-                    ),
                 }
             };
             let _ = sock

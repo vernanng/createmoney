@@ -102,6 +102,29 @@ pub fn render_metrics(
     s
 }
 
+/// Recent-trade feed for the 3D strategy-flow viewer.
+/// `items` are pre-serialized trades, oldest first; `total` is the full count.
+pub fn render_flows_envelope(items: &[serde_json::Value], total: usize) -> String {
+    serde_json::json!({"flows": items, "count": total}).to_string()
+}
+
+/// The viewer page, served as `GET /viewer` by the engine binary.
+pub const VIEWER_HTML: &str = include_str!("viewer.html");
+
+/// Viewer routes. Returns (status_code, body, content_type) when matched.
+/// `flows_body` is the snapshot rendered by [`render_flows_envelope`].
+pub fn route_viewer(
+    method: &str,
+    path: &str,
+    flows_body: &str,
+) -> Option<(u16, String, &'static str)> {
+    match (method, path) {
+        ("GET", "/flows") => Some((200, flows_body.to_string(), "application/json")),
+        ("GET", "/viewer") => Some((200, VIEWER_HTML.to_string(), "text/html")),
+        _ => None,
+    }
+}
+
 /// Route a control request path. Returns (status_code, body).
 /// POST semantics are modeled as path commands to keep the transport trivial:
 ///   GET  /health /status /metrics
@@ -181,5 +204,22 @@ mod tests {
         assert!(body.contains("\"triangular\""), "status body: {body}");
         assert!(body.contains("\"killed\":true"), "status body: {body}");
         assert_eq!(route("GET", "/nope", &mut c, &st, &m).0, 404);
+    }
+
+    #[test]
+    fn viewer_flows_and_page() {
+        let items = vec![serde_json::json!({"intent": {"strategy": "triangular"}})];
+        let body = render_flows_envelope(&items, 42);
+        assert!(body.contains("\"count\":42"), "flows body: {body}");
+        let (code, out, ctype) = route_viewer("GET", "/flows", &body).unwrap();
+        assert_eq!(code, 200);
+        assert_eq!(ctype, "application/json");
+        assert!(out.contains("triangular"), "flows out: {out}");
+        let (code, page, ctype) = route_viewer("GET", "/viewer", &body).unwrap();
+        assert_eq!(code, 200);
+        assert_eq!(ctype, "text/html");
+        assert!(page.contains("strategy-flow"), "viewer page");
+        assert!(route_viewer("GET", "/nope", &body).is_none());
+        assert!(route_viewer("POST", "/flows", &body).is_none());
     }
 }
