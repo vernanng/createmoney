@@ -1,0 +1,17 @@
+ Piece            │ Local now             │ VPS later             │
+  ├──────────────────┼───────────────────────┼───────────────────────┤
+  │ Engine           │ Same Rust binary      │ Same Rust binary      │
+  ├──────────────────┼───────────────────────┼───────────────────────┤
+  │ Database         │ SQLite file           │ Postgres              │
+  ├──────────────────┼───────────────────────┼───────────────────────┤
+  │ Market recording │ CSV/JSONL in ./data   │ Parquet on NVMe       │
+  ├──────────────────┼───────────────────────┼───────────────────────┤
+  │ Metrics          │ Terminal logs         │ Prometheus + Grafana  │
+  ├──────────────────┼───────────────────────┼───────────────────────┤
+  │ Alerts           │ Terminal              │ Telegram              │
+  ├──────────────────┼───────────────────────┼───────────────────────┤
+  │ Dashboard        │ None yet              │ TypeScript, read-only │
+  ├──────────────────┼───────────────────────┼───────────────────────┤
+  │ Run method       │ cargo run --release   │ systemd               │
+  ├──────────────────┼───────────────────────┼───────────────────────┤
+  │ Secrets          │ Local .env            │ Restricted env file
