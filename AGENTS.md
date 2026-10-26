@@ -11,8 +11,7 @@
 
 - `bins` — application source
 - `crates` — crates
-- `xtask` — dev tooling (`cargo xtask doc-check|install-hooks|ablate`)
-- `scripts` — git hook shim only (`hook-post-commit` calls `xtask`)
+- `xtask` — dev tooling (`cargo xtask doc-check|install-hooks|ablate`; the post-commit hook is the `xtask` binary, no shell)
 - `docs` — project documentation
 - `.github` — project configuration
 
