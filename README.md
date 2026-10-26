@@ -1,4 +1,4 @@
-# cariuang — Rust arbitrage engine
+# createmoney — Rust arbitrage engine
 
 Multi-venue, multi-strategy arbitrage engine. **Paper-first**: real strategy
 logic, simulated fills against live-shaped books, live order sending locked
