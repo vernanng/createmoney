@@ -1,0 +1,4 @@
+#!/bin/sh
+# post-commit hook: remind about .md updates after every commit.
+# Installed by scripts/install-hooks.sh (symlinked into .git/hooks).
+exec "$(git rev-parse --show-toplevel)/scripts/doc-check.sh"
