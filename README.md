@@ -40,6 +40,28 @@ docker run --rm -p 127.0.0.1:8787:8787 \
 
 Live trading is never auto-deployed: promote by hand, keep caps tiny.
 
+### Local continuous deployment (paper)
+
+On the dev Mac, Colima (auto-started at login via `brew services start
+colima`) runs the latest published image as a continuous paper soak.
+Watchtower polls GHCR every 5 minutes and restarts the engine on each new
+CI-green `main` image. Paper trades land in `cd-data/paper-trades.jsonl`.
+
+```bash
+gh auth refresh -h github.com -s read:packages   # one-time: pull the private image
+gh auth token | docker login ghcr.io -u <user> --password-stdin
+docker compose -f docker-compose.cd.yml up -d    # start engine + watchtower
+docker compose -f docker-compose.cd.yml ps       # status
+docker compose -f docker-compose.cd.yml logs -f  # logs
+docker compose -f docker-compose.cd.yml down     # stop continuous deployment
+curl http://127.0.0.1:8787/health
+```
+
+No API keys are passed to this stack, so it cannot arm live trading; it
+exists to keep the paper soak current with `main`. The publish workflow
+builds `linux/amd64` and `linux/arm64` — Watchtower needs a host-arch
+manifest to auto-update on Apple Silicon.
+
 ## Layout
 
 ```
