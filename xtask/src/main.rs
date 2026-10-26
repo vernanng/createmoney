@@ -3,7 +3,8 @@
 //! Commands:
 //! - `doc-check [commit]` — advisory docs reminder for a commit (default
 //!   HEAD). Always exits 0 so it can run as a post-commit hook.
-//! - `install-hooks` — symlink the versioned hooks into `.git/hooks`.
+//! - `install-hooks` — install this binary as the `.git/hooks/post-commit`
+//!   hook (a symlink; no shell shim).
 //! - `ablate` — S8 ablation test matrix, then the full workspace suite.
 //!
 //! Invoking the binary as `post-commit` runs `doc-check`.
@@ -142,21 +143,27 @@ fn install_hooks() -> i32 {
         eprintln!("install-hooks: not inside a git work tree");
         return 1;
     };
-    let src = root.join("scripts/hook-post-commit");
+    // The hook is this binary, symlinked under the name `post-commit`.
+    // `run` dispatches on that name, so no shell shim is needed. Re-run
+    // after changing xtask to refresh the link target profile if desired.
+    let src = match env::current_exe().and_then(fs::canonicalize) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("install-hooks: locate own binary: {e}");
+            return 1;
+        }
+    };
     let dst = root.join(".git/hooks/post-commit");
     let _ = fs::remove_file(&dst);
     if let Err(e) = symlink(&src, &dst) {
         eprintln!("install-hooks: symlink {}: {e}", dst.display());
         return 1;
     }
-    let exec = fs::Permissions::from_mode(0o755);
-    for p in [&dst, &src] {
-        if let Err(e) = fs::set_permissions(p, exec.clone()) {
-            eprintln!("install-hooks: chmod {}: {e}", p.display());
-            return 1;
-        }
+    if let Err(e) = fs::set_permissions(&dst, fs::Permissions::from_mode(0o755)) {
+        eprintln!("install-hooks: chmod {}: {e}", dst.display());
+        return 1;
     }
-    println!("installed: .git/hooks/post-commit");
+    println!("installed: .git/hooks/post-commit -> {}", src.display());
     0
 }
 
