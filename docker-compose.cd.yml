@@ -1,0 +1,57 @@
+# Local continuous deployment: run the latest published image as a paper
+# soak on this Mac, auto-updated by Watchtower when CI-green `main` publishes
+# a new image. Separate from docker-compose.yml (local build) on purpose.
+#
+# Paper only, by construction:
+# - config.toml is mounted read-only and must stay `mode = "paper"`.
+# - No env_file and no API keys are passed, so the live executor in
+#   arb-exec cannot arm even if the mode were flipped.
+# Live trading is never auto-deployed (see README "Going live").
+name: createmoney-cd
+
+services:
+  arb-engine:
+    image: ghcr.io/vernanng/createmoney:latest
+    # TODO: drop this pin once the multi-arch publish workflow (same
+    # branch) has landed on main and published once, then re-run
+    # `docker compose -f docker-compose.cd.yml up -d` to switch to the
+    # native arm64 image. Until then the published image is amd64-only:
+    # it runs through Rosetta, and Watchtower polls but cannot pull
+    # updates (no arm64 manifest to compare against).
+    platform: linux/amd64
+    restart: unless-stopped
+    # config.toml binds the control API to 127.0.0.1, which inside a
+    # container is unreachable through Docker's port publish. Rewrite just
+    # that line at container start; the host-side publish below stays
+    # loopback-only, and the mounted dev config is not modified.
+    entrypoint:
+      - bash
+      - -c
+      - >-
+        sed 's|^api_addr *=.*|api_addr = "0.0.0.0:8787"|'
+        /etc/arb-engine/config.toml > /tmp/config.toml &&
+        exec arb-engine --config /tmp/config.toml
+    environment:
+      RUST_LOG: info
+    ports:
+      - "127.0.0.1:8787:8787"
+    volumes:
+      - ./config.toml:/etc/arb-engine/config.toml:ro
+      - ./cd-data:/data
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+      - "com.centurylinklabs.watchtower.scope=createmoney-cd"
+
+  watchtower:
+    # Maintained Watchtower fork (upstream containrrr is unmaintained).
+    image: nickfedor/watchtower:latest
+    restart: unless-stopped
+    # Poll every 5 minutes; update only labelled containers in this scope;
+    # delete superseded images after an update.
+    command: --interval 300 --label-enable --scope createmoney-cd --cleanup
+    environment:
+      TZ: Asia/Jakarta
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      # GHCR pull credentials from `docker login ghcr.io` (private image).
+      - ${HOME}/.docker/config.json:/config.json:ro
