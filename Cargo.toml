@@ -12,6 +12,7 @@ members = [
   "crates/dex-sol",
   "crates/api",
   "bins/arb-engine",
+  "xtask",
 ]
 
 [workspace.package]

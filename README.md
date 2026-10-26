@@ -54,6 +54,8 @@ crates/dex-sol   Jupiter quote building/parsing
 crates/store     Store trait + in-memory/JSONL backend + SQL schema for the DB backend
 crates/api       control state, status/metrics rendering, route table
 bins/arb-engine  wiring, config, tick loop, localhost control API
+xtask            dev tooling: doc-check, install-hooks, ablate (cargo xtask <cmd>)
+scripts/         hook-post-commit shim only; all logic lives in xtask
 ```
 
 ## Config
