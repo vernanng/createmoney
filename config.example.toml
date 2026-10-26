@@ -1,0 +1,38 @@
+# Copy to config.toml and edit. See config.toml for comments on every field.
+[engine]
+mode = "paper"
+feed = "synthetic"
+tick_ms = 250
+api_addr = "127.0.0.1:8787"
+jsonl_path = "paper-trades.jsonl"
+
+venues = ["binance", "bybit", "okx", "indodax"]
+symbols = ["BTC/USDT", "ETH/USDT"]
+
+[strategies]
+cross_exchange = true
+triangular = true
+funding_rate = true
+cex_dex = true
+
+[params]
+min_edge_bps = 15
+slip_buffer_bps = 5
+target_notional_quote = 1000
+max_book_age_ms = 2000
+ttl_ms = 1500
+min_funding_annualized_bps = 500
+
+[risk]
+max_notional_quote_per_trade = 5000
+max_notional_quote_per_venue = 25000
+
+[dex]
+uniswap = true
+pancakeswap = true
+jupiter = true
+evm_gas_quote = 1
+solana_fee_quote = 1
+
+[indodax]
+usd_idr = 16000

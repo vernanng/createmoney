@@ -1,0 +1,13 @@
+services:
+  arb-engine:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "127.0.0.1:8787:8787"
+    volumes:
+      - ./config.toml:/etc/arb-engine/config.toml:ro
+      - arb-data:/data
+
+volumes:
+  arb-data:

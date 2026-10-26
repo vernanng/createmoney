@@ -1,0 +1,46 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/core",
+  "crates/feed",
+  "crates/exec",
+  "crates/strategy",
+  "crates/risk",
+  "crates/paper",
+  "crates/store",
+  "crates/dex-evm",
+  "crates/dex-sol",
+  "crates/api",
+  "bins/arb-engine",
+]
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+rust-version = "1.75"
+
+[workspace.dependencies]
+arb-core = { path = "crates/core" }
+arb-feed = { path = "crates/feed" }
+arb-exec = { path = "crates/exec" }
+arb-strategy = { path = "crates/strategy" }
+arb-risk = { path = "crates/risk" }
+arb-paper = { path = "crates/paper" }
+arb-store = { path = "crates/store" }
+arb-dex-evm = { path = "crates/dex-evm" }
+arb-dex-sol = { path = "crates/dex-sol" }
+arb-api = { path = "crates/api" }
+
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rust_decimal = { version = "1", features = ["serde-str"] }
+rust_decimal_macros = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "net", "io-util"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+toml = "0.8"
+clap = { version = "4", features = ["derive"] }
+sha2 = "0.10"
+hmac = "0.12"
