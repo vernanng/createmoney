@@ -7,7 +7,9 @@ use rust_decimal::Decimal;
 use serde_json::Value;
 use std::str::FromStr;
 
+pub mod live;
 pub mod synthetic;
+pub use live::{pick_fresh, spawn_venue_tasks, LiveBooks};
 pub use synthetic::SyntheticFeed;
 
 #[derive(Debug, thiserror::Error)]
@@ -79,7 +81,7 @@ pub fn subscribe_frame(venue: Venue, symbol: &Symbol) -> Value {
     match venue {
         Venue::Binance => serde_json::json!({
             "method": "SUBSCRIBE",
-            "params": [format!("{}@depth@100ms", symbol.binance()), format!("{}@bookTicker", symbol.binance())],
+            "params": [format!("{}@depth20@100ms", symbol.binance()), format!("{}@bookTicker", symbol.binance())],
             "id": 1
         }),
         Venue::Bybit => serde_json::json!({
@@ -114,6 +116,19 @@ pub fn parse_binance_depth(book: &mut OrderBook, raw: &str) -> Result<bool, Feed
     let fin = v["u"].as_u64().unwrap_or(0);
     let ts = v["E"].as_i64().unwrap_or(0);
     Ok(book.apply_diff(levels(&v["b"])?, levels(&v["a"])?, first, fin, ts))
+}
+
+// Partial book (depth20@100ms): {"lastUpdateId":1,"bids":[[px,qty]],"asks":[[..]]}.
+// Full top-20 image on every push, so no REST snapshot sync is needed.
+pub fn parse_binance_partial(
+    book: &mut OrderBook,
+    raw: &str,
+    ts_ms: i64,
+) -> Result<bool, FeedError> {
+    let v: Value = serde_json::from_str(raw)?;
+    let seq = v["lastUpdateId"].as_u64().unwrap_or(0);
+    book.apply_snapshot(levels(&v["bids"])?, levels(&v["asks"])?, seq, ts_ms);
+    Ok(true)
 }
 
 // Book ticker: {"u":1,"s":"BTCUSDT","b":"100","B":"1","a":"101","A":"2"}
@@ -271,5 +286,19 @@ mod tests {
         assert!(subscribe_frame(Venue::Bybit, &s)
             .to_string()
             .contains("orderbook.50.BTCUSDT"));
+    }
+
+    #[test]
+    fn binance_partial_book_snapshots() {
+        let mut b = OrderBook::new(Venue::Binance, Symbol::new("BTC", "USDT"));
+        parse_binance_partial(
+            &mut b,
+            r#"{"lastUpdateId":9,"bids":[["99","1"]],"asks":[["100","2"]]}"#,
+            7,
+        )
+        .unwrap();
+        assert_eq!(b.best_bid().unwrap().price, dec!(99));
+        assert_eq!(b.best_ask().unwrap().price, dec!(100));
+        assert_eq!(b.ts_ms, 7);
     }
 }

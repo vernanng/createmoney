@@ -7,7 +7,7 @@ use arb_api::{
 use arb_core::{now_ms, Symbol, Venue};
 use arb_dex_evm::{to_dex_quote, DexKind, V2Pool};
 use arb_exec::{keys_from_env, ExecMode, LiveExecutor};
-use arb_feed::SyntheticFeed;
+use arb_feed::{pick_fresh, LiveBooks, SyntheticFeed};
 use arb_paper::PaperExecutor;
 use arb_risk::RiskEngine;
 use arb_store::{MemoryStore, Store, StoredTrade};
@@ -39,6 +39,8 @@ struct Shared {
     per_strategy: Mutex<BTreeMap<String, u64>>,
     /// Pre-rendered `/flows` snapshot (last `FLOWS_SNAPSHOT` trades).
     flows: Mutex<String>,
+    /// Live venue books (empty unless `feed = "live"` tasks are spawned).
+    live_books: LiveBooks,
 }
 
 /// Trades kept in the `/flows` snapshot served to the 3D viewer.
@@ -130,6 +132,7 @@ impl Engine {
             }),
             per_strategy: Mutex::new(BTreeMap::new()),
             flows: Mutex::new(render_flows_envelope(&[], 0)),
+            live_books: LiveBooks::default(),
         });
         let mode = ExecMode::parse(&cfg.engine.mode).unwrap_or(ExecMode::Paper);
         let keys = keys_from_env();
@@ -218,6 +221,15 @@ impl Engine {
                 needed.push(cyc_sym);
             }
         }
+        // Live books, when the WS tasks run: fresh ones win, stale venues
+        // are skipped (never backfilled) so paper only sees real spreads.
+        let live_mode = self.cfg.engine.feed == "live";
+        let live_map = self
+            .shared
+            .live_books
+            .lock()
+            .map(|m| m.clone())
+            .unwrap_or_default();
         for sym in &needed {
             let anchor = anchors
                 .get(&sym.to_string())
@@ -227,6 +239,18 @@ impl Engine {
             let venues = self.cfg.venues.clone();
             for v in &venues {
                 if !v.is_cex() {
+                    continue;
+                }
+                if live_mode {
+                    if let Some(b) = pick_fresh(
+                        &live_map,
+                        *v,
+                        &sym.to_string(),
+                        now,
+                        self.cfg.params.max_book_age_ms,
+                    ) {
+                        view.put(b);
+                    }
                     continue;
                 }
                 if *v == Venue::Indodax && sym.quote == "USDT" {
@@ -385,6 +409,14 @@ impl Engine {
             .lock()
             .map(|c| (c.is_killed(), c.paused()))
             .unwrap_or_default();
+        let live_mode = self.cfg.engine.feed == "live";
+        let now = now_ms();
+        let live_map = self
+            .shared
+            .live_books
+            .lock()
+            .map(|m| m.clone())
+            .unwrap_or_default();
         EngineStatus {
             mode: self.cfg.engine.mode.clone(),
             killed,
@@ -395,11 +427,28 @@ impl Engine {
                 .cfg
                 .venues
                 .iter()
-                .map(|v| ConnectorHealth {
-                    venue: *v,
-                    connected: true,
-                    last_msg_ms: now_ms(),
-                    books: self.symbols.len(),
+                .map(|v| {
+                    let fresh_ts: Vec<i64> = live_map
+                        .iter()
+                        .filter(|((w, _), b)| {
+                            w == v && now - b.ts_ms <= self.cfg.params.max_book_age_ms
+                        })
+                        .map(|(_, b)| b.ts_ms)
+                        .collect();
+                    ConnectorHealth {
+                        venue: *v,
+                        connected: if live_mode {
+                            !fresh_ts.is_empty()
+                        } else {
+                            true
+                        },
+                        last_msg_ms: fresh_ts.into_iter().max().unwrap_or(now),
+                        books: if live_mode {
+                            live_map.keys().filter(|(w, _)| w == v).count()
+                        } else {
+                            self.symbols.len()
+                        },
+                    }
                 })
                 .collect(),
             paused_strategies,
@@ -509,7 +558,15 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(mode = %engine.status().mode, feed = %feed_kind, venues = ?engine.cfg.venues,
         symbols = ?engine.cfg.symbols, strategies = engine.strategies.len(), "arb-engine starting");
     if feed_kind == "live" {
-        tracing::warn!("feed=live requested: wire WS tasks into arb-feed parsers (ws_url/subscribe_frame are ready); running synthetic books until then");
+        // Live venue books in, paper execution unchanged: fills stay simulated
+        // and the live-send gate is untouched. Stale venues are skipped.
+        arb_feed::spawn_venue_tasks(
+            &engine.shared.live_books,
+            engine.cfg.venues.clone(),
+            engine.symbols.clone(),
+            engine.cfg.indodax.usd_idr,
+        );
+        tracing::info!("live WS feeds starting (paper execution)");
     }
 
     if let Some(addr) = api_addr {
