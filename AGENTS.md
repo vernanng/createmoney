@@ -20,6 +20,11 @@
 - Write Rust against edition 2021.
 - Place unit tests inline in `#[cfg(test)] mod tests` inside the source file.
 
+## Branches
+
+- Never work directly on `main`. Use one branch per change: `feat/<name>` (feature), `fix/<name>` (bug fix), `chore/<name>` (tooling/deps/CI), `docs/<name>` (docs only), `refactor/<name>` (no behavior change), `hotfix/<name>` (urgent fix toward `main`).
+- Merge to `main` only after review and green CI (`cargo test --workspace`, `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`).
+
 ## Docs
 
 - After every commit, review and update the affected `.md` docs (`README.md`, `docs/plan.md`) so commands, layout, and behavior stay accurate.
