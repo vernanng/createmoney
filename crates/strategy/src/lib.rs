@@ -4,14 +4,24 @@ use arb_core::{Intent, OrderBook, Symbol, Venue};
 use rust_decimal::Decimal;
 use std::collections::BTreeMap;
 
+pub mod ablate;
 pub mod cex_dex;
 pub mod cross_exchange;
+pub mod fee_table;
 pub mod funding;
+pub mod fx_triangle;
+pub mod imbalance;
+pub mod lag_chase;
 pub mod triangular;
 
+pub use ablate::{effective_fees, effective_params, matrix, Ablation};
 pub use cex_dex::{CexDex, DexQuote};
-pub use cross_exchange::CrossExchange;
-pub use funding::{FundingRate, FundingStrategy};
+pub use cross_exchange::{CrossExchange, ADAPTIVE_NOTIONALS};
+pub use fee_table::FeeTable;
+pub use funding::{accrued, FundingRate, FundingStrategy};
+pub use fx_triangle::{converted, FxTriangle};
+pub use imbalance::{both_sided_agrees, imbalance, quote_imbalance};
+pub use lag_chase::LagChase;
 pub use triangular::Triangular;
 
 /// Read-only market view handed to strategies each tick.

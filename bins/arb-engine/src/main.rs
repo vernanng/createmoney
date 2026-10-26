@@ -12,7 +12,8 @@ use arb_paper::PaperExecutor;
 use arb_risk::RiskEngine;
 use arb_store::{MemoryStore, Store, StoredTrade};
 use arb_strategy::{
-    CexDex, CrossExchange, FundingRate, FundingStrategy, MarketView, Strategy, Triangular,
+    CexDex, CrossExchange, FundingRate, FundingStrategy, FxTriangle, LagChase, MarketView,
+    Strategy, Triangular,
 };
 use clap::Parser;
 use rust_decimal::Decimal;
@@ -112,6 +113,28 @@ impl Engine {
                 params.clone(),
                 cex.clone(),
                 symbols.clone(),
+            )));
+        }
+        // S1 + S3: lead-lag and FX-triangle ride on the cross-exchange flag.
+        // Conservative jump threshold so synthetic paper stays quiet until a
+        // real dislocation prints; only wired when both venues exist.
+        if cfg.strategies.cross_exchange
+            && cex.contains(&Venue::Binance)
+            && cex.contains(&Venue::Indodax)
+        {
+            strategies.push(Box::new(LagChase::new(
+                params.clone(),
+                Venue::Binance,
+                Venue::Indodax,
+                symbols.clone(),
+                Decimal::new(30, 0),
+            )));
+            strategies.push(Box::new(FxTriangle::new(
+                params.clone(),
+                Venue::Binance,
+                Venue::Indodax,
+                symbols.clone(),
+                cfg.indodax.usd_idr,
             )));
         }
 

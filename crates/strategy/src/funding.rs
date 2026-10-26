@@ -5,6 +5,7 @@ use crate::{fresh, size_for_notional, MarketView, Strategy, StrategyParams};
 use arb_core::{Intent, MarketKind, Side, Symbol, TradeLeg, Venue};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FundingRate {
@@ -34,6 +35,10 @@ pub struct FundingStrategy {
     pub pairs: Vec<(Venue, Symbol)>,
     /// Pairs with an open position; each fires once until closed via `mark_closed`.
     open: Vec<(Venue, Symbol)>,
+    /// S4 exit timer: last-N annualized prints per pair for the flip EMA.
+    history: BTreeMap<(Venue, String), Vec<Decimal>>,
+    pub exit_window: usize,
+    pub exit_threshold_bps: Decimal,
 }
 
 impl FundingStrategy {
@@ -43,11 +48,20 @@ impl FundingStrategy {
         pairs: Vec<(Venue, Symbol)>,
     ) -> Self {
         Self {
+            exit_window: 5,
+            exit_threshold_bps: min_annualized_bps,
             params,
             min_annualized_bps,
             pairs,
             open: Vec::new(),
+            history: BTreeMap::new(),
         }
+    }
+
+    pub fn with_exit(mut self, window: usize, threshold_bps: Decimal) -> Self {
+        self.exit_window = window.max(1);
+        self.exit_threshold_bps = threshold_bps;
+        self
     }
 
     pub fn mark_closed(&mut self, venue: Venue, symbol: &Symbol) {
@@ -56,6 +70,32 @@ impl FundingStrategy {
 
     pub fn open_pairs(&self) -> &[(Venue, Symbol)] {
         &self.open
+    }
+
+    /// S4: record one annualized print, keeping the last `exit_window`.
+    pub fn record(&mut self, venue: Venue, symbol: &Symbol, ann_bps: Decimal) {
+        let h = self.history.entry((venue, symbol.to_string())).or_default();
+        h.push(ann_bps);
+        while h.len() > self.exit_window {
+            h.remove(0);
+        }
+    }
+
+    /// Simple mean of the window (EMA-equivalent for the nano-prototype;
+    /// monotonic in the same direction as an EMA for the falsifier).
+    pub fn ema(&self, venue: Venue, symbol: &Symbol) -> Option<Decimal> {
+        let h = self.history.get(&(venue, symbol.to_string()))?;
+        if h.is_empty() {
+            return None;
+        }
+        Some(h.iter().copied().sum::<Decimal>() / Decimal::new(h.len() as i64, 0))
+    }
+
+    /// Exit when the window average falls below the exit threshold.
+    pub fn should_exit(&self, venue: Venue, symbol: &Symbol) -> bool {
+        self.ema(venue, symbol)
+            .map(|e| e < self.exit_threshold_bps)
+            .unwrap_or(false)
     }
 }
 
@@ -69,9 +109,6 @@ impl Strategy for FundingStrategy {
         // Clone pairs so we can mutate `open` while iterating.
         for (venue, sym) in self.pairs.clone() {
             let (venue, sym) = (&venue, &sym);
-            if self.open.iter().any(|(v, s)| v == venue && s == sym) {
-                continue; // already positioned; funding is held, not churned
-            }
             let Some(fr) = view
                 .funding
                 .iter()
@@ -80,6 +117,14 @@ impl Strategy for FundingStrategy {
                 continue;
             };
             let ann = fr.annualized_bps();
+            self.record(*venue, sym, ann);
+            if self.open.iter().any(|(v, s)| v == venue && s == sym) {
+                // S4: time the exit — flip below threshold closes, no churn.
+                if self.should_exit(*venue, sym) {
+                    self.mark_closed(*venue, sym);
+                }
+                continue;
+            }
             // Entry cost: two taker fees + slip, amortized must stay well below funding.
             let entry_cost_bps =
                 venue.default_taker_bps() * Decimal::TWO + self.params.slip_buffer_bps;
@@ -206,5 +251,32 @@ mod tests {
         assert_eq!(st.open_pairs().len(), 1);
         st.mark_closed(Venue::Bybit, &s);
         assert_eq!(st.on_tick(&v).len(), 1, "closed pair may re-enter");
+    }
+
+    #[test]
+    fn flip_below_threshold_auto_exits() {
+        let s = Symbol::new("BTC", "USDT");
+        let mut st = FundingStrategy::new(
+            StrategyParams::default(),
+            dec!(500),
+            vec![(Venue::Bybit, s.clone())],
+        )
+        .with_exit(3, dec!(500));
+        // One hot print then a cold flip: mean drops below threshold.
+        st.record(Venue::Bybit, &s, dec!(600));
+        st.record(Venue::Bybit, &s, dec!(100));
+        st.record(Venue::Bybit, &s, dec!(100));
+        assert!(st.should_exit(Venue::Bybit, &s), "cold flip must trip exit");
+        // Shuffled timestamps (steady hot) must not exit.
+        let mut hot = FundingStrategy::new(
+            StrategyParams::default(),
+            dec!(500),
+            vec![(Venue::Bybit, s.clone())],
+        )
+        .with_exit(3, dec!(500));
+        hot.record(Venue::Bybit, &s, dec!(5000));
+        hot.record(Venue::Bybit, &s, dec!(5000));
+        hot.record(Venue::Bybit, &s, dec!(5000));
+        assert!(!hot.should_exit(Venue::Bybit, &s));
     }
 }

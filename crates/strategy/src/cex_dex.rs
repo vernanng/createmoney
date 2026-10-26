@@ -34,11 +34,20 @@ impl CexDex {
         }
     }
 
+    /// S5 multi-size sweep: try 0.1/0.5/1.0x of target, keep the best net
+    /// edge including per-size gas. Small sizes win where V2 impact < spread.
     fn try_pair(&self, view: &MarketView, sym: &Symbol, dq: &DexQuote) -> Option<Intent> {
         if view.now_ms - dq.ts_ms > self.params.max_book_age_ms {
             return None;
         }
-        let mut best: Option<Intent> = None;
+        let mut best: Option<(Decimal, Intent)> = None; // (edge, intent)
+        let mut consider = |edge: Decimal, legs: [TradeLeg; 2]| {
+            if edge >= self.params.min_edge_bps
+                && best.as_ref().map(|(e, _)| edge > *e).unwrap_or(true)
+            {
+                best = Some((edge, intent(self, view, sym, legs, edge)));
+            }
+        };
         for cv in &self.cex_venues {
             // A missing/empty book on one venue must skip that venue only —
             // never abort the whole scan (`?` here was a live bug).
@@ -48,93 +57,91 @@ impl CexDex {
             if !fresh(book, view.now_ms, self.params.max_book_age_ms) {
                 continue;
             }
-            let (Some(bid), Some(ask)) = (book.best_bid(), book.best_ask()) else {
+            let (Some(_bid), Some(_ask)) = (book.best_bid(), book.best_ask()) else {
                 continue;
             };
-
-            // Direction 1: buy CEX ask, sell DEX.
-            let qty = size_for_notional(self.params.target_notional_quote, ask.price);
-            if qty > Decimal::ZERO {
-                if let Ok(buy_vwap) = book.vwap(Side::Buy, qty) {
-                    let gas_bps = gas_as_bps(dq.gas_quote, self.params.target_notional_quote);
-                    let edge = net_edge_bps(
-                        buy_vwap,
-                        dq.sell_px,
-                        cv.default_taker_bps(),
-                        Decimal::ZERO,
-                        self.params.slip_buffer_bps + gas_bps,
-                    );
-                    if edge >= self.params.min_edge_bps {
-                        best = Some(intent(
-                            self,
-                            view,
-                            sym,
-                            [
-                                TradeLeg {
-                                    venue: *cv,
-                                    symbol: sym.clone(),
-                                    side: Side::Buy,
-                                    price: buy_vwap,
-                                    qty_base: qty,
-                                    market: MarketKind::Spot,
-                                },
-                                TradeLeg {
-                                    venue: dq.venue,
-                                    symbol: sym.clone(),
-                                    side: Side::Sell,
-                                    price: dq.sell_px,
-                                    qty_base: qty,
-                                    market: MarketKind::Spot,
-                                },
-                            ],
-                            edge,
-                        ));
+            for frac in [Decimal::new(1, 1), Decimal::new(5, 1), Decimal::ONE] {
+                let sweep_notional = self.params.target_notional_quote * frac;
+                if sweep_notional <= Decimal::ZERO {
+                    continue;
+                }
+                // Direction 1: buy CEX ask, sell DEX.
+                if let Some(ask) = book.best_ask() {
+                    let qty = size_for_notional(sweep_notional, ask.price);
+                    if qty > Decimal::ZERO {
+                        if let Ok(buy_vwap) = book.vwap(Side::Buy, qty) {
+                            let gas_bps = gas_as_bps(dq.gas_quote, sweep_notional);
+                            let edge = net_edge_bps(
+                                buy_vwap,
+                                dq.sell_px,
+                                cv.default_taker_bps(),
+                                Decimal::ZERO,
+                                self.params.slip_buffer_bps + gas_bps,
+                            );
+                            consider(
+                                edge,
+                                [
+                                    TradeLeg {
+                                        venue: *cv,
+                                        symbol: sym.clone(),
+                                        side: Side::Buy,
+                                        price: buy_vwap,
+                                        qty_base: qty,
+                                        market: MarketKind::Spot,
+                                    },
+                                    TradeLeg {
+                                        venue: dq.venue,
+                                        symbol: sym.clone(),
+                                        side: Side::Sell,
+                                        price: dq.sell_px,
+                                        qty_base: qty,
+                                        market: MarketKind::Spot,
+                                    },
+                                ],
+                            );
+                        }
                     }
                 }
-            }
-            // Direction 2: buy DEX, sell CEX bid.
-            let qty = size_for_notional(self.params.target_notional_quote, dq.buy_px);
-            if qty > Decimal::ZERO {
-                if let Ok(sell_vwap) = book.vwap(Side::Sell, qty) {
-                    let gas_bps = gas_as_bps(dq.gas_quote, self.params.target_notional_quote);
-                    let edge = net_edge_bps(
-                        dq.buy_px,
-                        sell_vwap,
-                        Decimal::ZERO,
-                        cv.default_taker_bps(),
-                        self.params.slip_buffer_bps + gas_bps,
-                    );
-                    if edge >= self.params.min_edge_bps && best.is_none() {
-                        let _ = bid;
-                        best = Some(intent(
-                            self,
-                            view,
-                            sym,
-                            [
-                                TradeLeg {
-                                    venue: dq.venue,
-                                    symbol: sym.clone(),
-                                    side: Side::Buy,
-                                    price: dq.buy_px,
-                                    qty_base: qty,
-                                    market: MarketKind::Spot,
-                                },
-                                TradeLeg {
-                                    venue: *cv,
-                                    symbol: sym.clone(),
-                                    side: Side::Sell,
-                                    price: sell_vwap,
-                                    qty_base: qty,
-                                    market: MarketKind::Spot,
-                                },
-                            ],
-                            edge,
-                        ));
+                // Direction 2: buy DEX, sell CEX bid.
+                {
+                    let qty = size_for_notional(sweep_notional, dq.buy_px);
+                    if qty > Decimal::ZERO {
+                        if let Ok(sell_vwap) = book.vwap(Side::Sell, qty) {
+                            let gas_bps = gas_as_bps(dq.gas_quote, sweep_notional);
+                            let edge = net_edge_bps(
+                                dq.buy_px,
+                                sell_vwap,
+                                Decimal::ZERO,
+                                cv.default_taker_bps(),
+                                self.params.slip_buffer_bps + gas_bps,
+                            );
+                            consider(
+                                edge,
+                                [
+                                    TradeLeg {
+                                        venue: dq.venue,
+                                        symbol: sym.clone(),
+                                        side: Side::Buy,
+                                        price: dq.buy_px,
+                                        qty_base: qty,
+                                        market: MarketKind::Spot,
+                                    },
+                                    TradeLeg {
+                                        venue: *cv,
+                                        symbol: sym.clone(),
+                                        side: Side::Sell,
+                                        price: sell_vwap,
+                                        qty_base: qty,
+                                        market: MarketKind::Spot,
+                                    },
+                                ],
+                            );
+                        }
                     }
                 }
             }
         }
-        best
+        best.map(|(_, i)| i)
     }
 }
 
@@ -268,5 +275,62 @@ mod tests {
         let hits = st.on_tick(&v);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].legs[0].venue, Venue::Bybit);
+    }
+
+    #[test]
+    fn sweep_prefers_small_size_in_thin_book() {
+        // Thin CEX asks: 0.03 @ 3001 then deep 3100. Full $1000 walks into
+        // 3100 (edge dies); 0.1x stays near touch (edge lives). Sweep must
+        // pick the small size, proving the edge-size curve crosses zero.
+        let s = Symbol::new("ETH", "USDT");
+        let mut st = CexDex::new(
+            StrategyParams::default(),
+            vec![Venue::Binance],
+            vec![s.clone()],
+        );
+        let mut v = MarketView {
+            now_ms: 1_000,
+            ..Default::default()
+        };
+        let mut b = OrderBook::new(Venue::Binance, s.clone());
+        b.apply_snapshot(
+            vec![BookLevel {
+                price: dec!(3000),
+                qty: dec!(10),
+            }],
+            vec![
+                BookLevel {
+                    price: dec!(3001),
+                    qty: dec!(0.03),
+                },
+                BookLevel {
+                    price: dec!(3100),
+                    qty: dec!(10),
+                },
+            ],
+            1,
+            1_000,
+        );
+        v.put(b);
+        v.dex_quotes.push(DexQuote {
+            venue: Venue::Uniswap,
+            symbol: s,
+            buy_px: dec!(3060),
+            sell_px: dec!(3050),
+            gas_quote: dec!(0.5),
+            ts_ms: 1_000,
+        });
+        let hits = st.on_tick(&v);
+        assert_eq!(
+            hits.len(),
+            1,
+            "small size must survive where full size dies"
+        );
+        let qty = hits[0].legs[0].qty_base;
+        let full = crate::size_for_notional(dec!(1000), dec!(3001));
+        assert!(
+            qty < full,
+            "sweep must pick smaller than full, got {qty} vs {full}"
+        );
     }
 }

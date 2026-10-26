@@ -25,12 +25,27 @@ curl -X POST http://127.0.0.1:8787/kill                      # trip kill-switch
 
 Paper trades append to `paper-trades.jsonl`. Logs via `RUST_LOG=debug`.
 
+## Container image (CD)
+
+Every green `main` build publishes `ghcr.io/vernanng/createmoney:latest`
+(plus a SHA tag) via the `publish` workflow, which only runs after `ci`
+passes. Paper soak from the image:
+
+```bash
+docker pull ghcr.io/vernanng/createmoney:latest
+docker run --rm -p 127.0.0.1:8787:8787 \
+  -v ./config.toml:/etc/arb-engine/config.toml:ro \
+  ghcr.io/vernanng/createmoney:latest
+```
+
+Live trading is never auto-deployed: promote by hand, keep caps tiny.
+
 ## Layout
 
 ```
 crates/core      types, L2 book (snapshot/diff/VWAP), decimal money math
 crates/feed      Binance/Bybit/OKX/Indodax parsers, WS URLs, IDR->USD books, synthetic feed
-crates/strategy  Strategy trait + cross-ex / triangular / funding / cex-dex
+crates/strategy  Strategy trait + cross-ex / triangular / funding / cex-dex + lag-chase / fx-triangle / imbalance / ablation / fee-table
 crates/risk      pre-trade checks, venue caps, kill-switch
 crates/paper     book-walking fill simulator (fees + slippage haircut)
 crates/exec      live send gate (armed check), env key loading, HMAC signing
