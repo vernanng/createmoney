@@ -44,6 +44,20 @@ struct Shared {
 /// Trades kept in the `/flows` snapshot served to the 3D viewer.
 const FLOWS_SNAPSHOT: usize = 200;
 
+/// Reference price levels for the synthetic feed and paper seeding.
+/// Real feeds replace these with live books; keep them plausible.
+fn anchors() -> BTreeMap<String, Decimal> {
+    BTreeMap::from([
+        ("BTC/USDT".to_string(), Decimal::new(100_000, 0)),
+        ("ETH/USDT".to_string(), Decimal::new(3_000, 0)),
+        ("ETH/BTC".to_string(), Decimal::new(3, 2)), // 0.03 — triangular needs the cross
+        ("SOL/USDT".to_string(), Decimal::new(150, 0)),
+        ("SOL/USDC".to_string(), Decimal::new(150, 0)),
+        ("XRP/USDT".to_string(), Decimal::new(6, 1)),
+        ("DOGE/USDT".to_string(), Decimal::new(2, 1)),
+    ])
+}
+
 struct Engine {
     cfg: config::Config,
     symbols: Vec<Symbol>,
@@ -152,12 +166,21 @@ impl Engine {
                     assets.push(extra.into());
                 }
             }
+            let anchor_tbl = anchors();
             for v in venues {
                 for a in &assets {
                     let amt = if a == "USDT" || a == "USDC" {
                         cfg.paper.start_quote_per_venue
                     } else {
-                        cfg.paper.start_base_per_asset
+                        // Seed enough base to sell ~2x target notional at the
+                        // reference price, so cheap assets can actually trade.
+                        let ref_px = anchor_tbl
+                            .iter()
+                            .find(|(k, _)| k.split('/').next() == Some(a.as_str()))
+                            .map(|(_, v)| *v)
+                            .unwrap_or(Decimal::new(100, 0));
+                        let need = Decimal::new(2, 0) * cfg.params.target_notional_quote / ref_px;
+                        cfg.paper.start_base_per_asset.max(need)
                     };
                     paper.seed(v, a, amt);
                 }
@@ -184,13 +207,7 @@ impl Engine {
             now_ms: now,
             ..Default::default()
         };
-        let anchors: BTreeMap<String, Decimal> = BTreeMap::from([
-            ("BTC/USDT".to_string(), Decimal::new(100_000, 0)),
-            ("ETH/USDT".to_string(), Decimal::new(3_000, 0)),
-            ("ETH/BTC".to_string(), Decimal::new(3, 2)), // 0.03 — triangular needs the cross
-            ("SOL/USDT".to_string(), Decimal::new(150, 0)),
-            ("SOL/USDC".to_string(), Decimal::new(150, 0)),
-        ]);
+        let anchors = anchors();
         let mut needed: Vec<Symbol> = self.symbols.clone();
         for cyc_sym in [
             Symbol::new("BTC", "USDT"),

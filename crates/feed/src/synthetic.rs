@@ -65,7 +65,10 @@ impl SyntheticFeed {
         let mut levels = |start: Decimal, dir: Decimal| -> Vec<BookLevel> {
             (0..5)
                 .map(|i| {
-                    let qty = Decimal::new(5 + ((self.rnd() % 20) as i64), 1); // 0.5 .. 2.4
+                    // Depth in notional terms: each level carries 1k–5k quote
+                    // units of base, so low-price assets can actually fill.
+                    let lvl_notional = Decimal::new(1000 + ((self.rnd() % 41) as i64) * 100, 0);
+                    let qty = lvl_notional / mid;
                     BookLevel {
                         price: start + dir * step * Decimal::new(i, 0),
                         qty,

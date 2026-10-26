@@ -1,13 +1,15 @@
 # arb-engine config. Secrets come from env only — never put keys here.
+# NOTE: top-level keys (venues/symbols) must stay above the first [table]
+# header — bare keys after a header belong to that table and are ignored.
+venues = ["binance", "bybit", "okx", "indodax"]
+symbols = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "DOGE/USDT"]
+
 [engine]
 mode = "paper"        # paper | live (live still requires *_API_KEY env vars)
-feed = "synthetic"    # synthetic | live (live WS wiring lands in arb-feed tasks)
+feed = "live"    # synthetic | live (live WS wiring lands in arb-feed tasks)
 tick_ms = 250
 api_addr = "127.0.0.1:8787"
 jsonl_path = "paper-trades.jsonl"
-
-venues = ["binance", "bybit", "okx", "indodax"]
-symbols = ["BTC/USDT", "ETH/USDT"]
 
 [strategies]
 cross_exchange = true
@@ -35,7 +37,7 @@ evm_gas_quote = 1      # USD per swap (L2-ish). Raise for L1.
 solana_fee_quote = 1
 
 [indodax]
-usd_idr = 16000        # reference rate for IDR -> USD book normalization
+usd_idr = 19000        # reference rate for IDR -> USD book normalization
 
 [paper]
 start_quote_per_venue = 1000000  # USDT/USDC seeded per venue (incl. DEX wallets)

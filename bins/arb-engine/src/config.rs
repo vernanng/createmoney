@@ -180,3 +180,37 @@ impl Config {
         Ok(toml::from_str(&text)?)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn top_level_venues_and_symbols_are_honored() {
+        // Regression: bare keys placed after a [table] header belong to that
+        // table and are silently ignored — venues/symbols must be parsed.
+        let text = r#"
+venues = ["binance", "bybit"]
+symbols = ["BTC/USDT", "SOL/USDT"]
+
+[engine]
+mode = "paper"
+feed = "synthetic"
+
+[params]
+min_edge_bps = 15
+slip_buffer_bps = 5
+target_notional_quote = 1000
+max_book_age_ms = 2000
+
+[risk]
+max_notional_quote_per_trade = 5000
+max_notional_quote_per_venue = 25000
+"#;
+        let cfg: Config = toml::from_str(text).unwrap();
+        assert_eq!(cfg.venues, vec![Venue::Binance, Venue::Bybit]);
+        let syms = cfg.symbols().unwrap();
+        assert_eq!(syms.len(), 2);
+        assert_eq!(syms[1], Symbol::new("SOL", "USDT"));
+    }
+}
