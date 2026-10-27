@@ -2,7 +2,6 @@
 //! the SQL backend (Postgres/SQLite via sqlx) drops in without touching callers.
 //! JSONL export gives durable, diffable paper-trade history today.
 
-use anyhow::Context;
 use arb_core::{Fill, Intent};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -139,8 +138,14 @@ fn load_jsonl(path: &Path) -> anyhow::Result<Vec<StoredTrade>> {
                 break;
             }
             Err(e) => {
-                return Err(e)
-                    .with_context(|| format!("loading {} line {}", path.display(), i + 1));
+                // shortcut: one corrupt middle line must not block startup;
+                // skip it loudly so history loss is visible but not fatal.
+                eprintln!(
+                    "store: skipping corrupt {} line {}: {e}",
+                    path.display(),
+                    i + 1
+                );
+                continue;
             }
         }
     }
@@ -259,6 +264,50 @@ mod tests {
         assert_eq!(reopened.total_pnl(), dec!(5));
         assert_eq!(reopened.trades()[0].session_id, "s1");
         assert_eq!(reopened.trades()[1].session_id, "");
+        let _ = std::fs::remove_file(&dir);
+    }
+
+    #[test]
+    fn schema_sql_covers_the_store_contract() {
+        // No SQL backend exists yet; the DDL is the contract it must
+        // honor. Pin the tables and columns the Store trait serves so
+        // schema and trait cannot drift apart silently.
+        for table in [
+            "CREATE TABLE IF NOT EXISTS trades",
+            "CREATE TABLE IF NOT EXISTS fills",
+            "CREATE TABLE IF NOT EXISTS opportunities",
+        ] {
+            assert!(SCHEMA_SQL.contains(table), "{table}");
+        }
+        for column in [
+            "strategy",
+            "expected_edge_bps",
+            "realized_pnl_quote",
+            "venue",
+            "symbol",
+            "side",
+            "price",
+            "qty_base",
+            "fee_quote",
+        ] {
+            assert!(SCHEMA_SQL.contains(column), "{column}");
+        }
+    }
+
+    #[test]
+    fn corrupt_middle_line_does_not_block_startup() {
+        let dir = std::env::temp_dir().join("arb-store-test-corrupt.jsonl");
+        let _ = std::fs::remove_file(&dir);
+        {
+            let mut st = MemoryStore::with_jsonl(dir.clone()).unwrap();
+            st.record_trade(mk_trade(dec!(2), "s1")).unwrap();
+            let mut f = OpenOptions::new().append(true).open(&dir).unwrap();
+            writeln!(f, "not json at all").unwrap();
+            st.record_trade(mk_trade(dec!(3), "s1")).unwrap();
+        }
+        let reopened = MemoryStore::with_jsonl(dir.clone()).unwrap();
+        assert_eq!(reopened.trades().len(), 2);
+        assert_eq!(reopened.total_pnl(), dec!(5));
         let _ = std::fs::remove_file(&dir);
     }
 }

@@ -164,7 +164,9 @@ fn intent(
         strategy: "cex_dex".into(),
         legs: legs.into(),
         expected_edge_bps: edge,
-        ttl_ms: s.params.ttl_ms * 4,
+        // shortcut: 4x TTL kept stale DEX quotes alive; DEX quotes carry
+        // their own ts so the normal TTL plus max_book_age_ms is enough.
+        ttl_ms: s.params.ttl_ms,
         created_ms: view.now_ms,
         roundtrip: true,
     }
@@ -275,6 +277,7 @@ mod tests {
         let hits = st.on_tick(&v);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].legs[0].venue, Venue::Bybit);
+        assert_eq!(hits[0].ttl_ms, StrategyParams::default().ttl_ms);
     }
 
     #[test]

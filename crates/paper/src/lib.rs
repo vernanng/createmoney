@@ -90,7 +90,15 @@ impl PaperExecutor {
         let mut fills = Vec::new();
         for leg in &intent.legs {
             let px = match leg.market {
-                MarketKind::Perp => leg.price, // perp fills at mark; no spot book walk
+                // Perp fills at mark (no book to walk) with the same slip
+                // haircut as spot, so funding entries do not understate cost.
+                MarketKind::Perp => {
+                    let slip = leg.price * self.cfg.extra_slip_bps / Decimal::new(10_000, 0);
+                    match leg.side {
+                        Side::Buy => leg.price + slip,
+                        Side::Sell => leg.price - slip,
+                    }
+                }
                 MarketKind::Spot => {
                     // DEX legs fill at their quote price: AMM/aggregator
                     // quotes are already size-aware executable prices, and
@@ -465,6 +473,31 @@ mod tests {
         // Fee = 0.1% of 200 = 0.2 debited from margin; no BTC created or owed.
         assert_eq!(ex.balance(Venue::Bybit, "USDT"), dec!(999.8));
         assert_eq!(ex.balance(Venue::Bybit, "BTC"), dec!(0));
+    }
+
+    #[test]
+    fn perp_leg_pays_slip_haircut() {
+        let s = Symbol::new("BTC", "USDT");
+        let intent = Intent {
+            strategy: "funding_rate".into(),
+            expected_edge_bps: dec!(500),
+            ttl_ms: 1000,
+            created_ms: 0,
+            roundtrip: false,
+            legs: vec![TradeLeg {
+                venue: Venue::Bybit,
+                symbol: s,
+                side: Side::Sell,
+                price: dec!(100),
+                qty_base: dec!(2),
+                market: MarketKind::Perp,
+            }],
+        };
+        // Default 2bps slip: short fills 2bps below mark.
+        let mut ex = PaperExecutor::default();
+        ex.seed(Venue::Bybit, "USDT", dec!(1000));
+        let r = ex.execute(&intent, &BTreeMap::new(), 10).unwrap();
+        assert_eq!(r.fills[0].price, dec!(99.98));
     }
 
     #[test]

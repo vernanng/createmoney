@@ -503,4 +503,30 @@ mod tests {
         );
         assert!(ack.is_none());
     }
+
+    #[test]
+    fn connector_state_records_connects_and_errors() {
+        // Every venue task reports through here; a broken write would
+        // blind the /status connector health the engine serves.
+        let connectors: LiveConnectors = Arc::new(Mutex::new(BTreeMap::new()));
+        update_connector(&connectors, Venue::Binance, |c| {
+            c.connected = true;
+            c.last_msg_ms = Some(42);
+        });
+        update_connector(&connectors, Venue::Binance, |c| {
+            c.connected = false;
+            c.last_error = Some("boom".into());
+        });
+        let map = connectors.lock().unwrap();
+        let c = &map[&Venue::Binance];
+        assert!(!c.connected);
+        assert_eq!(c.last_msg_ms, Some(42));
+        assert_eq!(c.last_error.as_deref(), Some("boom"));
+    }
+
+    #[test]
+    fn raw_symbols_pass_through_non_idr_venues() {
+        let syms = vec![Symbol::new("BTC", "USDT")];
+        assert_eq!(raw_symbols(Venue::Binance, &syms), syms);
+    }
 }
