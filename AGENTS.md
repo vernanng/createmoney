@@ -2,9 +2,9 @@
 
 ## Commands
 
-- `cargo test --workspace` — run the full test suite
+- `cargo test --locked --workspace` — run the full test suite
 - `cargo fmt --check` — run the format task
-- `cargo clippy --workspace --all-targets -- -D warnings` — run the lint task
+- `cargo clippy --locked --workspace --all-targets -- -D warnings` — run the lint task
 - `cargo xtask ablate` — run the S8 ablation matrix, then the full suite
 
 ## Code Map
@@ -21,11 +21,12 @@
 - Import shared types through workspace path crates (e.g. `use arb_core::{...};`).
 - Write Rust against edition 2021.
 - Place unit tests inline in `#[cfg(test)] mod tests` inside the source file.
+- Re-export shared items with `pub use` in each crate's `lib.rs`.
 
 ## Branches
 
 - Never work directly on `main`. Use one branch per change: `feat/<name>` (feature), `fix/<name>` (bug fix), `chore/<name>` (tooling/deps/CI), `docs/<name>` (docs only), `refactor/<name>` (no behavior change), `hotfix/<name>` (urgent fix toward `main`).
-- Merge to `main` only after review and green CI (`cargo test --workspace`, `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`).
+- Merge to `main` only after review and green CI (`cargo test --locked --workspace`, `cargo fmt --check`, `cargo clippy --locked --workspace --all-targets -- -D warnings`).
 
 ## Docs
 
