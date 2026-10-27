@@ -241,13 +241,35 @@ pub fn route_viewer(
 /// POST semantics are modeled as path commands to keep the transport trivial:
 ///   GET  /health /status /metrics
 ///   POST /kill /revive /pause/<strategy> /resume/<strategy>
+/// When `expected_token` is Some, POST control paths require
+/// `?token=<value>` and return 401 without it. Reads stay open.
 pub fn route(
     method: &str,
     path: &str,
     control: &mut Control,
     status: &EngineStatus,
     metrics: &str,
+    expected_token: Option<&str>,
 ) -> (u16, String) {
+    let (path, query) = match path.split_once('?') {
+        Some((p, q)) => (p, q),
+        None => (path, ""),
+    };
+    let is_control = path == "/kill"
+        || path == "/revive"
+        || path.starts_with("/pause/")
+        || path.starts_with("/resume/");
+    if method == "POST" && is_control {
+        let ok = match expected_token {
+            None => true,
+            Some(t) => query
+                .split('&')
+                .any(|kv| kv.strip_prefix("token=") == Some(t)),
+        };
+        if !ok {
+            return (401, "{\"error\":\"unauthorized\"}".into());
+        }
+    }
     match (method, path) {
         ("GET", "/health") => (200, "{\"ok\":true}".into()),
         ("GET", "/status") => {
@@ -342,19 +364,58 @@ mod tests {
         assert!(m.contains("arb_usdt_idr_mid 18111.5"), "{m}");
         assert!(m.contains("arb_usdt_idr_fresh 1"), "{m}");
         assert!(m.contains("arb_usdt_idr_independent_sources 3"), "{m}");
-        assert_eq!(route("GET", "/health", &mut c, &st, &m).0, 200);
-        assert_eq!(route("POST", "/kill", &mut c, &st, &m).0, 200);
+        assert_eq!(route("GET", "/health", &mut c, &st, &m, None).0, 200);
+        assert_eq!(route("POST", "/kill", &mut c, &st, &m, None).0, 200);
         assert!(flag.load(Ordering::SeqCst));
-        route("POST", "/pause/triangular", &mut c, &st, &m);
+        route("POST", "/pause/triangular", &mut c, &st, &m, None);
         assert!(c.is_paused("triangular"));
         // Regression: /status must reflect the pause immediately, even though
         // the caller's snapshot still has paused_strategies=[].
-        let (_, body) = route("GET", "/status", &mut c, &st, &m);
+        let (_, body) = route("GET", "/status", &mut c, &st, &m, None);
         assert!(body.contains("\"usdt_idr\""), "status body: {body}");
         assert!(body.contains("\"state\":\"ok\""), "status body: {body}");
         assert!(body.contains("\"triangular\""), "status body: {body}");
         assert!(body.contains("\"killed\":true"), "status body: {body}");
-        assert_eq!(route("GET", "/nope", &mut c, &st, &m).0, 404);
+        assert_eq!(route("GET", "/nope", &mut c, &st, &m, None).0, 404);
+    }
+
+    #[test]
+    fn control_posts_need_token_when_set() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let mut c = Control::new(flag.clone());
+        let st = EngineStatus {
+            mode: "paper".into(),
+            killed: false,
+            trades: 0,
+            realized_pnl_quote: dec!(0),
+            opportunities_seen: 0,
+            connectors: vec![],
+            paused_strategies: vec![],
+            usdt_idr: UsdtIdrHealth::default(),
+        };
+        // Reads stay open; control posts are rejected without the token.
+        assert_eq!(
+            route("GET", "/health", &mut c, &st, "", Some("s3cr3t")).0,
+            200
+        );
+        assert_eq!(
+            route("POST", "/kill", &mut c, &st, "", Some("s3cr3t")).0,
+            401
+        );
+        assert!(!flag.load(Ordering::SeqCst));
+        assert_eq!(
+            route(
+                "POST",
+                "/kill?token=s3cr3t",
+                &mut c,
+                &st,
+                "",
+                Some("s3cr3t")
+            )
+            .0,
+            200
+        );
+        assert!(flag.load(Ordering::SeqCst));
     }
 
     #[test]

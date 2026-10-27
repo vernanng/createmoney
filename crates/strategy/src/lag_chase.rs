@@ -94,23 +94,29 @@ impl Strategy for LagChase {
             if qty <= Decimal::ZERO {
                 continue;
             }
+            // shortcut: leader touch was the wrong side (sell at ask, buy at
+            // bid) and ignored depth; VWAP both legs at the executed qty.
             let (buy_px, sell_px, buy_v, sell_v) = match side {
                 Side::Buy => {
-                    let Ok(vwap) = follower_book.vwap(Side::Buy, qty) else {
+                    let (Ok(fvwap), Ok(lvwap)) = (
+                        follower_book.vwap(Side::Buy, qty),
+                        leader_book.vwap(Side::Sell, qty),
+                    ) else {
                         continue;
                     };
-                    (vwap, lq.ask, self.follower, self.leader)
+                    (fvwap, lvwap, self.follower, self.leader)
                 }
                 Side::Sell => {
-                    let Ok(vwap) = follower_book.vwap(Side::Sell, qty) else {
+                    let (Ok(lvwap), Ok(fvwap)) = (
+                        leader_book.vwap(Side::Buy, qty),
+                        follower_book.vwap(Side::Sell, qty),
+                    ) else {
                         continue;
                     };
-                    (lq.bid, vwap, self.leader, self.follower)
+                    (lvwap, fvwap, self.leader, self.follower)
                 }
             };
-            // Touch pricing on the leader side is conservative enough for the
-            // nano-prototype; paper fills re-walk both books.
-            let _ = fq;
+            let _ = (lq, fq);
             let edge = net_edge_bps(
                 buy_px,
                 sell_px,

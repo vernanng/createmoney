@@ -23,7 +23,7 @@ everything after that.
 ## Quick start
 
 ```bash
-cargo test --workspace
+cargo test --locked --workspace
 cargo run -p arb-engine -- --config config.toml --ticks 40   # paper smoke run
 cargo run -p arb-engine -- --config config.toml              # run until Ctrl-C
 curl http://127.0.0.1:8787/health
@@ -266,9 +266,9 @@ engine binary currently constructs `CrossExchange::new`, so the gate is
 threshold from realized paper PnL, because one global 15 bps bar is wrong
 for both 10 bps and 51 bps venues. A losing round-trip raises that route's
 bar (EWMA, α = 0.3, toward `global_min − pnl_bps`); winners decay back to
-the global floor, never below it. Implemented and tested in
-`crates/strategy/src/fee_table.rs`; the engine does not call it yet — wire
-`threshold_for` / `record` into the tick loop before relying on it.
+the global floor, never below it. Test-only harness in
+`crates/strategy/src/fee_table.rs` (not compiled into the binary);
+wire `threshold_for` / `record` into the tick loop before relying on it.
 
 ### S8 `ablate` — proving the cost models matter
 
@@ -306,7 +306,9 @@ mattering, the corresponding cost model — or the test — is broken.
 ## Control API
 
 Localhost HTTP on `api_addr` (default `127.0.0.1:8787`), served by the
-binary from the tested route table in `crates/api`:
+binary from the tested route table in `crates/api`. Reads are open;
+if `API_TOKEN` is set in env, the POST rows below need `?token=<value>`
+(e.g. `POST /kill?token=$API_TOKEN`) and return 401 without it:
 
 | Route | Method | Effect |
 |---|---|---|
@@ -361,7 +363,7 @@ venue so the paper soak behaves like the live book.
 ```
 crates/core      types (Venue/Symbol/Intent), L2 book (snapshot/diff/VWAP/depth), decimal money math
 crates/feed      Binance/Bybit/OKX/Indodax parsers, WS URLs/frames, live WS tasks, IDR->USD books, synthetic feed
-crates/strategy  Strategy trait + MarketView; all six strategies + imbalance (S6) / fee_table (S7) / ablate (S8)
+crates/strategy  Strategy trait + MarketView; all six strategies + imbalance filter (S6); fee_table (S7) / ablate (S8) test harnesses
 crates/risk      pre-trade checks, per-trade/per-venue caps, kill-switch, exposure settle
 crates/paper     book-walking fill simulator (fees + slippage haircut, inventory-enforced)
 crates/exec      live send gate (armed check), env key loading, HMAC-SHA256 signing
@@ -456,8 +458,8 @@ manifest to auto-update on Apple Silicon.
   funding prints and cannot fire. Only the synthetic feed synthesizes them.
 - DEX quotes in the engine are paper pools / paper Jupiter prices; the
   quoting math is real, the reserves are not yet read from chain.
-- S6 imbalance gate and S7 fee table are implemented and tested but not
-  enabled in the engine binary's wiring.
+- S6 imbalance gate is implemented and tested but off in the engine
+  binary's wiring; S7 fee table is a test-only harness, not engine-wired.
 - Cross-exchange assumes pre-funded balances on both venues; rebalancing
   and transfer costs are out of loop and unmodeled.
 

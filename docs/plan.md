@@ -20,7 +20,8 @@ decision record. Beyond the original four strategies, the S-series shipped:
   auto-wired when Binance + Indodax are both configured.
 - S2 depth-adaptive sizing inside `cross_exchange`, S4 timed exit inside
   `funding_rate`, S5 multi-size sweep inside `cex_dex`.
-- S6 imbalance gate and S7 fee table: implemented and tested, not yet on in
-  the engine binary. S8 ablation harness runs via `cargo xtask ablate`.
+- S6 imbalance gate: implemented and tested, not yet on in the engine
+  binary. S7 fee table and S8 ablation harness are test-only harnesses
+  (`cargo xtask ablate` runs them).
 - Live WS venue tasks, control API (`/flows`, `/viewer`, pause/resume), and
   the GHCR + Watchtower paper CD. Venue order senders remain go-live work.

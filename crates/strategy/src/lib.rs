@@ -4,20 +4,22 @@ use arb_core::{Intent, OrderBook, Symbol, Venue};
 use rust_decimal::Decimal;
 use std::collections::BTreeMap;
 
-pub mod ablate;
+/// S8 cost-model falsifier: test harness only, never built into the binary.
+#[cfg(test)]
+mod ablate;
 pub mod cex_dex;
 pub mod cross_exchange;
-pub mod fee_table;
+/// S7 fee-threshold optimizer: test harness only, never built into the binary.
+#[cfg(test)]
+mod fee_table;
 pub mod funding;
 pub mod fx_triangle;
 pub mod imbalance;
 pub mod lag_chase;
 pub mod triangular;
 
-pub use ablate::{effective_fees, effective_params, matrix, Ablation};
 pub use cex_dex::{CexDex, DexQuote};
 pub use cross_exchange::{CrossExchange, ADAPTIVE_NOTIONALS};
-pub use fee_table::FeeTable;
 pub use funding::{accrued, FundingRate, FundingStrategy};
 pub use fx_triangle::{converted, FxTriangle};
 pub use imbalance::{both_sided_agrees, imbalance, quote_imbalance};
@@ -71,6 +73,11 @@ impl Default for StrategyParams {
 pub trait Strategy: Send {
     fn name(&self) -> &'static str;
     fn on_tick(&mut self, view: &MarketView) -> Vec<Intent>;
+    /// Pairs the strategy closed this tick (funding exits). The engine
+    /// releases their venue-cap exposure. Default: nothing ever closes.
+    fn take_closed(&mut self) -> Vec<(Venue, Symbol)> {
+        Vec::new()
+    }
 }
 
 /// Size (base qty) for a target quote notional at a reference price.

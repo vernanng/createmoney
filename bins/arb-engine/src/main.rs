@@ -131,6 +131,7 @@ struct Engine {
     strategies: Vec<Box<dyn Strategy>>,
     risk: RiskEngine,
     paper: PaperExecutor,
+    funding_notionals: BTreeMap<(Venue, String), Decimal>,
     store: MemoryStore,
     shared: Arc<Shared>,
     feed: SyntheticFeed,
@@ -217,9 +218,16 @@ impl Engine {
                 .to_limits(cfg.params.min_edge_bps, cfg.params.max_book_age_ms),
         );
         // Restored open (non-roundtrip) positions still consume venue caps.
+        let mut funding_notionals: BTreeMap<(Venue, String), Decimal> = BTreeMap::new();
         for t in store.trades() {
             if !t.intent.roundtrip {
                 risk.settle(&t.intent);
+                if t.intent.strategy == "funding_rate" {
+                    if let Some(leg) = t.intent.legs.first() {
+                        let n: Decimal = t.intent.legs.iter().map(|l| l.notional_quote()).sum();
+                        funding_notionals.insert((leg.venue, leg.symbol.to_string()), n);
+                    }
+                }
             }
         }
         let shared = Arc::new(Shared {
@@ -297,6 +305,7 @@ impl Engine {
             strategies,
             risk,
             paper,
+            funding_notionals,
             store,
             shared,
             feed: SyntheticFeed::new(0xC0FFEE, Decimal::new(100_000, 0)),
@@ -589,6 +598,13 @@ impl Engine {
                 Ok(result) => {
                     // Settle exposure or per-venue caps can never bind.
                     self.risk.settle(&intent);
+                    if intent.strategy == "funding_rate" && !intent.roundtrip {
+                        if let Some(leg) = intent.legs.first() {
+                            let n: Decimal = intent.legs.iter().map(|l| l.notional_quote()).sum();
+                            self.funding_notionals
+                                .insert((leg.venue, leg.symbol.to_string()), n);
+                        }
+                    }
                     {
                         let m = self
                             .per_strategy
@@ -622,7 +638,19 @@ impl Engine {
                 }
             }
         }
+        self.release_closed();
         self.publish();
+    }
+
+    /// Funding exits free their venue-cap exposure again.
+    fn release_closed(&mut self) {
+        for st in self.strategies.iter_mut() {
+            for (v, s) in st.take_closed() {
+                if let Some(n) = self.funding_notionals.remove(&(v, s.to_string())) {
+                    self.risk.release(v, n);
+                }
+            }
+        }
     }
 
     /// Push a fresh snapshot to the API task.
@@ -742,7 +770,7 @@ impl Engine {
     }
 }
 
-async fn serve_api(addr: String, shared: Arc<Shared>) {
+async fn serve_api(addr: String, token: Option<String>, shared: Arc<Shared>) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
     let listener = match TcpListener::bind(&addr).await {
@@ -752,18 +780,42 @@ async fn serve_api(addr: String, shared: Arc<Shared>) {
             return;
         }
     };
+    if token.is_none() && !addr.starts_with("127.") && !addr.starts_with("localhost") {
+        // shortcut: remote binds without a token leave POST /kill open;
+        // set API_TOKEN. Reads stay open either way.
+        tracing::warn!(addr, "control API on a non-loopback bind without API_TOKEN; POST /kill /revive /pause /resume need ?token=");
+    }
     tracing::info!(addr, "control API listening (GET /health /status /metrics /flows /viewer, POST /kill /revive /pause/<s> /resume/<s>)");
     loop {
         let Ok((mut sock, _)) = listener.accept().await else {
             continue;
         };
-        let shared = shared.clone();
+        let (shared, token) = (shared.clone(), token.clone());
         tokio::spawn(async move {
-            let mut buf = [0u8; 2048];
-            let Ok(n) = sock.read(&mut buf).await else {
+            // Read until the header block ends (or 64KB); one 2048-byte
+            // read truncated long requests.
+            let mut raw: Vec<u8> = Vec::with_capacity(2048);
+            let mut buf = [0u8; 1024];
+            loop {
+                let Ok(n) = sock.read(&mut buf).await else {
+                    return;
+                };
+                if n == 0 {
+                    break;
+                }
+                raw.extend_from_slice(&buf[..n]);
+                if raw.len() > 65536 {
+                    break;
+                }
+                let head = String::from_utf8_lossy(&raw);
+                if head.contains("\r\n\r\n") || head.contains("\n\n") {
+                    break;
+                }
+            }
+            if raw.is_empty() {
                 return;
-            };
-            let req = String::from_utf8_lossy(&buf[..n]);
+            }
+            let req = String::from_utf8_lossy(&raw).into_owned();
             let mut parts = req.split_whitespace();
             let (method, path) = (parts.next().unwrap_or("GET"), parts.next().unwrap_or("/"));
             // Route through the tested table in arb-api; no parallel handlers.
@@ -798,7 +850,8 @@ async fn serve_api(addr: String, shared: Arc<Shared>) {
                 } else {
                     match shared.control.lock() {
                         Ok(mut ctl) => {
-                            let (code, body) = route(method, path, &mut ctl, &status, &metrics);
+                            let (code, body) =
+                                route(method, path, &mut ctl, &status, &metrics, token.as_deref());
                             let ctype = if path == "/metrics" {
                                 "text/plain"
                             } else {
@@ -868,7 +921,11 @@ async fn main() -> anyhow::Result<()> {
     }
 
     if let Some(addr) = api_addr {
-        tokio::spawn(serve_api(addr, engine.shared.clone()));
+        // Secret from env only, like venue keys — never from the config file.
+        let api_token = std::env::var("API_TOKEN")
+            .ok()
+            .filter(|t| !t.trim().is_empty());
+        tokio::spawn(serve_api(addr, api_token, engine.shared.clone()));
     }
 
     let mut count: u64 = 0;
@@ -951,5 +1008,75 @@ mod tests {
                 (Venue::Binance, Symbol::new("ETH", "USDT")),
             ]
         );
+    }
+
+    /// Stub strategy that reports one closed funding pair, so the engine
+    /// drain path runs without a full tick.
+    struct Closer(Vec<(Venue, Symbol)>);
+    impl Strategy for Closer {
+        fn name(&self) -> &'static str {
+            "test_closer"
+        }
+        fn on_tick(&mut self, _view: &MarketView) -> Vec<Intent> {
+            vec![]
+        }
+        fn take_closed(&mut self) -> Vec<(Venue, Symbol)> {
+            std::mem::take(&mut self.0)
+        }
+    }
+
+    #[test]
+    fn closed_funding_pairs_release_venue_caps() {
+        let cfg: config::Config = toml::from_str(
+            r#"
+venues = ["binance"]
+symbols = ["BTC/USDT"]
+
+[engine]
+mode = "paper"
+feed = "synthetic"
+
+[params]
+min_edge_bps = 15
+slip_buffer_bps = 5
+target_notional_quote = 1000
+max_book_age_ms = 2000
+
+[risk]
+max_notional_quote_per_trade = 5000
+max_notional_quote_per_venue = 25000
+"#,
+        )
+        .unwrap();
+        let mut engine = Engine::new(cfg).unwrap();
+        // Stage an open funding position: two 1000-notional legs on Binance.
+        let leg = |side| TradeLeg {
+            venue: Venue::Binance,
+            symbol: Symbol::new("BTC", "USDT"),
+            side,
+            price: Decimal::new(100, 0),
+            qty_base: Decimal::new(10, 0),
+            market: MarketKind::Spot,
+        };
+        let entry = Intent {
+            strategy: "funding_rate".into(),
+            expected_edge_bps: Decimal::new(500, 0),
+            ttl_ms: 100,
+            created_ms: 0,
+            roundtrip: false,
+            legs: vec![leg(Side::Buy), leg(Side::Sell)],
+        };
+        engine.risk.record(&entry);
+        engine
+            .funding_notionals
+            .insert((Venue::Binance, "BTC/USDT".into()), Decimal::new(2_000, 0));
+        assert_eq!(engine.risk.exposure(Venue::Binance), Decimal::new(2_000, 0));
+        engine.strategies = vec![Box::new(Closer(vec![(
+            Venue::Binance,
+            Symbol::new("BTC", "USDT"),
+        )]))];
+        engine.release_closed();
+        assert_eq!(engine.risk.exposure(Venue::Binance), Decimal::ZERO);
+        assert!(engine.funding_notionals.is_empty());
     }
 }

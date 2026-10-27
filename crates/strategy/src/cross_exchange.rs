@@ -120,7 +120,21 @@ impl CrossExchange {
                 best = Some((buy_v, sell_v, qty, buy_px, sell_px, edge));
             }
         }
-        let (buy_v, sell_v, qty, buy_px, sell_px, edge) = best?;
+        let (buy_v, sell_v, qty, buy_px, _, _) = best?;
+        // shortcut: both legs execute the same quantity, so price the sell
+        // side at the buy quantity instead of the discarded sell size.
+        let sell_book = view.book(sell_v, sym)?;
+        let sell_px = sell_book.vwap(Side::Sell, qty).ok()?;
+        let edge = net_edge_bps(
+            buy_px,
+            sell_px,
+            buy_v.default_taker_bps(),
+            sell_v.default_taker_bps(),
+            self.params.slip_buffer_bps,
+        );
+        if edge < self.params.min_edge_bps {
+            return None;
+        }
         Some(Intent {
             strategy: self.name().into(),
             expected_edge_bps: edge,

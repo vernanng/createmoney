@@ -35,6 +35,9 @@ pub struct FundingStrategy {
     pub pairs: Vec<(Venue, Symbol)>,
     /// Pairs with an open position; each fires once until closed via `mark_closed`.
     open: Vec<(Venue, Symbol)>,
+    /// Pairs closed this tick; drained by the engine via `take_closed`
+    /// so venue-cap exposure is released.
+    closed: Vec<(Venue, Symbol)>,
     /// S4 exit timer: last-N annualized prints per pair for the flip EMA.
     history: BTreeMap<(Venue, String), Vec<Decimal>>,
     pub exit_window: usize,
@@ -54,6 +57,7 @@ impl FundingStrategy {
             min_annualized_bps,
             pairs,
             open: Vec::new(),
+            closed: Vec::new(),
             history: BTreeMap::new(),
         }
     }
@@ -77,7 +81,15 @@ impl FundingStrategy {
     }
 
     pub fn mark_closed(&mut self, venue: Venue, symbol: &Symbol) {
+        let was_open = self.open.iter().any(|(v, s)| *v == venue && s == symbol);
         self.open.retain(|(v, s)| !(*v == venue && s == symbol));
+        if was_open && !self.closed.iter().any(|(v, s)| *v == venue && s == symbol) {
+            self.closed.push((venue, symbol.clone()));
+        }
+    }
+
+    pub fn drain_closed(&mut self) -> Vec<(Venue, Symbol)> {
+        std::mem::take(&mut self.closed)
     }
 
     pub fn open_pairs(&self) -> &[(Venue, Symbol)] {
@@ -116,21 +128,31 @@ impl Strategy for FundingStrategy {
         "funding_rate"
     }
 
+    fn take_closed(&mut self) -> Vec<(Venue, Symbol)> {
+        self.drain_closed()
+    }
+
     fn on_tick(&mut self, view: &MarketView) -> Vec<Intent> {
         let mut out = Vec::new();
         // Clone pairs so we can mutate `open` while iterating.
         for (venue, sym) in self.pairs.clone() {
             let (venue, sym) = (&venue, &sym);
+            let is_open = self.open.iter().any(|(v, s)| v == venue && s == sym);
             let Some(fr) = view
                 .funding
                 .iter()
                 .find(|f| f.venue == *venue && f.symbol == *sym)
             else {
+                // No print this tick: an open pair can still exit on its
+                // stored history instead of persisting on a dead feed.
+                if is_open && self.should_exit(*venue, sym) {
+                    self.mark_closed(*venue, sym);
+                }
                 continue;
             };
             let ann = fr.annualized_bps();
             self.record(*venue, sym, ann);
-            if self.open.iter().any(|(v, s)| v == venue && s == sym) {
+            if is_open {
                 // S4: time the exit — flip below threshold closes, no churn.
                 if self.should_exit(*venue, sym) {
                     self.mark_closed(*venue, sym);
@@ -312,6 +334,29 @@ mod tests {
         );
         st.mark_closed(Venue::Bybit, &s);
         assert_eq!(st.on_tick(&v).len(), 1, "closed pair may re-enter");
+    }
+
+    #[test]
+    fn open_pair_exits_without_fresh_print() {
+        use crate::Strategy;
+        let s = Symbol::new("BTC", "USDT");
+        let mut st = FundingStrategy::new(
+            StrategyParams::default(),
+            dec!(500),
+            vec![(Venue::Bybit, s.clone())],
+        )
+        .with_exit(2, dec!(500));
+        st.record(Venue::Bybit, &s, dec!(100));
+        st.record(Venue::Bybit, &s, dec!(100));
+        st.open.push((Venue::Bybit, s.clone()));
+        // No funding print in view: exit must still fire from history.
+        let v = MarketView {
+            now_ms: 1_000,
+            ..Default::default()
+        };
+        assert!(st.on_tick(&v).is_empty());
+        assert!(st.open_pairs().is_empty());
+        assert_eq!(st.drain_closed(), vec![(Venue::Bybit, s)]);
     }
 
     #[test]

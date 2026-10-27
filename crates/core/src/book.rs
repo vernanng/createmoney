@@ -69,6 +69,10 @@ impl OrderBook {
         if self.last_update_id != 0 && first_id > self.last_update_id + 1 {
             return false; // gap: missed updates
         }
+        // shortcut: stale or duplicate diffs must not rewind the sequence.
+        if self.last_update_id != 0 && final_id <= self.last_update_id {
+            return false;
+        }
         for l in bids {
             Self::upsert(&mut self.bids, l);
         }
@@ -269,6 +273,15 @@ mod tests {
             2_000
         ));
         assert_eq!(b.best_bid().unwrap().price, dec!(98)); // 99 level removed
+    }
+
+    #[test]
+    fn stale_diff_does_not_rewind() {
+        let mut b = book();
+        assert!(!b.apply_diff(vec![], vec![], 5, 9, 2_000));
+        assert_eq!(b.last_update_id, 10);
+        assert!(!b.apply_diff(vec![], vec![], 11, 10, 2_000));
+        assert_eq!(b.last_update_id, 10);
     }
 
     #[test]

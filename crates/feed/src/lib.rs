@@ -170,6 +170,10 @@ pub fn parse_bybit_orderbook(book: &mut OrderBook, raw: &str) -> Result<bool, Fe
         Ok(true)
     } else {
         // Bybit deltas carry no first-id; treat sequence as both bounds.
+        // An empty book has no snapshot yet: never seed it from a delta.
+        if book.last_update_id == 0 {
+            return Ok(false);
+        }
         Ok(book.apply_diff(bids, asks, seq, seq, ts))
     }
 }
@@ -285,6 +289,15 @@ mod tests {
     }
 
     #[test]
+    fn bybit_delta_needs_snapshot_first() {
+        let mut b = OrderBook::new(Venue::Bybit, Symbol::new("BTC", "USDT"));
+        let ok = parse_bybit_orderbook(&mut b,
+            r#"{"topic":"orderbook.50.BTCUSDT","type":"delta","ts":5,"data":{"s":"BTCUSDT","b":[["99","1"]],"a":[["100","1"]],"u":7}}"#).unwrap();
+        assert!(!ok);
+        assert_eq!(b.last_update_id, 0);
+    }
+
+    #[test]
     fn okx_books_snapshot() {
         let mut b = OrderBook::new(Venue::Okx, Symbol::new("BTC", "USDT"));
         parse_okx_books(&mut b,
@@ -345,6 +358,25 @@ mod tests {
         assert!(
             auth.contains("tok123") && auth.contains("\"id\":1"),
             "{auth}"
+        );
+    }
+
+    #[test]
+    fn ws_endpoints_are_pinned() {
+        // A wrong URL fails silently at connect time (reconnect loop with
+        // no books), so pin the exact endpoints the tasks dial.
+        assert_eq!(ws_url(Venue::Binance), "wss://stream.binance.com:9443");
+        assert_eq!(
+            ws_url(Venue::Bybit),
+            "wss://stream.bybit.com/v5/public/spot"
+        );
+        assert_eq!(ws_url(Venue::Okx), "wss://ws.okx.com:8443/ws/v5/public");
+        assert_eq!(ws_url(Venue::Indodax), "wss://ws3.indodax.com/ws/");
+        assert_eq!(ws_url(Venue::Uniswap), "");
+        assert_eq!(perp_ws_url(Venue::Binance), "wss://fstream.binance.com");
+        assert_eq!(
+            perp_ws_url(Venue::Bybit),
+            "wss://stream.bybit.com/v5/public/linear"
         );
     }
 
