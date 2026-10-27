@@ -10,6 +10,13 @@ permissions:
   contents: read
   packages: write
 
+# All publish runs write the same mutable `latest` tag. Keep only the newest
+# run active so a slow build of an older commit cannot finish later and move
+# `latest` backward.
+concurrency:
+  group: publish-main
+  cancel-in-progress: true
+
 jobs:
   image:
     # CD gate: only ship what CI already passed on main.

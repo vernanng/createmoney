@@ -369,9 +369,11 @@ After commits, run `cargo xtask doc-check` and update the docs it names.
 
 ## Container image (CD)
 
-Every green `main` build publishes `ghcr.io/vernanng/createmoney:latest`
+The newest green `main` build publishes `ghcr.io/vernanng/createmoney:latest`
 (plus a SHA tag) via the `publish` workflow, which only runs after `ci`
-passes. Paper soak from the image:
+passes. Publish runs share one concurrency group, so a superseded in-progress
+build is cancelled instead of letting an older commit move `latest` backward.
+Paper soak from the image:
 
 ```bash
 docker pull ghcr.io/vernanng/createmoney:latest
