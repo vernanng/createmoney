@@ -1,7 +1,7 @@
 FROM rust:1-bookworm AS build
 WORKDIR /src
 COPY . .
-RUN cargo build --release -p arb-engine
+RUN cargo build --locked --release -p arb-engine
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
