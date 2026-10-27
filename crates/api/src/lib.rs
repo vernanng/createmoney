@@ -37,6 +37,41 @@ pub struct StrategyMetrics {
     pub realized_pnl_quote: Decimal,
 }
 
+/// Health of the live USDT/IDR divisor used to normalize Indodax books.
+/// `fresh` means a rate was accepted for conversion; `degraded` means the
+/// cross-checks could not confirm it (or no rate at all). In synthetic
+/// mode `mid` echoes the configured reference with state `synthetic`.
+#[derive(Debug, Clone, Serialize)]
+pub struct UsdtIdrHealth {
+    pub mid: Option<Decimal>,
+    pub spread_bps: Option<Decimal>,
+    pub book_ts_ms: Option<i64>,
+    pub age_ms: Option<i64>,
+    pub fresh: bool,
+    pub degraded: bool,
+    pub consensus_mid: Option<Decimal>,
+    pub deviation_bps: Option<Decimal>,
+    pub independent_sources: usize,
+    pub state: String,
+}
+
+impl Default for UsdtIdrHealth {
+    fn default() -> Self {
+        Self {
+            mid: None,
+            spread_bps: None,
+            book_ts_ms: None,
+            age_ms: None,
+            fresh: false,
+            degraded: true,
+            consensus_mid: None,
+            deviation_bps: None,
+            independent_sources: 0,
+            state: "missing_primary".into(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct EngineStatus {
     pub mode: String,
@@ -46,6 +81,7 @@ pub struct EngineStatus {
     pub opportunities_seen: u64,
     pub connectors: Vec<ConnectorHealth>,
     pub paused_strategies: Vec<String>,
+    pub usdt_idr: UsdtIdrHealth,
 }
 
 pub struct Control {
@@ -149,6 +185,32 @@ pub fn render_metrics(
             c.venue, c.fresh_books
         ));
     }
+    let fx = &status.usdt_idr;
+    s.push_str("# HELP arb_usdt_idr_fresh Live USDT/IDR divisor accepted\n# TYPE arb_usdt_idr_fresh gauge\n");
+    s.push_str(&format!(
+        "arb_usdt_idr_fresh {}\n",
+        if fx.fresh { 1 } else { 0 }
+    ));
+    s.push_str(&format!(
+        "arb_usdt_idr_degraded {}\n",
+        if fx.degraded { 1 } else { 0 }
+    ));
+    s.push_str(&format!(
+        "arb_usdt_idr_independent_sources {}\n",
+        fx.independent_sources
+    ));
+    if let Some(mid) = fx.mid {
+        s.push_str(&format!("arb_usdt_idr_mid {mid}\n"));
+    }
+    if let Some(spread) = fx.spread_bps {
+        s.push_str(&format!("arb_usdt_idr_spread_bps {spread}\n"));
+    }
+    if let Some(age) = fx.age_ms {
+        s.push_str(&format!("arb_usdt_idr_age_ms {age}\n"));
+    }
+    if let Some(dev) = fx.deviation_bps {
+        s.push_str(&format!("arb_usdt_idr_deviation_bps {dev}\n"));
+    }
     s
 }
 
@@ -243,6 +305,18 @@ mod tests {
                 last_error: None,
             }],
             paused_strategies: vec![],
+            usdt_idr: UsdtIdrHealth {
+                mid: Some(dec!(18111.5)),
+                spread_bps: Some(dec!(0.55)),
+                book_ts_ms: Some(1_000),
+                age_ms: Some(250),
+                fresh: true,
+                degraded: false,
+                consensus_mid: Some(dec!(18105)),
+                deviation_bps: Some(dec!(3.6)),
+                independent_sources: 3,
+                state: "ok".into(),
+            },
         };
         let m = render_metrics(
             &st,
@@ -265,6 +339,9 @@ mod tests {
             m.contains("arb_connector_fresh_books{venue=\"binance\"} 1"),
             "{m}"
         );
+        assert!(m.contains("arb_usdt_idr_mid 18111.5"), "{m}");
+        assert!(m.contains("arb_usdt_idr_fresh 1"), "{m}");
+        assert!(m.contains("arb_usdt_idr_independent_sources 3"), "{m}");
         assert_eq!(route("GET", "/health", &mut c, &st, &m).0, 200);
         assert_eq!(route("POST", "/kill", &mut c, &st, &m).0, 200);
         assert!(flag.load(Ordering::SeqCst));
@@ -273,6 +350,8 @@ mod tests {
         // Regression: /status must reflect the pause immediately, even though
         // the caller's snapshot still has paused_strategies=[].
         let (_, body) = route("GET", "/status", &mut c, &st, &m);
+        assert!(body.contains("\"usdt_idr\""), "status body: {body}");
+        assert!(body.contains("\"state\":\"ok\""), "status body: {body}");
         assert!(body.contains("\"triangular\""), "status body: {body}");
         assert!(body.contains("\"killed\":true"), "status body: {body}");
         assert_eq!(route("GET", "/nope", &mut c, &st, &m).0, 404);

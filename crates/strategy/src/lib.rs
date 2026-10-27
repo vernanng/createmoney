@@ -31,6 +31,11 @@ pub struct MarketView {
     pub dex_quotes: Vec<DexQuote>,
     pub funding: Vec<FundingRate>,
     pub now_ms: i64,
+    /// USDT/IDR divisor the engine used to normalize IDR books this tick
+    /// (live rate in live mode, configured reference in synthetic mode).
+    pub usdt_idr_mid: Option<Decimal>,
+    /// Timestamp of the book that divisor came from, when live.
+    pub usdt_idr_ts_ms: Option<i64>,
 }
 
 impl MarketView {

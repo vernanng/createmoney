@@ -2,12 +2,15 @@ mod config;
 
 use arb_api::{
     render_flows_envelope, render_metrics, route, route_viewer, ConnectorHealth, Control,
-    EngineStatus, StrategyMetrics,
+    EngineStatus, StrategyMetrics, UsdtIdrHealth,
 };
 use arb_core::{now_ms, Symbol, Venue};
 use arb_dex_evm::{to_dex_quote, DexKind, V2Pool};
 use arb_exec::{keys_from_env, ExecMode, LiveExecutor};
-use arb_feed::{pick_fresh, LiveBooks, LiveConnectors, SyntheticFeed};
+use arb_feed::{
+    implied_usdt_idr, pick_fresh, resolve_usdt_idr, FxCrossCheck, LiveBooks, LiveConnectors,
+    RateDecision, SyntheticFeed, UsdtIdrRate,
+};
 use arb_paper::PaperExecutor;
 use arb_risk::RiskEngine;
 use arb_store::{MemoryStore, SessionStart, Store, StoredTrade};
@@ -45,6 +48,8 @@ struct Shared {
     live_books: LiveBooks,
     /// Socket-level state written by the live venue tasks.
     live_connectors: LiveConnectors,
+    /// Latest independent USDT/IDR sample (Upbit Indonesia cross-check).
+    fx_cross: FxCrossCheck,
 }
 
 const ENGINE_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -133,6 +138,8 @@ struct Engine {
     per_strategy: BTreeMap<String, StrategyMetrics>,
     live: LiveExecutor,
     session_id: String,
+    /// Last tick's USDT/IDR rate decision, surfaced via status/metrics.
+    last_fx: RateDecision,
 }
 
 impl Engine {
@@ -225,11 +232,13 @@ impl Engine {
                 opportunities_seen: 0,
                 connectors: vec![],
                 paused_strategies: vec![],
+                usdt_idr: UsdtIdrHealth::default(),
             }),
             per_strategy: Mutex::new(BTreeMap::new()),
             flows: Mutex::new(render_flows_envelope(&[], 0)),
             live_books: LiveBooks::default(),
             live_connectors: LiveConnectors::default(),
+            fx_cross: FxCrossCheck::default(),
         });
         let mode = ExecMode::parse(&cfg.engine.mode).unwrap_or(ExecMode::Paper);
         let keys = keys_from_env();
@@ -295,6 +304,7 @@ impl Engine {
             per_strategy: BTreeMap::new(),
             live,
             session_id: new_session_id(),
+            last_fx: RateDecision::default(),
         })
     }
 
@@ -311,6 +321,66 @@ impl Engine {
         if let Err(e) = self.store.record_session_start(rec) {
             tracing::error!(%e, "session start write failed");
         }
+    }
+
+    /// Select this tick's USDT/IDR divisor from one live snapshot:
+    /// Indodax's own USDT/IDR book as primary, cross-checked against the
+    /// Upbit Indonesia sample and the crosses implied by fresh Binance
+    /// `X/USDT` vs Indodax `X/IDR` books. No static fallback, ever.
+    fn fx_decision(
+        &self,
+        live_map: &std::collections::BTreeMap<(Venue, String), arb_core::OrderBook>,
+        needed: &[Symbol],
+        now: i64,
+    ) -> RateDecision {
+        let cfg = &self.cfg.indodax;
+        let mut independent: Vec<Decimal> = Vec::new();
+        if let Some(sample) = self.shared.fx_cross.lock().map(|c| *c).unwrap_or_default() {
+            if let Some(r) = UsdtIdrRate::from_bid_ask(
+                sample.bid,
+                sample.ask,
+                sample.ts_ms,
+                now,
+                cfg.rate_max_age_ms,
+                cfg.rate_max_spread_bps,
+            ) {
+                independent.push(r.mid);
+            }
+        }
+        for sym in needed {
+            if sym.quote != "USDT" || sym.base == "USDT" {
+                continue;
+            }
+            let (Some(usdt_book), Some(idr_book)) = (
+                pick_fresh(
+                    live_map,
+                    Venue::Binance,
+                    &sym.to_string(),
+                    now,
+                    self.cfg.params.max_book_age_ms,
+                ),
+                pick_fresh(
+                    live_map,
+                    Venue::Indodax,
+                    &format!("{}/IDR", sym.base),
+                    now,
+                    self.cfg.params.max_book_age_ms,
+                ),
+            ) else {
+                continue;
+            };
+            if let Some(mid) = implied_usdt_idr(&idr_book, &usdt_book) {
+                independent.push(mid);
+            }
+        }
+        resolve_usdt_idr(
+            live_map.get(&(Venue::Indodax, "USDT/IDR".to_string())),
+            &independent,
+            now,
+            cfg.rate_max_age_ms,
+            cfg.rate_max_spread_bps,
+            cfg.rate_max_deviation_bps,
+        )
     }
 
     fn build_view(&mut self) -> MarketView {
@@ -339,6 +409,16 @@ impl Engine {
             .lock()
             .map(|m| m.clone())
             .unwrap_or_default();
+        // One snapshot, one divisor: every IDR book this tick converts at
+        // the same selected rate (or not at all, when the decision has none).
+        let fx = if live_mode {
+            self.fx_decision(&live_map, &needed, now)
+        } else {
+            RateDecision::default()
+        };
+        if live_mode {
+            self.last_fx = fx;
+        }
         for sym in &needed {
             let anchor = anchors
                 .get(&sym.to_string())
@@ -351,6 +431,26 @@ impl Engine {
                     continue;
                 }
                 if live_mode {
+                    if *v == Venue::Indodax {
+                        // Raw IDR books convert only under an accepted live
+                        // rate. Without one the venue is invisible this tick:
+                        // no static-rate fallback, no phantom edge.
+                        if sym.quote == "USDT" {
+                            if let (Some(rate), Some(raw)) = (
+                                fx.rate,
+                                pick_fresh(
+                                    &live_map,
+                                    *v,
+                                    &format!("{}/IDR", sym.base),
+                                    now,
+                                    self.cfg.params.max_book_age_ms,
+                                ),
+                            ) {
+                                view.put(arb_feed::idr_book_to_usd(&raw, rate.mid));
+                            }
+                        }
+                        continue;
+                    }
                     if let Some(b) = pick_fresh(
                         &live_map,
                         *v,
@@ -428,6 +528,13 @@ impl Engine {
         // feeds land, so the soak cannot accumulate invented entries.
         view.funding
             .extend(synthetic_funding(&self.cfg.engine.feed, &self.symbols, now));
+        // Publish the divisor for provenance (FxTriangle records it).
+        if live_mode {
+            view.usdt_idr_mid = fx.rate.map(|r| r.mid);
+            view.usdt_idr_ts_ms = fx.rate.map(|r| r.ts_ms);
+        } else {
+            view.usdt_idr_mid = Some(self.cfg.indodax.usd_idr);
+        }
         view
     }
 
@@ -601,6 +708,29 @@ impl Engine {
                 })
                 .collect(),
             paused_strategies,
+            usdt_idr: if live_mode {
+                let d = &self.last_fx;
+                UsdtIdrHealth {
+                    mid: d.rate.map(|r| r.mid),
+                    spread_bps: d.rate.map(|r| r.spread_bps),
+                    book_ts_ms: d.rate.map(|r| r.ts_ms),
+                    age_ms: d.rate.map(|r| now - r.ts_ms),
+                    fresh: d.rate.is_some(),
+                    degraded: d.degraded(),
+                    consensus_mid: d.consensus_mid,
+                    deviation_bps: d.deviation_bps,
+                    independent_sources: d.independent_sources,
+                    state: d.state.as_str().into(),
+                }
+            } else {
+                UsdtIdrHealth {
+                    mid: Some(self.cfg.indodax.usd_idr),
+                    fresh: true,
+                    degraded: false,
+                    state: "synthetic".into(),
+                    ..UsdtIdrHealth::default()
+                }
+            },
         }
     }
 }
@@ -643,6 +773,7 @@ async fn serve_api(addr: String, shared: Arc<Shared>) {
                         opportunities_seen: 0,
                         connectors: vec![],
                         paused_strategies: vec![],
+                        usdt_idr: UsdtIdrHealth::default(),
                     });
                 let per = shared
                     .per_strategy
@@ -720,9 +851,12 @@ async fn main() -> anyhow::Result<()> {
             &engine.shared.live_connectors,
             engine.cfg.venues.clone(),
             engine.symbols.clone(),
-            engine.cfg.indodax.usd_idr,
             indodax_token,
         );
+        if engine.cfg.venues.contains(&Venue::Indodax) {
+            // Independent USDT/IDR cross-check for the live divisor.
+            arb_feed::spawn_upbit_usdt_idr_task(&engine.shared.fx_cross);
+        }
         tracing::info!("live WS feeds starting (paper execution)");
     }
 

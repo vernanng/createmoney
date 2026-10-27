@@ -158,14 +158,48 @@ fn default_gas() -> Decimal {
     Decimal::new(1, 0)
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize)]
 pub struct IndodaxCfg {
-    /// USD/IDR reference for normalizing IDR books. Update daily or feed live.
+    /// Synthetic-feed reference for IDR books. Live mode never uses this:
+    /// it converts with the streamed USDT/IDR rate (see `arb_feed::fx`)
+    /// and withholds Indodax books when no live rate is acceptable.
     #[serde(default = "default_usdidr")]
     pub usd_idr: Decimal,
+    /// Max age of the Indodax USDT/IDR book before it stops being a divisor.
+    #[serde(default = "default_rate_max_age_ms")]
+    pub rate_max_age_ms: i64,
+    /// Max top-of-book spread of the USDT/IDR book, in bps of mid.
+    #[serde(default = "default_rate_max_spread_bps")]
+    pub rate_max_spread_bps: Decimal,
+    /// Max deviation of the Indodax rate from the independent-source
+    /// consensus (Upbit Indonesia + implied crosses), in bps. Beyond it,
+    /// Indodax books are withheld instead of converted.
+    #[serde(default = "default_rate_max_deviation_bps")]
+    pub rate_max_deviation_bps: Decimal,
+}
+// Manual Default: `#[serde(default)]` on the parent field bypasses the
+// per-field serde defaults when the whole [indodax] table is absent.
+impl Default for IndodaxCfg {
+    fn default() -> Self {
+        Self {
+            usd_idr: default_usdidr(),
+            rate_max_age_ms: default_rate_max_age_ms(),
+            rate_max_spread_bps: default_rate_max_spread_bps(),
+            rate_max_deviation_bps: default_rate_max_deviation_bps(),
+        }
+    }
 }
 fn default_usdidr() -> Decimal {
     Decimal::new(16_000, 0)
+}
+fn default_rate_max_age_ms() -> i64 {
+    30_000
+}
+fn default_rate_max_spread_bps() -> Decimal {
+    Decimal::new(50, 0)
+}
+fn default_rate_max_deviation_bps() -> Decimal {
+    Decimal::new(300, 0)
 }
 
 impl Config {
@@ -212,5 +246,12 @@ max_notional_quote_per_venue = 25000
         let syms = cfg.symbols().unwrap();
         assert_eq!(syms.len(), 2);
         assert_eq!(syms[1], Symbol::new("SOL", "USDT"));
+        // No [indodax] table at all: live-rate guards still get real
+        // defaults, not zeroes (serde field defaults do not run when the
+        // whole table is defaulted).
+        assert_eq!(cfg.indodax.rate_max_age_ms, 30_000);
+        assert_eq!(cfg.indodax.rate_max_spread_bps, Decimal::new(50, 0));
+        assert_eq!(cfg.indodax.rate_max_deviation_bps, Decimal::new(300, 0));
+        assert_eq!(cfg.indodax.usd_idr, Decimal::new(16_000, 0));
     }
 }

@@ -7,9 +7,17 @@ use rust_decimal::Decimal;
 use serde_json::Value;
 use std::str::FromStr;
 
+pub mod fx;
 pub mod live;
 pub mod synthetic;
-pub use live::{pick_fresh, spawn_venue_tasks, ConnectorState, LiveBooks, LiveConnectors};
+pub use fx::{
+    implied_usdt_idr, resolve_usdt_idr, FxCrossCheck, FxSample, RateDecision, RateState,
+    UsdtIdrRate,
+};
+pub use live::{
+    pick_fresh, spawn_upbit_usdt_idr_task, spawn_venue_tasks, ConnectorState, LiveBooks,
+    LiveConnectors,
+};
 pub use synthetic::SyntheticFeed;
 
 #[derive(Debug, thiserror::Error)]
