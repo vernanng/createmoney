@@ -51,7 +51,7 @@ cargo xtask ablate    # S8 ablation matrix, then the full suite
 | Binance | CEX | spot books, perp funding, lag leader | 10 bps (0.10%) |
 | Bybit | CEX | spot books, perp funding | 10 bps |
 | OKX | CEX | spot books, perp funding | 10 bps |
-| Indodax | CEX (IDR) | IDR books normalized to USD via `[indodax] usd_idr` | 51 bps (~0.51% incl. tax) |
+| Indodax | CEX (IDR) | IDR books normalized via live USDT/IDR rate (own book, cross-checked; `[indodax] usd_idr` is synthetic-only) | 51 bps (~0.51% incl. tax) |
 | Uniswap | DEX (EVM) | V2 pools quoted locally; V3 quoter types/addresses | 30 bps V2 (0.30%) |
 | PancakeSwap | DEX (EVM) | V2 pools quoted locally; V3 quoter types/addresses | 25 bps V2 (0.25%) |
 | Jupiter | DEX (Solana) | Swap API quote URL building + parsing | 0 bps (inside the route) |
@@ -225,19 +225,27 @@ leg on Binance.
 
 ### 6. `fx_triangle` — S3 IDR-FX triangle (Binance ↔ Indodax)
 
-Exploits mispricing between Indodax's IDR books (normalized to USD at the
-`[indodax] usd_idr` reference rate, default in config: 19000) and Binance's
-USDT books. Checks both directions (buy Binance / sell Indodax and the
-reverse) at VWAP for `target_notional_quote`, net of the real 10 bps vs
-51 bps fee asymmetry.
+Exploits mispricing between Indodax's IDR books (normalized to USDT at
+the live USDT/IDR rate) and Binance's USDT books. Checks both directions
+(buy Binance / sell Indodax and the reverse) at VWAP for
+`target_notional_quote`, net of the real 10 bps vs 51 bps fee asymmetry.
 
 - The catch this strategy exists to respect: a stale USD/IDR reference
   manufactures phantom spreads far larger than any real venue edge (a
-  16000 vs 19000 rate error moves the USD print by >1000 bps). The
-  conversion rate is therefore explicit configuration (`converted(px_idr,
-  usd_idr)`), and the tests assert fee-free-only "edges" must not fire.
-  Keep `usd_idr` fresh (update daily or feed it live) or this strategy
-  trades accounting error, not arbitrage.
+  16000 vs 19000 rate error moves the USD print by >1000 bps; the old
+  static 19000 did exactly this against an ~18100 market). In live mode
+  the divisor is therefore streamed, never configured: Indodax's own
+  USDT/IDR order-book midpoint, validated per tick against independent
+  USDT/IDR sources — the Upbit Indonesia book plus the crosses implied
+  by fresh Binance `X/USDT` vs Indodax `X/IDR` books (`crates/feed/src/fx.rs`).
+  If the primary book is stale/crossed/wide, or deviates from the
+  independent consensus by more than `[indodax] rate_max_deviation_bps`
+  (default 300), Indodax books are withheld entirely — there is no
+  fallback rate. Cash USD/IDR (Google, ECB reference) is never used: it
+  prices bank dollars, not USDT. `[indodax] usd_idr` now applies to the
+  synthetic feed only. Rate state is visible at `/status` (`usdt_idr`)
+  and as `arb_usdt_idr_*` metrics, and the strategy records the divisor
+  it actually saw (`usd_idr_used`).
 - Engine wiring: same auto-enable rule as `lag_chase` (`cross_exchange`
   on + Binance and Indodax present). `roundtrip = true`.
 
@@ -338,7 +346,10 @@ Top-level `venues` / `symbols` must stay above the first `[table]` header.
 | `[dex] uniswap / pancakeswap / jupiter` | all `true` | quote sources for `cex_dex` |
 | `[dex] evm_gas_quote` | 1 | USD gas estimate per EVM swap (raise for L1) |
 | `[dex] solana_fee_quote` | 1 | USD fee estimate per Jupiter swap |
-| `[indodax] usd_idr` | 19000 | USD/IDR reference for IDR→USD normalization (code fallback: 16000) |
+| `[indodax] usd_idr` | 19000 | synthetic-feed IDR reference only; live mode streams USDT/IDR (code fallback: 16000) |
+| `[indodax] rate_max_age_ms` | 30000 | max age of the live USDT/IDR book used as divisor |
+| `[indodax] rate_max_spread_bps` | 50 | max USDT/IDR top-of-book spread (bps of mid) |
+| `[indodax] rate_max_deviation_bps` | 300 | max deviation vs independent consensus before Indodax is withheld |
 | `[paper] start_quote_per_venue` | 1,000,000 | seeded USDT/USDC per venue incl. DEX wallets |
 | `[paper] start_base_per_asset` | 100 | seeded base units per symbol asset |
 
@@ -423,8 +434,9 @@ manifest to auto-update on Apple Silicon.
    build + Solana send in `dex-sol`.
 4. Set keys in env, set `mode = "live"`, keep caps tiny. The executor
    refuses to arm without keys; the kill-switch (`POST /kill`) blocks all
-   intents. Verify Indodax fees and refresh `usd_idr` before enabling
-   `lag_chase` / `fx_triangle` with real money.
+   intents. Verify Indodax fees, and confirm `/status` shows
+   `usdt_idr.state = "ok"`, before enabling `lag_chase` / `fx_triangle`
+   with real money.
 
 ## Safety defaults
 

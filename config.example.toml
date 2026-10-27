@@ -37,7 +37,10 @@ evm_gas_quote = 1
 solana_fee_quote = 1
 
 [indodax]
-usd_idr = 19000
+usd_idr = 19000        # synthetic feed only; live mode streams USDT/IDR and never uses this
+rate_max_age_ms = 30000        # live USDT/IDR book older than this stops being the divisor
+rate_max_spread_bps = 50       # live USDT/IDR top-of-book spread cap (bps of mid)
+rate_max_deviation_bps = 300   # vs independent consensus (Upbit ID + implied crosses); beyond it Indodax is withheld
 
 # Starting capital (simulated seed per venue/asset). Paper fills enforce
 # inventory: unfunded buys and sells of unheld assets abort the intent.

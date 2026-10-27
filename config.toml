@@ -37,7 +37,10 @@ evm_gas_quote = 1      # USD per swap (L2-ish). Raise for L1.
 solana_fee_quote = 1
 
 [indodax]
-usd_idr = 19000        # reference rate for IDR -> USD book normalization
+usd_idr = 19000        # synthetic feed only; live mode streams USDT/IDR and never uses this
+rate_max_age_ms = 30000        # live USDT/IDR book older than this stops being the divisor
+rate_max_spread_bps = 50       # live USDT/IDR top-of-book spread cap (bps of mid)
+rate_max_deviation_bps = 300   # vs independent consensus (Upbit ID + implied crosses); beyond it Indodax is withheld
 
 [paper]
 start_quote_per_venue = 1000000  # USDT/USDC seeded per venue (incl. DEX wallets)

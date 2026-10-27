@@ -19,7 +19,8 @@ pub struct FxTriangle {
     pub ref_venue: Venue,
     pub idr_venue: Venue,
     pub symbols: Vec<Symbol>,
-    /// Rate the engine used to normalize IDR books (stale in prod).
+    /// Rate the engine used to normalize IDR books. Seeded from config,
+    /// then overwritten each tick from the view's live divisor.
     pub usd_idr_used: Decimal,
 }
 
@@ -47,6 +48,11 @@ impl Strategy for FxTriangle {
     }
 
     fn on_tick(&mut self, view: &MarketView) -> Vec<Intent> {
+        // Record the divisor that actually normalized this tick's books,
+        // so audit/replay never has to guess which rate produced a print.
+        if let Some(mid) = view.usdt_idr_mid {
+            self.usd_idr_used = mid;
+        }
         let mut out = Vec::new();
         for sym in &self.symbols {
             let (Some(rb), Some(ib)) = (
@@ -185,5 +191,28 @@ mod tests {
         );
         // 100.1 -> 100.15 is ~5bps gross < fees + slip: must stay out.
         assert!(st.on_tick(&v).is_empty());
+    }
+
+    #[test]
+    fn records_the_live_divisor_from_the_view() {
+        let mut v = MarketView {
+            now_ms: 1_000,
+            usdt_idr_mid: Some(dec!(18111.5)),
+            usdt_idr_ts_ms: Some(999),
+            ..Default::default()
+        };
+        let mut st = FxTriangle::new(
+            StrategyParams::default(),
+            Venue::Binance,
+            Venue::Indodax,
+            vec![Symbol::new("BTC", "USDT")],
+            dec!(19000), // stale config seed
+        );
+        assert!(st.on_tick(&v).is_empty());
+        assert_eq!(st.usd_idr_used, dec!(18111.5));
+        // Without a divisor on the view the last recorded rate stands.
+        v.usdt_idr_mid = None;
+        assert!(st.on_tick(&v).is_empty());
+        assert_eq!(st.usd_idr_used, dec!(18111.5));
     }
 }

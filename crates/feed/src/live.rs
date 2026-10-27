@@ -2,19 +2,20 @@
 //! Paper mode consumes these through [`pick_fresh`]; stale venues are
 //! skipped, never backfilled with synthetic data.
 
+use super::fx::{parse_upbit_orderbook, upbit_subscribe_frame, FxCrossCheck, UPBIT_ID_WS_URL};
 use super::{
-    idr_book_to_usd, indodax_auth_frame, parse_binance_partial, parse_bybit_orderbook,
-    parse_indodax_depth, parse_okx_books, subscribe_frame, ws_url,
+    indodax_auth_frame, parse_binance_partial, parse_bybit_orderbook, parse_indodax_depth,
+    parse_okx_books, subscribe_frame, ws_url,
 };
 use arb_core::{now_ms, OrderBook, Symbol, Venue};
 use futures_util::StreamExt;
-use rust_decimal::Decimal;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// Shared live books, keyed by (venue, `"BASE/QUOTE"`). Indodax books are
-/// stored converted to USDT terms (see [`idr_book_to_usd`]).
+/// stored raw in IDR terms (including the `USDT/IDR` rate book); the
+/// engine converts per tick with the selected live rate (see [`super::fx`]).
 pub type LiveBooks = Arc<Mutex<BTreeMap<(Venue, String), OrderBook>>>;
 
 /// Socket-level state for one venue task, tracked separately from book
@@ -72,7 +73,6 @@ pub fn spawn_venue_tasks(
     connectors: &LiveConnectors,
     venues: Vec<Venue>,
     symbols: Vec<Symbol>,
-    usd_idr: Decimal,
     indodax_token: Option<String>,
 ) {
     // Pin the TLS crypto provider explicitly: feature unification across the
@@ -95,15 +95,7 @@ pub fn spawn_venue_tasks(
             let mut backoff = Duration::from_secs(1);
             loop {
                 update_connector(&connectors, v, |c| c.connected = false);
-                match connect_and_stream(
-                    v,
-                    &symbols,
-                    usd_idr,
-                    &shared,
-                    &connectors,
-                    token.as_deref(),
-                )
-                .await
+                match connect_and_stream(v, &symbols, &shared, &connectors, token.as_deref()).await
                 {
                     Err(e) => {
                         update_connector(&connectors, v, |c| {
@@ -122,12 +114,19 @@ pub fn spawn_venue_tasks(
 }
 
 /// Raw subscription symbols: Indodax quotes in IDR, everything else as-is.
+/// Indodax additionally always carries `USDT/IDR` itself: that book is the
+/// primary live rate the engine converts the other IDR books with.
 fn raw_symbols(venue: Venue, symbols: &[Symbol]) -> Vec<Symbol> {
     if venue == Venue::Indodax {
-        symbols
+        let mut out: Vec<Symbol> = symbols
             .iter()
             .map(|s| Symbol::new(&s.base, "IDR"))
-            .collect()
+            .collect();
+        let rate = Symbol::new("USDT", "IDR");
+        if !out.contains(&rate) {
+            out.push(rate);
+        }
+        out
     } else {
         symbols.to_vec()
     }
@@ -146,7 +145,6 @@ fn venue_spelling(venue: Venue, s: &Symbol) -> String {
 async fn connect_and_stream(
     venue: Venue,
     symbols: &[Symbol],
-    usd_idr: Decimal,
     shared: &LiveBooks,
     connectors: &LiveConnectors,
     indodax_token: Option<&str>,
@@ -221,21 +219,73 @@ async fn connect_and_stream(
             _ => {}
         }
         if let Some(key) = apply_msg(venue, &raw, &mut books, msg.to_text()?, now_ms()) {
+            // Books publish raw in their quoted terms. IDR conversion moved
+            // to the engine tick, where one snapshot yields one live rate.
             let mut map = lock_map(shared);
-            if venue == Venue::Indodax {
-                if let Some(raw_book) = books.get(&key) {
-                    let base = key.split('/').next().unwrap_or(&key);
-                    map.insert(
-                        (venue, format!("{base}/USDT")),
-                        idr_book_to_usd(raw_book, usd_idr),
-                    );
-                }
-            } else if let Some(b) = books.get(&key) {
+            if let Some(b) = books.get(&key) {
                 map.insert((venue, key), b.clone());
             }
         }
     }
 }
+/// Spawn the independent USDT/IDR cross-check stream (Upbit Indonesia,
+/// public, no key). This feeds rate validation only; it is not a trading
+/// venue and never becomes the conversion divisor.
+pub fn spawn_upbit_usdt_idr_task(cross: &FxCrossCheck) {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let cross = cross.clone();
+    tokio::spawn(async move {
+        let mut backoff = Duration::from_secs(1);
+        loop {
+            match stream_upbit_usdt_idr(&cross).await {
+                Err(e) => {
+                    tracing::warn!(%e, backoff_s = backoff.as_secs(), "upbit IDR cross-check down; reconnecting");
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(Duration::from_secs(30));
+                }
+                Ok(()) => backoff = Duration::from_secs(1),
+            }
+        }
+    });
+}
+
+async fn stream_upbit_usdt_idr(cross: &FxCrossCheck) -> anyhow::Result<()> {
+    use futures_util::SinkExt;
+    use tokio_tungstenite::tungstenite::Message;
+    let (ws, _) = tokio::time::timeout(
+        Duration::from_secs(10),
+        tokio_tungstenite::connect_async(UPBIT_ID_WS_URL),
+    )
+    .await??;
+    let (mut sink, mut stream) = ws.split();
+    sink.send(Message::Text(upbit_subscribe_frame().to_string().into()))
+        .await?;
+    tracing::info!("upbit USDT/IDR cross-check connected");
+    loop {
+        let msg = tokio::time::timeout(Duration::from_secs(30), stream.next()).await?;
+        let Some(msg) = msg else {
+            anyhow::bail!("stream closed by venue");
+        };
+        match msg? {
+            Message::Ping(p) => sink.send(Message::Pong(p)).await?,
+            Message::Close(f) => anyhow::bail!("stream closed by venue: {f:?}"),
+            Message::Text(t) => {
+                if let Some(sample) = parse_upbit_orderbook(&t) {
+                    *cross.lock().unwrap_or_else(|e| e.into_inner()) = Some(sample);
+                }
+            }
+            Message::Binary(b) => {
+                if let Ok(t) = std::str::from_utf8(&b) {
+                    if let Some(sample) = parse_upbit_orderbook(t) {
+                        *cross.lock().unwrap_or_else(|e| e.into_inner()) = Some(sample);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Route one text message into its book. Returns the raw book key touched
 /// (`"BASE/QUOTE"`, IDR-quoted on Indodax), or `None` when the message
 /// carries no book (subscription acks, tickers, other channels).
@@ -398,9 +448,28 @@ mod tests {
     }
 
     #[test]
-    fn router_converts_indodax_to_usdt_key() {
+    fn router_keeps_indodax_books_raw_and_carries_the_rate_pair() {
         let raws = raw_symbols(Venue::Indodax, &[Symbol::new("BTC", "USDT")]);
         assert_eq!(raws[0], Symbol::new("BTC", "IDR"));
+        // The USDT/IDR rate book rides along exactly once, even when the
+        // configured symbols already imply it.
+        assert_eq!(
+            raws.iter()
+                .filter(|s| **s == Symbol::new("USDT", "IDR"))
+                .count(),
+            1
+        );
+        let dupes = raw_symbols(
+            Venue::Indodax,
+            &[Symbol::new("BTC", "USDT"), Symbol::new("USDT", "USDT")],
+        );
+        assert_eq!(
+            dupes
+                .iter()
+                .filter(|s| **s == Symbol::new("USDT", "IDR"))
+                .count(),
+            1
+        );
         let mut books = BTreeMap::new();
         // Current live wire shape (documented channel + bid/ask objects).
         let hit = apply_msg(
@@ -412,6 +481,18 @@ mod tests {
         );
         assert_eq!(hit.as_deref(), Some("BTC/IDR"));
         assert_eq!(books["BTC/IDR"].best_ask().unwrap().price, dec!(1616000000));
+        // The rate pair parses under its own key — never as USDT/USDT.
+        let hit = apply_msg(
+            Venue::Indodax,
+            &raws,
+            &mut books,
+            r#"{"result":{"channel":"market:order-book-usdtidr","data":{"data":{"pair":"usdtidr","ask":[{"price":"18112","usdt_volume":"5000"}],"bid":[{"price":"18111","usdt_volume":"7000"}]}}}}"#,
+            11,
+        );
+        assert_eq!(hit.as_deref(), Some("USDT/IDR"));
+        assert_eq!(books["USDT/IDR"].best_bid().unwrap().price, dec!(18111));
+        assert_eq!(books["USDT/IDR"].best_ask().unwrap().qty, dec!(5000));
+        assert!(!books.contains_key("USDT/USDT"));
         // Auth and subscribe acknowledgements touch no book.
         let ack = apply_msg(
             Venue::Indodax,
