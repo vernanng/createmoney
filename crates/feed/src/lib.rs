@@ -9,7 +9,7 @@ use std::str::FromStr;
 
 pub mod live;
 pub mod synthetic;
-pub use live::{pick_fresh, spawn_venue_tasks, LiveBooks};
+pub use live::{pick_fresh, spawn_venue_tasks, ConnectorState, LiveBooks, LiveConnectors};
 pub use synthetic::SyntheticFeed;
 
 #[derive(Debug, thiserror::Error)]
@@ -97,7 +97,7 @@ pub fn subscribe_frame(venue: Venue, symbol: &Symbol) -> Value {
         }),
         Venue::Indodax => serde_json::json!({
             "method": 1,
-            "params": {"channel": format!("market:orderbook-{}", symbol.indodax())},
+            "params": {"channel": format!("market:order-book-{}", symbol.indodax())},
             "id": 2
         }),
         _ => Value::Null,
@@ -183,17 +183,41 @@ pub fn parse_okx_books(book: &mut OrderBook, raw: &str) -> Result<bool, FeedErro
 }
 
 // ---------- Indodax ----------
-// Orderbook channel payloads arrive as {"result":{"channel":"market:orderbook-btcidr","data":{...}}}
-// Depth REST shape: {"buy":[[px, qtyIdr?]], "sell":[[..]]} — parse defensively: first two cols.
+// Live orderbook payloads arrive as
+// {"result":{"channel":"market:order-book-btcidr","data":{"data":
+//   {"pair":"btcidr","bid":[{"price":"..","btc_volume":"..",..}],"ask":[..]}}}}
+// The depth REST shape is {"buy":[[px, qty]], "sell":[[..]]}; both are parsed.
+fn indodax_object_levels(arr: &Value, base: &str) -> Result<Vec<BookLevel>, FeedError> {
+    let vol_key = format!("{}_volume", base.to_lowercase());
+    let mut out = Vec::new();
+    for row in arr.as_array().cloned().unwrap_or_default() {
+        out.push(BookLevel {
+            price: dec_val(&row["price"])?,
+            qty: dec_val(&row[&vol_key])?,
+        });
+    }
+    Ok(out)
+}
+
 pub fn parse_indodax_depth(book: &mut OrderBook, raw: &str, ts_ms: i64) -> Result<(), FeedError> {
     let v: Value = serde_json::from_str(raw)?;
-    let root = if v.get("buy").is_some() || v.get("sell").is_some() {
+    let root = if v.get("buy").is_some()
+        || v.get("sell").is_some()
+        || v.get("bid").is_some()
+        || v.get("ask").is_some()
+    {
         &v
     } else {
         &v["result"]["data"]["data"]
     };
-    let bids = levels(&root["buy"])?;
-    let asks = levels(&root["sell"])?;
+    let (bids, asks) = if root.get("bid").is_some() || root.get("ask").is_some() {
+        (
+            indodax_object_levels(&root["bid"], &book.symbol.base)?,
+            indodax_object_levels(&root["ask"], &book.symbol.base)?,
+        )
+    } else {
+        (levels(&root["buy"])?, levels(&root["sell"])?)
+    };
     if bids.is_empty() && asks.is_empty() {
         return Err(FeedError::BadPayload {
             venue: Venue::Indodax,
@@ -275,6 +299,24 @@ mod tests {
     }
 
     #[test]
+    fn indodax_live_object_depth() {
+        // Regression: the live WS payload is bid/ask objects keyed by
+        // `<base>_volume`, not the REST buy/sell arrays. The old parser
+        // read it as empty depth, so no Indodax book ever landed.
+        let mut b = OrderBook::new(Venue::Indodax, Symbol::new("BTC", "IDR"));
+        parse_indodax_depth(
+            &mut b,
+            r#"{"result":{"channel":"market:order-book-btcidr","data":{"data":{"pair":"btcidr","ask":[{"price":"1445022000","btc_volume":"0.54152019","idr_volume":"782508588"}],"bid":[{"price":"1445021000","btc_volume":"0.25","idr_volume":"361255250"}]},"offset":74487609}}}"#,
+            10,
+        )
+        .unwrap();
+        assert_eq!(b.best_bid().unwrap().price, dec!(1445021000));
+        assert_eq!(b.best_bid().unwrap().qty, dec!(0.25));
+        assert_eq!(b.best_ask().unwrap().price, dec!(1445022000));
+        assert_eq!(b.best_ask().unwrap().qty, dec!(0.54152019));
+    }
+
+    #[test]
     fn subscribe_frames_carry_symbols() {
         let s = Symbol::new("BTC", "USDT");
         assert!(subscribe_frame(Venue::Binance, &s)
@@ -286,6 +328,16 @@ mod tests {
         assert!(subscribe_frame(Venue::Bybit, &s)
             .to_string()
             .contains("orderbook.50.BTCUSDT"));
+        // Indodax documents `market:order-book-<pair>` (hyphenated), and
+        // the connection must be authenticated before subscribing.
+        assert!(subscribe_frame(Venue::Indodax, &Symbol::new("BTC", "IDR"))
+            .to_string()
+            .contains("market:order-book-btcidr"));
+        let auth = indodax_auth_frame("tok123").to_string();
+        assert!(
+            auth.contains("tok123") && auth.contains("\"id\":1"),
+            "{auth}"
+        );
     }
 
     #[test]

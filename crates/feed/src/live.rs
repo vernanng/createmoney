@@ -3,8 +3,8 @@
 //! skipped, never backfilled with synthetic data.
 
 use super::{
-    idr_book_to_usd, parse_binance_partial, parse_bybit_orderbook, parse_indodax_depth,
-    parse_okx_books, subscribe_frame, ws_url,
+    idr_book_to_usd, indodax_auth_frame, parse_binance_partial, parse_bybit_orderbook,
+    parse_indodax_depth, parse_okx_books, subscribe_frame, ws_url,
 };
 use arb_core::{now_ms, OrderBook, Symbol, Venue};
 use futures_util::StreamExt;
@@ -16,6 +16,30 @@ use std::time::Duration;
 /// Shared live books, keyed by (venue, `"BASE/QUOTE"`). Indodax books are
 /// stored converted to USDT terms (see [`idr_book_to_usd`]).
 pub type LiveBooks = Arc<Mutex<BTreeMap<(Venue, String), OrderBook>>>;
+
+/// Socket-level state for one venue task, tracked separately from book
+/// freshness: a connected socket whose books are momentarily quiet is a
+/// different diagnosis from a socket that is down.
+#[derive(Debug, Clone, Default)]
+pub struct ConnectorState {
+    pub connected: bool,
+    /// Last WebSocket frame of any kind received from the venue.
+    pub last_msg_ms: Option<i64>,
+    pub last_connected_ms: Option<i64>,
+    pub last_error: Option<String>,
+}
+
+/// Shared per-venue connection state, written by the venue tasks.
+pub type LiveConnectors = Arc<Mutex<BTreeMap<Venue, ConnectorState>>>;
+
+fn update_connector(
+    connectors: &LiveConnectors,
+    venue: Venue,
+    f: impl FnOnce(&mut ConnectorState),
+) {
+    let mut map = connectors.lock().unwrap_or_else(|e| e.into_inner());
+    f(map.entry(venue).or_default());
+}
 
 /// Freshness gate shared with the engine: a live book is usable when recent
 /// and not crossed.
@@ -39,12 +63,17 @@ fn lock_map(shared: &LiveBooks) -> std::sync::MutexGuard<'_, BTreeMap<(Venue, St
 }
 
 /// Spawn one reconnecting WS task per CEX venue. Returns immediately; tasks
-/// publish into `shared` until the runtime shuts down.
+/// publish into `shared` until the runtime shuts down. Indodax requires
+/// its published static market-data token (`indodax_token`, from the
+/// environment) before any subscription; without it that venue is skipped
+/// with one clear error instead of a reconnect loop.
 pub fn spawn_venue_tasks(
     shared: &LiveBooks,
+    connectors: &LiveConnectors,
     venues: Vec<Venue>,
     symbols: Vec<Symbol>,
     usd_idr: Decimal,
+    indodax_token: Option<String>,
 ) {
     // Pin the TLS crypto provider explicitly: feature unification across the
     // tree can leave rustls with an ambiguous provider set, which panics on
@@ -54,16 +83,38 @@ pub fn spawn_venue_tasks(
         if !v.is_cex() || ws_url(v).is_empty() {
             continue;
         }
-        let (shared, symbols) = (shared.clone(), symbols.clone());
+        if v == Venue::Indodax && indodax_token.is_none() {
+            let msg = "INDODAX_WS_TOKEN not set; Indodax feed disabled (its WS rejects unauthenticated subscriptions)".to_string();
+            tracing::error!(venue = %v, "{msg}");
+            update_connector(connectors, v, |c| c.last_error = Some(msg));
+            continue;
+        }
+        let (shared, connectors, symbols) = (shared.clone(), connectors.clone(), symbols.clone());
+        let token = indodax_token.clone();
         tokio::spawn(async move {
             let mut backoff = Duration::from_secs(1);
             loop {
-                if let Err(e) = connect_and_stream(v, &symbols, usd_idr, &shared).await {
-                    tracing::warn!(venue = %v, %e, backoff_s = backoff.as_secs(), "live feed down; reconnecting");
-                    tokio::time::sleep(backoff).await;
-                    backoff = (backoff * 2).min(Duration::from_secs(30));
-                } else {
-                    backoff = Duration::from_secs(1);
+                update_connector(&connectors, v, |c| c.connected = false);
+                match connect_and_stream(
+                    v,
+                    &symbols,
+                    usd_idr,
+                    &shared,
+                    &connectors,
+                    token.as_deref(),
+                )
+                .await
+                {
+                    Err(e) => {
+                        update_connector(&connectors, v, |c| {
+                            c.connected = false;
+                            c.last_error = Some(e.to_string());
+                        });
+                        tracing::warn!(venue = %v, %e, backoff_s = backoff.as_secs(), "live feed down; reconnecting");
+                        tokio::time::sleep(backoff).await;
+                        backoff = (backoff * 2).min(Duration::from_secs(30));
+                    }
+                    Ok(()) => backoff = Duration::from_secs(1),
                 }
             }
         });
@@ -97,7 +148,11 @@ async fn connect_and_stream(
     symbols: &[Symbol],
     usd_idr: Decimal,
     shared: &LiveBooks,
+    connectors: &LiveConnectors,
+    indodax_token: Option<&str>,
 ) -> anyhow::Result<()> {
+    use futures_util::SinkExt;
+    use tokio_tungstenite::tungstenite::Message;
     let raw = raw_symbols(venue, symbols);
     // Binance partial-book payloads carry no symbol, so use one combined
     // stream URL (payloads arrive wrapped with their stream name).
@@ -117,12 +172,29 @@ async fn connect_and_stream(
     )
     .await??;
     let (mut sink, mut stream) = ws.split();
+    update_connector(connectors, venue, |c| {
+        c.connected = true;
+        c.last_connected_ms = Some(now_ms());
+        c.last_error = None;
+    });
+    if venue == Venue::Indodax {
+        // Indodax closes unauthenticated subscriptions as "bad request"
+        // (verified against the live endpoint). Authenticate with the
+        // published static token first; commands on one socket are
+        // processed in order, so subscriptions can follow immediately.
+        let token = indodax_token.ok_or_else(|| anyhow::anyhow!("INDODAX_WS_TOKEN not set"))?;
+        sink.send(Message::Text(indodax_auth_frame(token).to_string().into()))
+            .await?;
+    }
     if venue != Venue::Binance {
-        use futures_util::SinkExt;
-        for s in &raw {
-            let frame = subscribe_frame(venue, s).to_string();
-            sink.send(tokio_tungstenite::tungstenite::Message::Text(frame.into()))
-                .await?;
+        for (i, s) in raw.iter().enumerate() {
+            let mut frame = subscribe_frame(venue, s);
+            if venue == Venue::Indodax {
+                // Request ids must uniquely identify each request; the
+                // auth frame already used id 1.
+                frame["id"] = serde_json::json!(2 + i);
+            }
+            sink.send(Message::Text(frame.to_string().into())).await?;
         }
     }
     tracing::info!(venue = %venue, books = raw.len(), "live feed connected");
@@ -133,8 +205,20 @@ async fn connect_and_stream(
             anyhow::bail!("stream closed by venue");
         };
         let msg = msg?;
-        if !msg.is_text() {
-            continue;
+        update_connector(connectors, venue, |c| {
+            c.connected = true;
+            c.last_msg_ms = Some(now_ms());
+        });
+        match msg {
+            Message::Ping(p) => {
+                sink.send(Message::Pong(p)).await?;
+                continue;
+            }
+            Message::Close(f) => {
+                anyhow::bail!("stream closed by venue: {f:?}");
+            }
+            _ if !msg.is_text() => continue,
+            _ => {}
         }
         if let Some(key) = apply_msg(venue, &raw, &mut books, msg.to_text()?, now_ms()) {
             let mut map = lock_map(shared);
@@ -209,7 +293,9 @@ fn apply_msg(
         }
         Venue::Indodax => {
             let channel = v.get("result")?.get("channel")?.as_str()?;
-            let tag = channel.strip_prefix("market:orderbook-")?;
+            let tag = channel
+                .strip_prefix("market:order-book-")
+                .or_else(|| channel.strip_prefix("market:orderbook-"))?;
             let sym = raw.iter().find(|s| s.indodax() == tag)?;
             parse_indodax_depth(
                 books
@@ -316,13 +402,24 @@ mod tests {
         let raws = raw_symbols(Venue::Indodax, &[Symbol::new("BTC", "USDT")]);
         assert_eq!(raws[0], Symbol::new("BTC", "IDR"));
         let mut books = BTreeMap::new();
+        // Current live wire shape (documented channel + bid/ask objects).
         let hit = apply_msg(
             Venue::Indodax,
             &raws,
             &mut books,
-            r#"{"result":{"channel":"market:orderbook-btcidr","data":{"data":{"buy":[[1600000000,1]],"sell":[[1616000000,1]]}}}}"#,
+            r#"{"result":{"channel":"market:order-book-btcidr","data":{"data":{"pair":"btcidr","ask":[{"price":"1616000000","btc_volume":"1"}],"bid":[{"price":"1600000000","btc_volume":"1"}]}}}}"#,
             10,
         );
         assert_eq!(hit.as_deref(), Some("BTC/IDR"));
+        assert_eq!(books["BTC/IDR"].best_ask().unwrap().price, dec!(1616000000));
+        // Auth and subscribe acknowledgements touch no book.
+        let ack = apply_msg(
+            Venue::Indodax,
+            &raws,
+            &mut books,
+            r#"{"id":1,"result":{"client":"abc","version":"2.8.7"}}"#,
+            11,
+        );
+        assert!(ack.is_none());
     }
 }

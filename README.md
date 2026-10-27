@@ -165,14 +165,18 @@ collecting funding each interval. Legs carry explicit `MarketKind::Spot` /
   fill; funding accrues over time (`accrued(notional, rate, hours)`), and
   the position consumes venue risk exposure until unwound.
 - **Fire-once**: an open (venue, symbol) pair never re-fires until closed
-  (`mark_closed`), so the strategy cannot churn every tick.
+  (`mark_closed`), so the strategy cannot churn every tick. This holds
+  across restarts and redeploys: filled entries reload from the JSONL
+  store at startup and re-seed the open set (with their risk exposure).
 - **S4 exit timing** (`with_exit(window, threshold)`, defaults: last 5
   prints vs `min_funding_annualized_bps`): the strategy records annualized
   prints per pair; when the window mean drops below the exit threshold
   (funding flipped cold), the pair is marked closed and may re-enter later.
-- Caveat: today the engine feeds this strategy a synthetic funding snapshot
-  (1 bp / 8 h ≈ 1095 bps/yr on every pair), so paper entries fire readily.
-  Live perp funding feeds replace that snapshot at go-live.
+- Caveat: the synthetic funding snapshot (1 bp / 8 h ≈ 1095 bps/yr on
+  every pair) exists only on the synthetic feed. In live mode the engine
+  deliberately provides no funding data until real perp feeds land, so
+  this strategy cannot fire there instead of accumulating invented
+  entries against real books.
 
 ### 4. `cex_dex` — CEX book vs DEX quote (includes S5)
 
@@ -299,8 +303,8 @@ binary from the tested route table in `crates/api`:
 | Route | Method | Effect |
 |---|---|---|
 | `/health` | GET | `{"ok":true}` |
-| `/status` | GET | mode, killed, trades, realized PnL, opportunities, per-venue connector health, paused strategies |
-| `/metrics` | GET | text metrics incl. per-strategy trade counts |
+| `/status` | GET | mode, killed, trades, realized PnL, opportunities, per-venue connector health (socket state reported separately from fresh-book counts), paused strategies |
+| `/metrics` | GET | text metrics incl. per-strategy funnel counters (scans, intents, risk rejects, fill failures, trades, PnL) and per-venue book freshness |
 | `/flows` | GET | JSON snapshot of the last 200 trades (for the viewer) |
 | `/viewer` | GET | built-in HTML trade-flow viewer |
 | `/kill` | POST | trip the kill-switch |
@@ -312,6 +316,9 @@ binary from the tested route table in `crates/api`:
 
 Copy `config.example.toml` to `config.toml` (a working paper default is
 committed). Secrets only via env (see `.env.example`) — never in config.
+The live Indodax feed additionally needs `INDODAX_WS_TOKEN`, the public
+static market-data token from Indodax's WebSocket docs; without it that
+venue is disabled at startup with one error instead of reconnecting.
 Top-level `venues` / `symbols` must stay above the first `[table]` header.
 
 | Key | Default (committed config) | Meaning |
@@ -322,7 +329,7 @@ Top-level `venues` / `symbols` must stay above the first `[table]` header.
 | `[engine] feed` | `live` | `live` (real WS books, paper fills) \| `synthetic` |
 | `[engine] tick_ms` | 250 | tick-loop period |
 | `[engine] api_addr` | `127.0.0.1:8787` | control-API bind; omit to disable |
-| `[engine] jsonl_path` | `paper-trades.jsonl` | paper-trade log |
+| `[engine] jsonl_path` | `paper-trades.jsonl` | paper-trade log; each start appends a `session_start` record, trades carry `session_id` + `engine_version`, and history reloads at startup |
 | `[strategies]` | all `true` | toggles for `cross_exchange`, `triangular`, `funding_rate`, `cex_dex` (`lag_chase`/`fx_triangle` ride on `cross_exchange`) |
 | `[params]` | see [Shared contract](#shared-contract) | `min_edge_bps`, `slip_buffer_bps`, `target_notional_quote`, `max_book_age_ms`, `ttl_ms` |
 | `[params] min_funding_annualized_bps` | 500 | funding-rate entry bar |
@@ -408,7 +415,8 @@ manifest to auto-update on Apple Silicon.
    `LiveExecutor::guard` (signing is done: `arb_exec::sign_query`). Start on
    testnet/demo where offered.
 3. Replace paper quote sources: live funding prints for `funding_rate`
-   (engine currently synthesizes them), and for DEX an alloy provider +
+   (synthesized only on the synthetic feed; live mode gets none), and
+   for DEX an alloy provider +
    signer in `dex-evm` (V3 via Quoter `eth_call`) plus Jupiter `/swap`
    build + Solana send in `dex-sol`.
 4. Set keys in env, set `mode = "live"`, keep caps tiny. The executor
@@ -430,7 +438,8 @@ manifest to auto-update on Apple Silicon.
 ## Current limitations (honest list)
 
 - Live mode: real books in, paper fills out — no venue order senders yet.
-- `funding_rate` runs on a synthetic funding snapshot until perp feeds land.
+- `funding_rate` has no live data source yet: in live mode it receives no
+  funding prints and cannot fire. Only the synthetic feed synthesizes them.
 - DEX quotes in the engine are paper pools / paper Jupiter prices; the
   quoting math is real, the reserves are not yet read from chain.
 - S6 imbalance gate and S7 fee table are implemented and tested but not

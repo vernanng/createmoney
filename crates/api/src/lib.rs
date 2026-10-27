@@ -11,9 +11,30 @@ use std::sync::Arc;
 #[derive(Debug, Clone, Serialize)]
 pub struct ConnectorHealth {
     pub venue: Venue,
+    /// Socket-level state, independent of whether books are fresh.
     pub connected: bool,
-    pub last_msg_ms: i64,
+    /// Last WebSocket frame of any kind received, if ever.
+    pub last_msg_ms: Option<i64>,
+    /// Newest stored book timestamp for this venue, if any.
+    pub last_book_ms: Option<i64>,
+    /// Books currently held for this venue.
     pub books: usize,
+    /// Held books inside the freshness window and not crossed.
+    pub fresh_books: usize,
+    pub last_error: Option<String>,
+}
+
+/// Engine-boundary funnel counters for one strategy: how many intents it
+/// emitted, and where they stopped. Decisions inside a strategy (for
+/// example stale-book skips before emitting) are not counted here.
+#[derive(Debug, Clone, Default)]
+pub struct StrategyMetrics {
+    pub scans: u64,
+    pub emitted: u64,
+    pub risk_rejected: u64,
+    pub fill_failed: u64,
+    pub filled: u64,
+    pub realized_pnl_quote: Decimal,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -67,7 +88,7 @@ impl Control {
 /// Prometheus text exposition for the handful of series that matter.
 pub fn render_metrics(
     status: &EngineStatus,
-    per_strategy_trades: &BTreeMap<String, u64>,
+    per_strategy: &BTreeMap<String, StrategyMetrics>,
 ) -> String {
     let mut s = String::new();
     s.push_str("# HELP arb_trades_total Executed intents\n# TYPE arb_trades_total counter\n");
@@ -87,9 +108,30 @@ pub fn render_metrics(
         "arb_killed {}\n",
         if status.killed { 1 } else { 0 }
     ));
-    for (k, v) in per_strategy_trades {
+    for (k, m) in per_strategy {
         s.push_str(&format!(
-            "arb_strategy_trades_total{{strategy=\"{k}\"}} {v}\n"
+            "arb_strategy_scans_total{{strategy=\"{k}\"}} {}\n",
+            m.scans
+        ));
+        s.push_str(&format!(
+            "arb_strategy_intents_total{{strategy=\"{k}\"}} {}\n",
+            m.emitted
+        ));
+        s.push_str(&format!(
+            "arb_strategy_risk_rejected_total{{strategy=\"{k}\"}} {}\n",
+            m.risk_rejected
+        ));
+        s.push_str(&format!(
+            "arb_strategy_fill_failed_total{{strategy=\"{k}\"}} {}\n",
+            m.fill_failed
+        ));
+        s.push_str(&format!(
+            "arb_strategy_trades_total{{strategy=\"{k}\"}} {}\n",
+            m.filled
+        ));
+        s.push_str(&format!(
+            "arb_strategy_realized_pnl_quote{{strategy=\"{k}\"}} {}\n",
+            m.realized_pnl_quote
         ));
     }
     for c in &status.connectors {
@@ -97,6 +139,14 @@ pub fn render_metrics(
             "arb_connector_up{{venue=\"{}\"}} {}\n",
             c.venue,
             if c.connected { 1 } else { 0 }
+        ));
+        s.push_str(&format!(
+            "arb_connector_books{{venue=\"{}\"}} {}\n",
+            c.venue, c.books
+        ));
+        s.push_str(&format!(
+            "arb_connector_fresh_books{{venue=\"{}\"}} {}\n",
+            c.venue, c.fresh_books
         ));
     }
     s
@@ -186,13 +236,35 @@ mod tests {
             connectors: vec![ConnectorHealth {
                 venue: Venue::Binance,
                 connected: true,
-                last_msg_ms: 1,
+                last_msg_ms: Some(1),
+                last_book_ms: Some(1),
                 books: 2,
+                fresh_books: 1,
+                last_error: None,
             }],
             paused_strategies: vec![],
         };
-        let m = render_metrics(&st, &BTreeMap::from([("cross_exchange".to_string(), 3)]));
+        let m = render_metrics(
+            &st,
+            &BTreeMap::from([(
+                "cross_exchange".to_string(),
+                StrategyMetrics {
+                    scans: 10,
+                    emitted: 5,
+                    risk_rejected: 1,
+                    fill_failed: 1,
+                    filled: 3,
+                    realized_pnl_quote: dec!(1.5),
+                },
+            )]),
+        );
         assert!(m.contains("arb_trades_total 3"));
+        assert!(m.contains("arb_strategy_intents_total{strategy=\"cross_exchange\"} 5"));
+        assert!(m.contains("arb_strategy_risk_rejected_total{strategy=\"cross_exchange\"} 1"));
+        assert!(
+            m.contains("arb_connector_fresh_books{venue=\"binance\"} 1"),
+            "{m}"
+        );
         assert_eq!(route("GET", "/health", &mut c, &st, &m).0, 200);
         assert_eq!(route("POST", "/kill", &mut c, &st, &m).0, 200);
         assert!(flag.load(Ordering::SeqCst));

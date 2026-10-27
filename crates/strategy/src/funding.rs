@@ -64,6 +64,18 @@ impl FundingStrategy {
         self
     }
 
+    /// Seed pairs already opened by earlier engine runs (rebuilt from
+    /// stored fills) so a restart or redeploy does not open duplicates.
+    /// Pairs outside the configured set are ignored.
+    pub fn with_open_pairs(mut self, pairs: Vec<(Venue, Symbol)>) -> Self {
+        for p in pairs {
+            if self.pairs.contains(&p) && !self.open.contains(&p) {
+                self.open.push(p);
+            }
+        }
+        self
+    }
+
     pub fn mark_closed(&mut self, venue: Venue, symbol: &Symbol) {
         self.open.retain(|(v, s)| !(*v == venue && s == symbol));
     }
@@ -249,6 +261,55 @@ mod tests {
         // Regression: must not re-fire every tick while the position is open.
         assert!(st.on_tick(&v).is_empty(), "open pair must not churn");
         assert_eq!(st.open_pairs().len(), 1);
+        st.mark_closed(Venue::Bybit, &s);
+        assert_eq!(st.on_tick(&v).len(), 1, "closed pair may re-enter");
+    }
+
+    #[test]
+    fn restored_open_pair_does_not_refire() {
+        // Regression: a redeploy must not reopen positions that a previous
+        // engine run already filled and stored.
+        let s = Symbol::new("BTC", "USDT");
+        let mut st = FundingStrategy::new(
+            StrategyParams::default(),
+            dec!(500),
+            vec![(Venue::Bybit, s.clone())],
+        )
+        .with_open_pairs(vec![
+            (Venue::Bybit, s.clone()),
+            (Venue::Bybit, s.clone()), // duplicate is deduped
+            (Venue::Okx, Symbol::new("ETH", "USDT")), // unconfigured: ignored
+        ]);
+        assert_eq!(st.open_pairs().len(), 1);
+        let mut v = MarketView {
+            now_ms: 1_000,
+            ..Default::default()
+        };
+        let mut b = OrderBook::new(Venue::Bybit, s.clone());
+        b.apply_snapshot(
+            vec![BookLevel {
+                price: dec!(100),
+                qty: dec!(10),
+            }],
+            vec![BookLevel {
+                price: dec!(100.1),
+                qty: dec!(10),
+            }],
+            1,
+            1_000,
+        );
+        v.put(b);
+        v.funding.push(FundingRate {
+            venue: Venue::Bybit,
+            symbol: s.clone(),
+            rate_per_interval: dec!(0.0005),
+            interval_hours: dec!(8),
+            next_funding_ms: 0,
+        });
+        assert!(
+            st.on_tick(&v).is_empty(),
+            "restored open pair must not re-fire"
+        );
         st.mark_closed(Venue::Bybit, &s);
         assert_eq!(st.on_tick(&v).len(), 1, "closed pair may re-enter");
     }

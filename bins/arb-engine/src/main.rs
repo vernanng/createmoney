@@ -2,15 +2,15 @@ mod config;
 
 use arb_api::{
     render_flows_envelope, render_metrics, route, route_viewer, ConnectorHealth, Control,
-    EngineStatus,
+    EngineStatus, StrategyMetrics,
 };
 use arb_core::{now_ms, Symbol, Venue};
 use arb_dex_evm::{to_dex_quote, DexKind, V2Pool};
 use arb_exec::{keys_from_env, ExecMode, LiveExecutor};
-use arb_feed::{pick_fresh, LiveBooks, SyntheticFeed};
+use arb_feed::{pick_fresh, LiveBooks, LiveConnectors, SyntheticFeed};
 use arb_paper::PaperExecutor;
 use arb_risk::RiskEngine;
-use arb_store::{MemoryStore, Store, StoredTrade};
+use arb_store::{MemoryStore, SessionStart, Store, StoredTrade};
 use arb_strategy::{
     CexDex, CrossExchange, FundingRate, FundingStrategy, FxTriangle, LagChase, MarketView,
     Strategy, Triangular,
@@ -18,6 +18,7 @@ use arb_strategy::{
 use clap::Parser;
 use rust_decimal::Decimal;
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 #[derive(Parser)]
@@ -37,11 +38,69 @@ struct Args {
 struct Shared {
     control: Mutex<Control>,
     status: Mutex<EngineStatus>,
-    per_strategy: Mutex<BTreeMap<String, u64>>,
+    per_strategy: Mutex<BTreeMap<String, StrategyMetrics>>,
     /// Pre-rendered `/flows` snapshot (last `FLOWS_SNAPSHOT` trades).
     flows: Mutex<String>,
     /// Live venue books (empty unless `feed = "live"` tasks are spawned).
     live_books: LiveBooks,
+    /// Socket-level state written by the live venue tasks.
+    live_connectors: LiveConnectors,
+}
+
+const ENGINE_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+static SESSION_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// One engine run = one session. The id is stamped on the session-start
+/// record and every trade so restarts are visible in the JSONL history.
+fn new_session_id() -> String {
+    format!(
+        "{}-{}-{}",
+        now_ms(),
+        std::process::id(),
+        SESSION_SEQ.fetch_add(1, Ordering::SeqCst)
+    )
+}
+
+/// Funding snapshot used only by the synthetic feed. Live mode must never
+/// invent funding: until real perp feeds land, `funding_rate` simply has
+/// no data there and cannot fire.
+fn synthetic_funding(feed: &str, symbols: &[Symbol], now: i64) -> Vec<FundingRate> {
+    if feed == "live" {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for v in [Venue::Binance, Venue::Bybit, Venue::Okx] {
+        for sym in symbols {
+            out.push(FundingRate {
+                venue: v,
+                symbol: sym.clone(),
+                rate_per_interval: Decimal::new(1, 4),
+                interval_hours: Decimal::new(8, 0),
+                next_funding_ms: now + 3_600_000,
+            });
+        }
+    }
+    out
+}
+
+/// Pairs with a filled, still-open funding entry in stored history.
+/// There are no closing fills yet, so every stored non-roundtrip
+/// `funding_rate` trade counts as open.
+fn restored_funding_pairs(trades: &[StoredTrade]) -> Vec<(Venue, Symbol)> {
+    let mut out: Vec<(Venue, Symbol)> = Vec::new();
+    for t in trades {
+        if t.intent.strategy != "funding_rate" || t.intent.roundtrip {
+            continue;
+        }
+        if let Some(leg) = t.intent.legs.first() {
+            let pair = (leg.venue, leg.symbol.clone());
+            if !out.contains(&pair) {
+                out.push(pair);
+            }
+        }
+    }
+    out
 }
 
 /// Trades kept in the `/flows` snapshot served to the 3D viewer.
@@ -71,8 +130,9 @@ struct Engine {
     shared: Arc<Shared>,
     feed: SyntheticFeed,
     opportunities: u64,
-    per_strategy: BTreeMap<String, u64>,
+    per_strategy: BTreeMap<String, StrategyMetrics>,
     live: LiveExecutor,
+    session_id: String,
 }
 
 impl Engine {
@@ -80,6 +140,14 @@ impl Engine {
         let symbols = cfg.symbols()?;
         let params = cfg.params.to_strategy_params();
         let cex: Vec<Venue> = cfg.venues.iter().copied().filter(|v| v.is_cex()).collect();
+
+        // Open the store first: reloaded history seeds funding pairs that
+        // are still open, so a restart cannot reopen them.
+        let store = match &cfg.engine.jsonl_path {
+            Some(p) => MemoryStore::with_jsonl(p.clone())?,
+            None => MemoryStore::new(),
+        };
+        let restored_pairs = restored_funding_pairs(store.trades());
 
         let mut strategies: Vec<Box<dyn Strategy>> = Vec::new();
         if cfg.strategies.cross_exchange {
@@ -102,11 +170,10 @@ impl Engine {
                 .filter(|v| matches!(v, Venue::Binance | Venue::Bybit | Venue::Okx))
                 .flat_map(|v| symbols.iter().map(move |s| (*v, s.clone())))
                 .collect();
-            strategies.push(Box::new(FundingStrategy::new(
-                params.clone(),
-                cfg.params.min_funding_annualized_bps,
-                pairs,
-            )));
+            strategies.push(Box::new(
+                FundingStrategy::new(params.clone(), cfg.params.min_funding_annualized_bps, pairs)
+                    .with_open_pairs(restored_pairs),
+            ));
         }
         if cfg.strategies.cex_dex {
             strategies.push(Box::new(CexDex::new(
@@ -138,10 +205,16 @@ impl Engine {
             )));
         }
 
-        let risk = RiskEngine::new(
+        let mut risk = RiskEngine::new(
             cfg.risk
                 .to_limits(cfg.params.min_edge_bps, cfg.params.max_book_age_ms),
         );
+        // Restored open (non-roundtrip) positions still consume venue caps.
+        for t in store.trades() {
+            if !t.intent.roundtrip {
+                risk.settle(&t.intent);
+            }
+        }
         let shared = Arc::new(Shared {
             control: Mutex::new(Control::new(risk.kill_handle())),
             status: Mutex::new(EngineStatus {
@@ -156,6 +229,7 @@ impl Engine {
             per_strategy: Mutex::new(BTreeMap::new()),
             flows: Mutex::new(render_flows_envelope(&[], 0)),
             live_books: LiveBooks::default(),
+            live_connectors: LiveConnectors::default(),
         });
         let mode = ExecMode::parse(&cfg.engine.mode).unwrap_or(ExecMode::Paper);
         let keys = keys_from_env();
@@ -163,10 +237,6 @@ impl Engine {
             tracing::warn!(venues_with_keys = keys.len(), "LIVE mode requested; paper executor still handles fills until venue HTTP senders are wired — see arb-exec guard");
         }
         let live = LiveExecutor::new(mode, keys);
-        let store = match &cfg.engine.jsonl_path {
-            Some(p) => MemoryStore::with_jsonl(p.clone()),
-            None => MemoryStore::new(),
-        };
         // Seed paper inventory: quote cash + base assets on every venue that
         // can receive a leg (CEXs plus DEX wallets). Sells of unheld assets
         // and unfunded buys abort in the paper executor.
@@ -224,7 +294,23 @@ impl Engine {
             opportunities: 0,
             per_strategy: BTreeMap::new(),
             live,
+            session_id: new_session_id(),
         })
+    }
+
+    /// Stamp the JSONL history with this run's boundary record.
+    fn record_session_start(&mut self) {
+        let rec = SessionStart::new(
+            self.session_id.clone(),
+            ENGINE_VERSION.into(),
+            self.cfg.engine.mode.clone(),
+            self.cfg.engine.feed.clone(),
+            now_ms(),
+            self.store.trades().len(),
+        );
+        if let Err(e) = self.store.record_session_start(rec) {
+            tracing::error!(%e, "session start write failed");
+        }
     }
 
     fn build_view(&mut self) -> MarketView {
@@ -337,18 +423,11 @@ impl Engine {
                 }
             }
         }
-        // Synthetic funding snapshot (live mode replaces with perp feed values).
-        for v in [Venue::Binance, Venue::Bybit, Venue::Okx] {
-            for sym in &self.symbols {
-                view.funding.push(FundingRate {
-                    venue: v,
-                    symbol: sym.clone(),
-                    rate_per_interval: Decimal::new(1, 4),
-                    interval_hours: Decimal::new(8, 0),
-                    next_funding_ms: now + 3_600_000,
-                });
-            }
-        }
+        // Synthetic funding exists only for the synthetic feed. In live
+        // mode there is deliberately no funding data until real perp
+        // feeds land, so the soak cannot accumulate invented entries.
+        view.funding
+            .extend(synthetic_funding(&self.cfg.engine.feed, &self.symbols, now));
         view
     }
 
@@ -366,11 +445,23 @@ impl Engine {
             if paused.iter().any(|p| p == st.name()) {
                 continue;
             }
+            self.per_strategy
+                .entry(st.name().to_string())
+                .or_default()
+                .scans += 1;
             intents.extend(st.on_tick(&view));
         }
         for intent in intents {
             self.opportunities += 1;
+            self.per_strategy
+                .entry(intent.strategy.clone())
+                .or_default()
+                .emitted += 1;
             if let Err(e) = self.risk.check(&intent, now) {
+                self.per_strategy
+                    .entry(intent.strategy.clone())
+                    .or_default()
+                    .risk_rejected += 1;
                 tracing::debug!(strategy = %intent.strategy, reject = %e, "intent rejected");
                 continue;
             }
@@ -384,10 +475,16 @@ impl Engine {
                 Ok(result) => {
                     // Settle exposure or per-venue caps can never bind.
                     self.risk.settle(&intent);
-                    *self
-                        .per_strategy
-                        .entry(intent.strategy.clone())
-                        .or_default() += 1;
+                    {
+                        let m = self
+                            .per_strategy
+                            .entry(intent.strategy.clone())
+                            .or_default();
+                        m.filled += 1;
+                        if let Some(p) = result.realized_pnl_quote {
+                            m.realized_pnl_quote += p;
+                        }
+                    }
                     tracing::info!(strategy = %intent.strategy, edge_bps = %intent.expected_edge_bps,
                         pnl = ?result.realized_pnl_quote, legs = intent.legs.len(), "paper trade");
                     let stored = StoredTrade {
@@ -395,12 +492,20 @@ impl Engine {
                         fills: result.fills,
                         realized_pnl_quote: result.realized_pnl_quote,
                         ts_ms: now,
+                        session_id: self.session_id.clone(),
+                        engine_version: ENGINE_VERSION.into(),
                     };
                     if let Err(e) = self.store.record_trade(stored) {
                         tracing::error!(%e, "store write failed");
                     }
                 }
-                Err(e) => tracing::debug!(%e, "paper fill failed"),
+                Err(e) => {
+                    self.per_strategy
+                        .entry(intent.strategy.clone())
+                        .or_default()
+                        .fill_failed += 1;
+                    tracing::debug!(%e, "paper fill failed");
+                }
             }
         }
         self.publish();
@@ -440,6 +545,12 @@ impl Engine {
             .lock()
             .map(|m| m.clone())
             .unwrap_or_default();
+        let conn_map = self
+            .shared
+            .live_connectors
+            .lock()
+            .map(|m| m.clone())
+            .unwrap_or_default();
         EngineStatus {
             mode: self.cfg.engine.mode.clone(),
             killed,
@@ -451,26 +562,41 @@ impl Engine {
                 .venues
                 .iter()
                 .map(|v| {
-                    let fresh_ts: Vec<i64> = live_map
+                    // Socket state and book freshness are separate signals:
+                    // `connected` says the WS task holds a socket, while
+                    // `fresh_books` says its data is currently usable.
+                    let venue_books: Vec<&arb_core::OrderBook> = live_map
                         .iter()
-                        .filter(|((w, _), b)| {
-                            w == v && now - b.ts_ms <= self.cfg.params.max_book_age_ms
-                        })
-                        .map(|(_, b)| b.ts_ms)
+                        .filter(|((w, _), _)| w == v)
+                        .map(|(_, b)| b)
                         .collect();
-                    ConnectorHealth {
-                        venue: *v,
-                        connected: if live_mode {
-                            !fresh_ts.is_empty()
-                        } else {
-                            true
-                        },
-                        last_msg_ms: fresh_ts.into_iter().max().unwrap_or(now),
-                        books: if live_mode {
-                            live_map.keys().filter(|(w, _)| w == v).count()
-                        } else {
-                            self.symbols.len()
-                        },
+                    let conn = conn_map.get(v);
+                    if live_mode {
+                        ConnectorHealth {
+                            venue: *v,
+                            connected: conn.map(|c| c.connected).unwrap_or(false),
+                            last_msg_ms: conn.and_then(|c| c.last_msg_ms),
+                            last_book_ms: venue_books.iter().map(|b| b.ts_ms).max(),
+                            books: venue_books.len(),
+                            fresh_books: venue_books
+                                .iter()
+                                .filter(|b| {
+                                    now - b.ts_ms <= self.cfg.params.max_book_age_ms
+                                        && !b.is_crossed()
+                                })
+                                .count(),
+                            last_error: conn.and_then(|c| c.last_error.clone()),
+                        }
+                    } else {
+                        ConnectorHealth {
+                            venue: *v,
+                            connected: true,
+                            last_msg_ms: Some(now),
+                            last_book_ms: Some(now),
+                            books: self.symbols.len(),
+                            fresh_books: self.symbols.len(),
+                            last_error: None,
+                        }
                     }
                 })
                 .collect(),
@@ -577,17 +703,25 @@ async fn main() -> anyhow::Result<()> {
     let tick_ms = cfg.engine.tick_ms;
     let feed_kind = cfg.engine.feed.clone();
     let mut engine = Engine::new(cfg)?;
+    engine.record_session_start();
 
-    tracing::info!(mode = %engine.status().mode, feed = %feed_kind, venues = ?engine.cfg.venues,
+    tracing::info!(session = %engine.session_id, mode = %engine.status().mode, feed = %feed_kind, venues = ?engine.cfg.venues,
         symbols = ?engine.cfg.symbols, strategies = engine.strategies.len(), "arb-engine starting");
     if feed_kind == "live" {
         // Live venue books in, paper execution unchanged: fills stay simulated
         // and the live-send gate is untouched. Stale venues are skipped.
+        // Indodax additionally needs its published static market-data token
+        // from the environment; it is not a trading credential.
+        let indodax_token = std::env::var("INDODAX_WS_TOKEN")
+            .ok()
+            .filter(|t| !t.trim().is_empty());
         arb_feed::spawn_venue_tasks(
             &engine.shared.live_books,
+            &engine.shared.live_connectors,
             engine.cfg.venues.clone(),
             engine.symbols.clone(),
             engine.cfg.indodax.usd_idr,
+            indodax_token,
         );
         tracing::info!("live WS feeds starting (paper execution)");
     }
@@ -618,4 +752,63 @@ async fn main() -> anyhow::Result<()> {
         count, st.opportunities_seen, st.trades, st.realized_pnl_quote
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arb_core::{Intent, MarketKind, Side, TradeLeg};
+
+    #[test]
+    fn live_feed_never_invents_funding() {
+        // Regression: the paper soak accumulated 90 synthetic funding
+        // entries against live books. Live mode must see no funding data
+        // until real perp feeds exist.
+        let syms = vec![Symbol::new("BTC", "USDT"), Symbol::new("ETH", "USDT")];
+        assert!(synthetic_funding("live", &syms, 1_000).is_empty());
+        assert_eq!(synthetic_funding("synthetic", &syms, 1_000).len(), 6);
+    }
+
+    fn stored(strategy: &str, roundtrip: bool, venue: Venue, base: &str) -> StoredTrade {
+        StoredTrade {
+            intent: Intent {
+                strategy: strategy.into(),
+                expected_edge_bps: Decimal::new(20, 0),
+                ttl_ms: 100,
+                created_ms: 0,
+                roundtrip,
+                legs: vec![TradeLeg {
+                    venue,
+                    symbol: Symbol::new(base, "USDT"),
+                    side: Side::Buy,
+                    price: Decimal::new(100, 0),
+                    qty_base: Decimal::new(1, 0),
+                    market: MarketKind::Spot,
+                }],
+            },
+            fills: vec![],
+            realized_pnl_quote: None,
+            ts_ms: 1,
+            session_id: "old".into(),
+            engine_version: "0.1.0".into(),
+        }
+    }
+
+    #[test]
+    fn restored_funding_pairs_dedupes_and_skips_roundtrips() {
+        let trades = vec![
+            stored("funding_rate", false, Venue::Bybit, "BTC"),
+            stored("funding_rate", false, Venue::Bybit, "BTC"), // duplicate restart entry
+            stored("funding_rate", false, Venue::Binance, "ETH"),
+            stored("cross_exchange", true, Venue::Bybit, "BTC"),
+            stored("funding_rate", true, Venue::Okx, "SOL"), // not a position
+        ];
+        assert_eq!(
+            restored_funding_pairs(&trades),
+            vec![
+                (Venue::Bybit, Symbol::new("BTC", "USDT")),
+                (Venue::Binance, Symbol::new("ETH", "USDT")),
+            ]
+        );
+    }
 }
