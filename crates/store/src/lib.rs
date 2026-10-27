@@ -2,12 +2,13 @@
 //! the SQL backend (Postgres/SQLite via sqlx) drops in without touching callers.
 //! JSONL export gives durable, diffable paper-trade history today.
 
+use anyhow::Context;
 use arb_core::{Fill, Intent};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
-use std::fs::OpenOptions;
-use std::io::Write;
-use std::path::PathBuf;
+use std::fs::{File, OpenOptions};
+use std::io::{BufRead, BufReader, Write};
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredTrade {
@@ -15,10 +16,52 @@ pub struct StoredTrade {
     pub fills: Vec<Fill>,
     pub realized_pnl_quote: Option<Decimal>,
     pub ts_ms: i64,
+    /// Engine run that produced this trade. Empty on records written
+    /// before sessions were tracked.
+    #[serde(default)]
+    pub session_id: String,
+    #[serde(default)]
+    pub engine_version: String,
+}
+
+/// Boundary marker written once per engine start so one JSONL file can
+/// hold many runs without looking like a single continuous soak.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionStart {
+    pub event: String,
+    pub session_id: String,
+    pub engine_version: String,
+    pub mode: String,
+    pub feed: String,
+    pub started_ms: i64,
+    /// Trades reloaded from the existing JSONL at this start.
+    pub restored_trades: usize,
+}
+
+impl SessionStart {
+    pub fn new(
+        session_id: String,
+        engine_version: String,
+        mode: String,
+        feed: String,
+        started_ms: i64,
+        restored_trades: usize,
+    ) -> Self {
+        Self {
+            event: "session_start".into(),
+            session_id,
+            engine_version,
+            mode,
+            feed,
+            started_ms,
+            restored_trades,
+        }
+    }
 }
 
 pub trait Store: Send {
     fn record_trade(&mut self, t: StoredTrade) -> anyhow::Result<()>;
+    fn record_session_start(&mut self, s: SessionStart) -> anyhow::Result<()>;
     fn trades(&self) -> &[StoredTrade];
     fn total_pnl(&self) -> Decimal {
         self.trades()
@@ -38,22 +81,80 @@ impl MemoryStore {
     pub fn new() -> Self {
         Self::default()
     }
-    pub fn with_jsonl(path: impl Into<PathBuf>) -> Self {
-        Self {
-            trades: Vec::new(),
-            jsonl_path: Some(path.into()),
+
+    /// Open a JSONL-backed store, reloading trades written by earlier
+    /// engine runs so state derived from history (for example open
+    /// funding pairs) survives restarts. A missing file starts empty.
+    pub fn with_jsonl(path: impl Into<PathBuf>) -> anyhow::Result<Self> {
+        let path = path.into();
+        let trades = load_jsonl(&path)?;
+        Ok(Self {
+            trades,
+            jsonl_path: Some(path),
+        })
+    }
+
+    fn append_line(&self, line: &str) -> anyhow::Result<()> {
+        if let Some(p) = &self.jsonl_path {
+            let mut f = OpenOptions::new().create(true).append(true).open(p)?;
+            writeln!(f, "{line}")?;
+        }
+        Ok(())
+    }
+}
+
+/// Reload trades from JSONL. `session_start` markers are skipped, and a
+/// malformed final line (a write interrupted mid-append) is tolerated;
+/// malformed lines anywhere else are an error, so history loss is loud.
+fn load_jsonl(path: &Path) -> anyhow::Result<Vec<StoredTrade>> {
+    let file = match File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e.into()),
+    };
+    let mut lines: Vec<String> = Vec::new();
+    for line in BufReader::new(file).lines() {
+        lines.push(line?);
+    }
+    let last_nonempty = lines.iter().rposition(|l| !l.trim().is_empty());
+    let mut trades = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let parsed = serde_json::from_str::<serde_json::Value>(line).and_then(|v| {
+            if v.get("event").and_then(|e| e.as_str()) == Some("session_start") {
+                Ok(None)
+            } else {
+                serde_json::from_value::<StoredTrade>(v).map(Some)
+            }
+        });
+        match parsed {
+            Ok(Some(t)) => trades.push(t),
+            Ok(None) => {}
+            Err(e) if Some(i) == last_nonempty => {
+                // Trailing partial record from an interrupted append.
+                let _ = e;
+                break;
+            }
+            Err(e) => {
+                return Err(e)
+                    .with_context(|| format!("loading {} line {}", path.display(), i + 1));
+            }
         }
     }
+    Ok(trades)
 }
 
 impl Store for MemoryStore {
     fn record_trade(&mut self, t: StoredTrade) -> anyhow::Result<()> {
-        if let Some(p) = &self.jsonl_path {
-            let mut f = OpenOptions::new().create(true).append(true).open(p)?;
-            writeln!(f, "{}", serde_json::to_string(&t)?)?;
-        }
+        self.append_line(&serde_json::to_string(&t)?)?;
         self.trades.push(t);
         Ok(())
+    }
+    fn record_session_start(&mut self, s: SessionStart) -> anyhow::Result<()> {
+        self.append_line(&serde_json::to_string(&s)?)
     }
     fn trades(&self) -> &[StoredTrade] {
         &self.trades
@@ -90,12 +191,8 @@ mod tests {
     use arb_core::{MarketKind, Side, Symbol, TradeLeg, Venue};
     use rust_decimal_macros::dec;
 
-    #[test]
-    fn memory_store_sums_pnl_and_writes_jsonl() {
-        let dir = std::env::temp_dir().join("arb-store-test.jsonl");
-        let _ = std::fs::remove_file(&dir);
-        let mut st = MemoryStore::with_jsonl(dir.clone());
-        let mk = |pnl: Decimal| StoredTrade {
+    fn mk_trade(pnl: Decimal, session_id: &str) -> StoredTrade {
+        StoredTrade {
             intent: Intent {
                 strategy: "t".into(),
                 expected_edge_bps: dec!(20),
@@ -114,11 +211,54 @@ mod tests {
             fills: vec![],
             realized_pnl_quote: Some(pnl),
             ts_ms: 1,
-        };
-        st.record_trade(mk(dec!(1.5))).unwrap();
-        st.record_trade(mk(dec!(-0.5))).unwrap();
+            session_id: session_id.into(),
+            engine_version: "0.1.0".into(),
+        }
+    }
+
+    #[test]
+    fn memory_store_sums_pnl_and_writes_jsonl() {
+        let dir = std::env::temp_dir().join("arb-store-test.jsonl");
+        let _ = std::fs::remove_file(&dir);
+        let mut st = MemoryStore::with_jsonl(dir.clone()).unwrap();
+        st.record_trade(mk_trade(dec!(1.5), "s1")).unwrap();
+        st.record_trade(mk_trade(dec!(-0.5), "s1")).unwrap();
         assert_eq!(st.total_pnl(), dec!(1));
         let content = std::fs::read_to_string(&dir).unwrap();
         assert_eq!(content.lines().count(), 2);
+    }
+
+    #[test]
+    fn jsonl_reload_restores_trades_and_skips_session_markers() {
+        let dir = std::env::temp_dir().join("arb-store-test-session.jsonl");
+        let _ = std::fs::remove_file(&dir);
+        {
+            let mut st = MemoryStore::with_jsonl(dir.clone()).unwrap();
+            st.record_session_start(SessionStart::new(
+                "s1".into(),
+                "0.1.0".into(),
+                "paper".into(),
+                "live".into(),
+                10,
+                0,
+            ))
+            .unwrap();
+            st.record_trade(mk_trade(dec!(2), "s1")).unwrap();
+            // Legacy line written before session fields existed.
+            let mut legacy = serde_json::to_value(mk_trade(dec!(3), "")).unwrap();
+            let obj = legacy.as_object_mut().unwrap();
+            obj.remove("session_id");
+            obj.remove("engine_version");
+            let mut f = OpenOptions::new().append(true).open(&dir).unwrap();
+            writeln!(f, "{legacy}").unwrap();
+            // Trailing partial record from an interrupted append.
+            write!(f, "{{\"intent\":").unwrap();
+        }
+        let reopened = MemoryStore::with_jsonl(dir.clone()).unwrap();
+        assert_eq!(reopened.trades().len(), 2);
+        assert_eq!(reopened.total_pnl(), dec!(5));
+        assert_eq!(reopened.trades()[0].session_id, "s1");
+        assert_eq!(reopened.trades()[1].session_id, "");
+        let _ = std::fs::remove_file(&dir);
     }
 }

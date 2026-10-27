@@ -29,6 +29,9 @@ services:
         exec arb-engine --config /tmp/config.toml
     environment:
       RUST_LOG: info
+      # Public static Indodax market-data token, supplied from the host
+      # environment at `up` time. Still no trading API keys in this stack.
+      INDODAX_WS_TOKEN: ${INDODAX_WS_TOKEN:-}
     ports:
       - "127.0.0.1:8787:8787"
     volumes:
