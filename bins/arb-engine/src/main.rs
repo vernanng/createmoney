@@ -2,7 +2,7 @@ mod config;
 
 use arb_api::{
     render_flows_envelope, render_metrics, route, route_viewer, ConnectorHealth, Control,
-    EngineStatus, StrategyMetrics, UsdtIdrHealth,
+    EngineStatus, PortfolioStatus, StrategyMetrics, UsdtIdrHealth, VenueBalance,
 };
 use arb_core::{now_ms, Symbol, Venue};
 use arb_dex_evm::{to_dex_quote, DexKind, V2Pool};
@@ -111,17 +111,47 @@ fn restored_funding_pairs(trades: &[StoredTrade]) -> Vec<(Venue, Symbol)> {
 /// Trades kept in the `/flows` snapshot served to the 3D viewer.
 const FLOWS_SNAPSHOT: usize = 200;
 
-/// Reference price levels for the synthetic feed and paper seeding.
-/// Real feeds replace these with live books; keep them plausible.
+/// Reference marks (asset -> USDT price) from the anchor table for the
+/// portfolio baseline. Stablecoins count at one; the ETH/BTC cross and any
+/// non-USDT pair never appear here.
+fn anchor_marks() -> BTreeMap<String, Decimal> {
+    let mut marks = BTreeMap::from([
+        ("USDT".to_string(), Decimal::ONE),
+        ("USDC".to_string(), Decimal::ONE),
+    ]);
+    for (pair, px) in anchors() {
+        let mut parts = pair.split('/');
+        if let (Some(base), Some("USDT")) = (parts.next(), parts.next()) {
+            marks.insert(base.to_string(), px);
+        }
+    }
+    marks
+}
+
 fn anchors() -> BTreeMap<String, Decimal> {
     BTreeMap::from([
-        ("BTC/USDT".to_string(), Decimal::new(100_000, 0)),
-        ("ETH/USDT".to_string(), Decimal::new(3_000, 0)),
+        ("BTC/USDT".to_string(), Decimal::new(80_000, 0)),
+        ("ETH/USDT".to_string(), Decimal::new(2_300, 0)),
         ("ETH/BTC".to_string(), Decimal::new(3, 2)), // 0.03 — triangular needs the cross
-        ("SOL/USDT".to_string(), Decimal::new(150, 0)),
-        ("SOL/USDC".to_string(), Decimal::new(150, 0)),
-        ("XRP/USDT".to_string(), Decimal::new(6, 1)),
-        ("DOGE/USDT".to_string(), Decimal::new(2, 1)),
+        ("SOL/USDT".to_string(), Decimal::new(100, 0)),
+        ("SOL/USDC".to_string(), Decimal::new(100, 0)),
+        ("BNB/USDT".to_string(), Decimal::new(740, 0)),
+        ("ADA/USDT".to_string(), Decimal::new(2, 1)),
+        ("LINK/USDT".to_string(), Decimal::new(113, 1)),
+        ("TRX/USDT".to_string(), Decimal::new(33, 2)),
+        ("LTC/USDT".to_string(), Decimal::new(56, 0)),
+        ("DOT/USDT".to_string(), Decimal::new(1, 0)),
+        ("AVAX/USDT".to_string(), Decimal::new(88, 1)),
+        ("UNI/USDT".to_string(), Decimal::new(71, 1)),
+        ("ATOM/USDT".to_string(), Decimal::new(16, 1)),
+        ("NEAR/USDT".to_string(), Decimal::new(45, 1)),
+        ("XLM/USDT".to_string(), Decimal::new(17, 2)),
+        ("ETC/USDT".to_string(), Decimal::new(75, 1)),
+        ("ALGO/USDT".to_string(), Decimal::new(1, 1)),
+        ("FIL/USDT".to_string(), Decimal::new(9, 1)),
+        ("SUI/USDT".to_string(), Decimal::new(9, 1)),
+        ("XRP/USDT".to_string(), Decimal::new(13, 1)),
+        ("DOGE/USDT".to_string(), Decimal::new(78, 3)),
     ])
 }
 
@@ -241,6 +271,7 @@ impl Engine {
                 connectors: vec![],
                 paused_strategies: vec![],
                 usdt_idr: UsdtIdrHealth::default(),
+                portfolio: PortfolioStatus::default(),
             }),
             per_strategy: Mutex::new(BTreeMap::new()),
             flows: Mutex::new(render_flows_envelope(&[], 0)),
@@ -287,18 +318,27 @@ impl Engine {
                     } else {
                         // Seed enough base to sell ~2x target notional at the
                         // reference price, so cheap assets can actually trade.
+                        // Exact USDT pair first: a prefix match would catch the
+                        // ETH/BTC triangle cross (0.03) and overseed ETH ~666x.
                         let ref_px = anchor_tbl
-                            .iter()
-                            .find(|(k, _)| k.split('/').next() == Some(a.as_str()))
-                            .map(|(_, v)| *v)
+                            .get(&format!("{a}/USDT"))
+                            .copied()
+                            .or_else(|| {
+                                anchor_tbl
+                                    .iter()
+                                    .find(|(k, _)| k.split('/').next() == Some(a.as_str()))
+                                    .map(|(_, v)| *v)
+                            })
                             .unwrap_or(Decimal::new(100, 0));
-                        let need = Decimal::new(2, 0) * cfg.params.target_notional_quote / ref_px;
-                        cfg.paper.start_base_per_asset.max(need)
+                        Decimal::new(2, 0) * cfg.params.target_notional_quote / ref_px
                     };
                     paper.seed(v, a, amt);
                 }
             }
         }
+        // Baseline for unrealized P/L: mark the seeded ledger at the reference
+        // prices, the same marks the synthetic feed would use.
+        paper.starting_equity = paper.equity_quote(&anchor_marks());
         Ok(Self {
             cfg,
             symbols,
@@ -693,12 +733,50 @@ impl Engine {
             .lock()
             .map(|m| m.clone())
             .unwrap_or_default();
+        // Portfolio marks: fresh live-book mids win; anchors fill the rest
+        // (and all of it in synthetic mode). Non-USDT pairs never mark.
+        let mut marks = anchor_marks();
+        if live_mode {
+            for ((_, sym), book) in &live_map {
+                let mut parts = sym.split('/');
+                if let (Some(base), Some("USDT")) = (parts.next(), parts.next()) {
+                    if now - book.ts_ms <= self.cfg.params.max_book_age_ms && !book.is_crossed() {
+                        if let (Some(bid), Some(ask)) = (book.best_bid(), book.best_ask()) {
+                            marks.insert(
+                                base.to_string(),
+                                (bid.price + ask.price) / Decimal::new(2, 0),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        let equity = self.paper.equity_quote(&marks);
+        let portfolio = PortfolioStatus {
+            per_venue: self
+                .paper
+                .balances_snapshot()
+                .iter()
+                .flat_map(|(v, m)| {
+                    m.iter().map(|(a, amt)| VenueBalance {
+                        venue: *v,
+                        asset: a.clone(),
+                        amount: *amt,
+                    })
+                })
+                .collect(),
+            equity_quote: equity,
+            baseline_quote: self.paper.starting_equity,
+            realized_pnl_quote: self.paper.realized_pnl,
+            unrealized_pnl_quote: self.paper.unrealized_pnl_quote(&marks),
+        };
         EngineStatus {
             mode: self.cfg.engine.mode.clone(),
             killed,
             trades: self.paper.trades,
             realized_pnl_quote: self.paper.realized_pnl,
             opportunities_seen: self.opportunities,
+            portfolio,
             connectors: self
                 .cfg
                 .venues
@@ -833,6 +911,7 @@ async fn serve_api(addr: String, token: Option<String>, shared: Arc<Shared>) {
                         connectors: vec![],
                         paused_strategies: vec![],
                         usdt_idr: UsdtIdrHealth::default(),
+                        portfolio: PortfolioStatus::default(),
                     });
                 let per = shared
                     .per_strategy
@@ -880,8 +959,47 @@ async fn serve_api(addr: String, token: Option<String>, shared: Arc<Shared>) {
     }
 }
 
+/// Split one `.env` line into (key, value). Blanks, comments, and lines
+/// without `=` return None. One layer of matching quotes is stripped.
+fn parse_dotenv_line(line: &str) -> Option<(&str, &str)> {
+    let line = line.trim();
+    let body = line.strip_prefix("export ").unwrap_or(line).trim();
+    if body.is_empty() || body.starts_with('#') {
+        return None;
+    }
+    let (key, mut value) = body.split_once('=')?;
+    let key = key.trim();
+    if key.is_empty() || !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return None;
+    }
+    value = value.trim();
+    if value.len() >= 2
+        && value.starts_with(['\'', '"'])
+        && value.ends_with(value.as_bytes()[0] as char)
+    {
+        value = &value[1..value.len() - 1];
+    }
+    Some((key, value))
+}
+
+/// Load `./.env` into the process env (real env wins). Lets `cargo run`
+/// pick up keys without a `set -a` wrapper; missing file is fine.
+fn load_dotenv() {
+    let Ok(text) = std::fs::read_to_string(".env") else {
+        return;
+    };
+    for line in text.lines() {
+        if let Some((key, value)) = parse_dotenv_line(line) {
+            if std::env::var_os(key).is_none() {
+                std::env::set_var(key, value);
+            }
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    load_dotenv();
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
@@ -956,6 +1074,58 @@ async fn main() -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use arb_core::{Intent, MarketKind, Side, TradeLeg};
+
+    #[test]
+    fn dotenv_line_parses_env_format() {
+        assert_eq!(parse_dotenv_line("FOO=bar"), Some(("FOO", "bar")));
+        assert_eq!(parse_dotenv_line("  FOO =  bar  "), Some(("FOO", "bar")));
+        assert_eq!(parse_dotenv_line("FOO=\"a=b\""), Some(("FOO", "a=b")));
+        assert_eq!(parse_dotenv_line("FOO='sp ace'"), Some(("FOO", "sp ace")));
+        assert_eq!(parse_dotenv_line("export FOO=bar"), Some(("FOO", "bar")));
+        assert_eq!(parse_dotenv_line("# comment"), None);
+        assert_eq!(parse_dotenv_line(""), None);
+        assert_eq!(parse_dotenv_line("NOEQUALS"), None);
+        assert_eq!(parse_dotenv_line("=v"), None);
+        assert_eq!(parse_dotenv_line("NOT A KEY=v"), None);
+    }
+
+    #[test]
+    fn eth_seeding_uses_usdt_anchor_not_triangle_cross() {
+        // Regression: the prefix lookup matched "ETH/BTC" (0.03) before
+        // "ETH/USDT" and seeded 66666.67 ETH per venue, inflating the
+        // portfolio baseline ~17x.
+        let cfg: config::Config = toml::from_str(
+            r#"
+venues = ["binance"]
+symbols = ["BTC/USDT", "ETH/USDT"]
+
+[engine]
+mode = "paper"
+feed = "synthetic"
+
+[params]
+min_edge_bps = 15
+slip_buffer_bps = 5
+target_notional_quote = 1000
+max_book_age_ms = 2000
+
+[risk]
+max_notional_quote_per_trade = 5000
+max_notional_quote_per_venue = 25000
+"#,
+        )
+        .unwrap();
+        let engine = Engine::new(cfg).unwrap();
+        // Dynamic rule: 2x target notional at the USDT anchor, no fixed floor.
+        // BTC: 2000/80000 = 0.025 exact. ETH must be 2000/2300, not the
+        // 66666.67 the old prefix match produced from the ETH/BTC cross.
+        assert_eq!(
+            engine.paper.balance(Venue::Binance, "BTC"),
+            Decimal::new(25, 3)
+        );
+        let eth = engine.paper.balance(Venue::Binance, "ETH");
+        assert!(eth > Decimal::ZERO && eth < Decimal::ONE, "ETH seed: {eth}");
+    }
 
     #[test]
     fn live_feed_never_invents_funding() {

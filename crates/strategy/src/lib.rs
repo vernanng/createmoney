@@ -63,7 +63,7 @@ impl Default for StrategyParams {
         Self {
             min_edge_bps: Decimal::new(15, 0),
             slip_buffer_bps: Decimal::new(5, 0),
-            target_notional_quote: Decimal::new(1_000, 0),
+            target_notional_quote: Decimal::new(10, 0),
             max_book_age_ms: 2_000,
             ttl_ms: 1_500,
         }

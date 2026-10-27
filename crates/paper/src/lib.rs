@@ -36,6 +36,9 @@ pub struct PaperExecutor {
     /// Simulated free balances per venue/asset. Spot fills debit/credit these;
     /// a leg the balance cannot fund aborts the intent (no partial mutation).
     pub balances: Balances,
+    /// Mark-to-market equity right after seeding. Unrealized P/L is measured
+    /// against this: equity now minus baseline minus realized.
+    pub starting_equity: Decimal,
 }
 
 impl Default for PaperExecutor {
@@ -51,7 +54,28 @@ impl PaperExecutor {
             realized_pnl: Decimal::ZERO,
             trades: 0,
             balances: Balances::new(),
+            starting_equity: Decimal::ZERO,
         }
+    }
+
+    /// Whole ledger, for the portfolio view. Clone is fine: called once a tick.
+    pub fn balances_snapshot(&self) -> Balances {
+        self.balances.clone()
+    }
+
+    /// Mark-to-market equity in quote terms. Assets with no mark are skipped
+    /// (stale venue, unknown token) so a missing feed never invents value.
+    pub fn equity_quote(&self, marks: &BTreeMap<String, Decimal>) -> Decimal {
+        self.balances
+            .values()
+            .flat_map(|m| m.iter())
+            .map(|(asset, amt)| marks.get(asset).copied().unwrap_or(Decimal::ZERO) * *amt)
+            .sum()
+    }
+
+    /// Open-position P/L: what the ledger gained or lost beyond closed trades.
+    pub fn unrealized_pnl_quote(&self, marks: &BTreeMap<String, Decimal>) -> Decimal {
+        self.equity_quote(marks) - self.starting_equity - self.realized_pnl
     }
 
     /// Credit a simulated balance (engine seeds these from config at startup).
@@ -299,6 +323,29 @@ mod tests {
             (book_key(Venue::Binance, &s), cheap),
             (book_key(Venue::Bybit, &s), rich),
         ])
+    }
+
+    #[test]
+    fn equity_and_unrealized_measure_against_baseline() {
+        let mut p = PaperExecutor::default();
+        p.seed(Venue::Binance, "USDT", dec!(1000));
+        p.seed(Venue::Binance, "BTC", dec!(1));
+        let marks = BTreeMap::from([
+            ("USDT".to_string(), dec!(1)),
+            ("BTC".to_string(), dec!(100)),
+        ]);
+        p.starting_equity = p.equity_quote(&marks);
+        assert_eq!(p.starting_equity, dec!(1100));
+        // BTC doubles with no closed trades: all gain is unrealized.
+        let up = BTreeMap::from([
+            ("USDT".to_string(), dec!(1)),
+            ("BTC".to_string(), dec!(200)),
+        ]);
+        assert_eq!(p.equity_quote(&up), dec!(1200));
+        assert_eq!(p.unrealized_pnl_quote(&up), dec!(100));
+        // Unknown assets mark at zero, never invented.
+        p.seed(Venue::Binance, "MYST", dec!(9));
+        assert_eq!(p.equity_quote(&up), dec!(1200));
     }
 
     #[test]

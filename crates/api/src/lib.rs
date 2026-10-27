@@ -72,6 +72,26 @@ impl Default for UsdtIdrHealth {
     }
 }
 
+/// One ledger line: free balance of one asset on one venue.
+#[derive(Debug, Clone, Serialize)]
+pub struct VenueBalance {
+    pub venue: Venue,
+    pub asset: String,
+    pub amount: Decimal,
+}
+
+/// Mark-to-market portfolio. `unrealized` is equity now minus the seeded
+/// baseline minus closed-trade (realized) P/L; assets with no live mark are
+/// excluded from equity rather than guessed.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct PortfolioStatus {
+    pub per_venue: Vec<VenueBalance>,
+    pub equity_quote: Decimal,
+    pub baseline_quote: Decimal,
+    pub realized_pnl_quote: Decimal,
+    pub unrealized_pnl_quote: Decimal,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct EngineStatus {
     pub mode: String,
@@ -82,6 +102,7 @@ pub struct EngineStatus {
     pub connectors: Vec<ConnectorHealth>,
     pub paused_strategies: Vec<String>,
     pub usdt_idr: UsdtIdrHealth,
+    pub portfolio: PortfolioStatus,
 }
 
 pub struct Control {
@@ -138,6 +159,18 @@ pub fn render_metrics(
     s.push_str(&format!(
         "arb_realized_pnl_quote {}\n",
         status.realized_pnl_quote
+    ));
+    s.push_str(
+        "# HELP arb_equity_quote Mark-to-market equity in quote\n# TYPE arb_equity_quote gauge\n",
+    );
+    s.push_str(&format!(
+        "arb_equity_quote {}\n",
+        status.portfolio.equity_quote
+    ));
+    s.push_str("# HELP arb_unrealized_pnl_quote Open-position PnL in quote\n# TYPE arb_unrealized_pnl_quote gauge\n");
+    s.push_str(&format!(
+        "arb_unrealized_pnl_quote {}\n",
+        status.portfolio.unrealized_pnl_quote
     ));
     s.push_str("# HELP arb_killed Kill-switch state\n# TYPE arb_killed gauge\n");
     s.push_str(&format!(
@@ -339,6 +372,17 @@ mod tests {
                 independent_sources: 3,
                 state: "ok".into(),
             },
+            portfolio: PortfolioStatus {
+                per_venue: vec![VenueBalance {
+                    venue: Venue::Binance,
+                    asset: "USDT".into(),
+                    amount: dec!(100),
+                }],
+                equity_quote: dec!(100),
+                baseline_quote: dec!(100),
+                realized_pnl_quote: dec!(1.5),
+                unrealized_pnl_quote: dec!(-1.5),
+            },
         };
         let m = render_metrics(
             &st,
@@ -364,6 +408,8 @@ mod tests {
         assert!(m.contains("arb_usdt_idr_mid 18111.5"), "{m}");
         assert!(m.contains("arb_usdt_idr_fresh 1"), "{m}");
         assert!(m.contains("arb_usdt_idr_independent_sources 3"), "{m}");
+        assert!(m.contains("arb_equity_quote 100"), "{m}");
+        assert!(m.contains("arb_unrealized_pnl_quote -1.5"), "{m}");
         assert_eq!(route("GET", "/health", &mut c, &st, &m, None).0, 200);
         assert_eq!(route("POST", "/kill", &mut c, &st, &m, None).0, 200);
         assert!(flag.load(Ordering::SeqCst));
@@ -376,6 +422,11 @@ mod tests {
         assert!(body.contains("\"state\":\"ok\""), "status body: {body}");
         assert!(body.contains("\"triangular\""), "status body: {body}");
         assert!(body.contains("\"killed\":true"), "status body: {body}");
+        assert!(body.contains("\"portfolio\""), "status body: {body}");
+        assert!(
+            body.contains("\"equity_quote\":\"100\""),
+            "status body: {body}"
+        );
         assert_eq!(route("GET", "/nope", &mut c, &st, &m, None).0, 404);
     }
 
@@ -392,6 +443,13 @@ mod tests {
             connectors: vec![],
             paused_strategies: vec![],
             usdt_idr: UsdtIdrHealth::default(),
+            portfolio: PortfolioStatus {
+                per_venue: vec![],
+                equity_quote: dec!(0),
+                baseline_quote: dec!(0),
+                realized_pnl_quote: dec!(0),
+                unrealized_pnl_quote: dec!(0),
+            },
         };
         // Reads stay open; control posts are rejected without the token.
         assert_eq!(

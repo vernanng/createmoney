@@ -49,6 +49,7 @@
 <div id="hud">
   <h1>strategy-flow</h1>
   <div id="status">connecting…</div>
+  <div id="portfolio">portfolio: waiting for status…</div>
   <div class="row" id="filters"></div>
   <div class="row"><button id="liveBtn" aria-pressed="true">live</button></div>
 </div>
@@ -370,6 +371,16 @@ async function loadStatus() {
     const s = await res.json();
     $('status').textContent =
       `mode=${s.mode} killed=${s.killed} trades=${s.trades} opps=${s.opportunities_seen} flows=${state.total}`;
+    const p = s.portfolio;
+    if (p) {
+      const fmt = (n) => (typeof n === 'number' ? n : Number(n)).toLocaleString('en-US', { maximumFractionDigits: 2 });
+      const lines = (p.per_venue || [])
+        .filter((b) => Number(b.amount) !== 0)
+        .map((b) => `${b.venue} ${b.asset} ${fmt(b.amount)}`);
+      $('portfolio').textContent =
+        `equity=${fmt(p.equity_quote)} realized=${fmt(p.realized_pnl_quote)} unrealized=${fmt(p.unrealized_pnl_quote)} | ` +
+        lines.join(' · ');
+    }
   } catch { /* status is best-effort; flows carry the scene */ }
 }
 // ---------- main loop and boot ----------

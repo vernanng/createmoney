@@ -221,18 +221,18 @@ mod tests {
             1_000,
         );
         v.put(b);
-        // DEX buys at 3030 (+~100bps vs CEX ask) but gas is $50 on $1000 notional = 500bps -> dead.
+        // DEX buys at 3030 (+~100bps vs CEX ask) but gas is $0.50 on $10 notional = 500bps -> dead.
         v.dex_quotes.push(DexQuote {
             venue: Venue::Uniswap,
             symbol: s.clone(),
             buy_px: dec!(3035),
             sell_px: dec!(3030),
-            gas_quote: dec!(50),
+            gas_quote: dec!(0.5),
             ts_ms: 1_000,
         });
         assert!(st.on_tick(&v).is_empty());
-        // Same prices, L2-style gas $0.50 = 5bps -> fires.
-        v.dex_quotes[0].gas_quote = dec!(0.5);
+        // Same prices, L2-style gas $0.005 = 5bps -> fires.
+        v.dex_quotes[0].gas_quote = dec!(0.005);
         let hits = st.on_tick(&v);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].legs[1].venue, Venue::Uniswap);
@@ -271,7 +271,7 @@ mod tests {
             symbol: s,
             buy_px: dec!(3035),
             sell_px: dec!(3030),
-            gas_quote: dec!(0.5),
+            gas_quote: dec!(0.005),
             ts_ms: 1_000,
         });
         let hits = st.on_tick(&v);
@@ -282,7 +282,7 @@ mod tests {
 
     #[test]
     fn sweep_prefers_small_size_in_thin_book() {
-        // Thin CEX asks: 0.03 @ 3001 then deep 3100. Full $1000 walks into
+        // Thin CEX asks: 0.0003 @ 3001 then deep 3100. Full $10 walks into
         // 3100 (edge dies); 0.1x stays near touch (edge lives). Sweep must
         // pick the small size, proving the edge-size curve crosses zero.
         let s = Symbol::new("ETH", "USDT");
@@ -299,16 +299,16 @@ mod tests {
         b.apply_snapshot(
             vec![BookLevel {
                 price: dec!(3000),
-                qty: dec!(10),
+                qty: dec!(0.1),
             }],
             vec![
                 BookLevel {
                     price: dec!(3001),
-                    qty: dec!(0.03),
+                    qty: dec!(0.0003),
                 },
                 BookLevel {
                     price: dec!(3100),
-                    qty: dec!(10),
+                    qty: dec!(0.1),
                 },
             ],
             1,
@@ -320,7 +320,7 @@ mod tests {
             symbol: s,
             buy_px: dec!(3060),
             sell_px: dec!(3050),
-            gas_quote: dec!(0.5),
+            gas_quote: dec!(0.005),
             ts_ms: 1_000,
         });
         let hits = st.on_tick(&v);
@@ -330,7 +330,7 @@ mod tests {
             "small size must survive where full size dies"
         );
         let qty = hits[0].legs[0].qty_base;
-        let full = crate::size_for_notional(dec!(1000), dec!(3001));
+        let full = crate::size_for_notional(dec!(10), dec!(3001));
         assert!(
             qty < full,
             "sweep must pick smaller than full, got {qty} vs {full}"

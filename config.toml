@@ -2,7 +2,7 @@
 # NOTE: top-level keys (venues/symbols) must stay above the first [table]
 # header — bare keys after a header belong to that table and are ignored.
 venues = ["binance", "bybit", "okx", "indodax"]
-symbols = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "DOGE/USDT"]
+symbols = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "DOGE/USDT", "BNB/USDT", "ADA/USDT", "LINK/USDT", "TRX/USDT", "LTC/USDT", "DOT/USDT", "AVAX/USDT", "UNI/USDT", "ATOM/USDT", "NEAR/USDT", "XLM/USDT", "ETC/USDT", "ALGO/USDT", "FIL/USDT", "SUI/USDT"]
 
 [engine]
 mode = "paper"        # paper | live (live still requires *_API_KEY env vars)
@@ -20,14 +20,14 @@ cex_dex = true
 [params]
 min_edge_bps = 15
 slip_buffer_bps = 5
-target_notional_quote = 1000
+target_notional_quote = 10
 max_book_age_ms = 2000
 ttl_ms = 1500
 min_funding_annualized_bps = 500
 
 [risk]
-max_notional_quote_per_trade = 5000
-max_notional_quote_per_venue = 25000
+max_notional_quote_per_trade = 50
+max_notional_quote_per_venue = 250
 
 [dex]
 uniswap = true
@@ -43,5 +43,5 @@ rate_max_spread_bps = 50       # live USDT/IDR top-of-book spread cap (bps of mi
 rate_max_deviation_bps = 300   # vs independent consensus (Upbit ID + implied crosses); beyond it Indodax is withheld
 
 [paper]
-start_quote_per_venue = 1000000  # USDT/USDC seeded per venue (incl. DEX wallets)
-start_base_per_asset = 100       # base units seeded per symbol asset
+start_quote_per_venue = 500  # USDT/USDC seeded per venue (incl. DEX wallets)
+# Base per asset is dynamic: ~2x target notional at the reference price, so no fixed knob.

@@ -29,22 +29,16 @@ pub struct Config {
 pub struct PaperCfg {
     #[serde(default = "default_start_quote")]
     pub start_quote_per_venue: Decimal,
-    #[serde(default = "default_start_base")]
-    pub start_base_per_asset: Decimal,
 }
 impl Default for PaperCfg {
     fn default() -> Self {
         Self {
             start_quote_per_venue: default_start_quote(),
-            start_base_per_asset: default_start_base(),
         }
     }
 }
 fn default_start_quote() -> Decimal {
-    Decimal::new(1_000_000, 0)
-}
-fn default_start_base() -> Decimal {
-    Decimal::new(100, 0)
+    Decimal::new(500, 0)
 }
 
 #[derive(Debug, Deserialize)]

@@ -18,8 +18,8 @@ pub struct RiskLimits {
 impl Default for RiskLimits {
     fn default() -> Self {
         Self {
-            max_notional_quote_per_trade: Decimal::new(5_000, 0),
-            max_notional_quote_per_venue: Decimal::new(25_000, 0),
+            max_notional_quote_per_trade: Decimal::new(50, 0),
+            max_notional_quote_per_venue: Decimal::new(250, 0),
             min_edge_bps: Decimal::new(15, 0),
             max_book_age_ms: 2_000,
         }
@@ -192,29 +192,29 @@ mod tests {
     fn accepts_good_and_rejects_bad() {
         let mut r = RiskEngine::new(RiskLimits::default());
         assert!(r
-            .check(&intent(dec!(100), dec!(1), dec!(30), 0), 100)
+            .check(&intent(dec!(10), dec!(1), dec!(30), 0), 100)
             .is_ok());
         assert!(matches!(
-            r.check(&intent(dec!(100), dec!(1), dec!(5), 0), 100),
+            r.check(&intent(dec!(10), dec!(1), dec!(5), 0), 100),
             Err(Reject::EdgeTooSmall { .. })
         ));
         assert!(matches!(
-            r.check(&intent(dec!(100000), dec!(1), dec!(30), 0), 100),
+            r.check(&intent(dec!(10000), dec!(1), dec!(30), 0), 100),
             Err(Reject::NotionalTooBig { .. })
         ));
         assert!(matches!(
-            r.check(&intent(dec!(100), dec!(1), dec!(30), 0), 5_000),
+            r.check(&intent(dec!(10), dec!(1), dec!(30), 0), 5_000),
             Err(Reject::Expired { .. })
         ));
         r.pause_venue(Venue::Binance);
         assert!(matches!(
-            r.check(&intent(dec!(100), dec!(1), dec!(30), 0), 100),
+            r.check(&intent(dec!(10), dec!(1), dec!(30), 0), 100),
             Err(Reject::VenuePaused(_))
         ));
         r.resume_venue(Venue::Binance);
         r.kill();
         assert!(matches!(
-            r.check(&intent(dec!(100), dec!(1), dec!(30), 0), 100),
+            r.check(&intent(dec!(10), dec!(1), dec!(30), 0), 100),
             Err(Reject::Killed)
         ));
     }
@@ -222,14 +222,14 @@ mod tests {
     #[test]
     fn venue_exposure_accumulates() {
         let limits = RiskLimits {
-            max_notional_quote_per_venue: dec!(150),
+            max_notional_quote_per_venue: dec!(15),
             ..Default::default()
         };
         let mut r = RiskEngine::new(limits);
-        let i = intent(dec!(100), dec!(1), dec!(30), 0);
+        let i = intent(dec!(10), dec!(1), dec!(30), 0);
         r.record(&i);
         assert!(matches!(r.check(&i, 10), Err(Reject::VenueExposure { .. })));
-        r.release(Venue::Binance, dec!(100));
+        r.release(Venue::Binance, dec!(10));
         assert!(r.check(&i, 10).is_ok());
     }
 

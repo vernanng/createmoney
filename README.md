@@ -99,7 +99,7 @@ All strategies share `StrategyParams` (from `[params]` in config):
 |---|---|---|
 | `min_edge_bps` | 15 | Minimum **net** edge (after fees + slippage buffer) to emit |
 | `slip_buffer_bps` | 5 | Extra bps subtracted from every edge before comparing |
-| `target_notional_quote` | 1000 | Base order size in quote (USD/USDT) terms |
+| `target_notional_quote` | 10 | Base order size in quote (USD/USDT) terms |
 | `max_book_age_ms` | 2000 | Books older than this, or crossed, never trade (`fresh()`) |
 | `ttl_ms` | 1500 | Intent lifetime; risk rejects anything older |
 
@@ -285,8 +285,8 @@ mattering, the corresponding cost model — or the test — is broken.
 - **Risk** (`crates/risk`): every intent passes `RiskEngine::check` before
   any executor sees it. Rejects: kill-switch on, empty intent, expired
   (`age > ttl_ms`), edge below `min_edge_bps`, any leg over
-  `max_notional_quote_per_trade` (default 5000), venue exposure over
-  `max_notional_quote_per_venue` (default 25000), or a leg on a paused
+  `max_notional_quote_per_trade` (default 50), venue exposure over
+  `max_notional_quote_per_venue` (default 250), or a leg on a paused
   venue. After a fill the engine calls `settle`: round-trips release
   exposure immediately; position-opening intents (funding entries) keep
   consuming the venue cap until released.
@@ -313,7 +313,7 @@ if `API_TOKEN` is set in env, the POST rows below need `?token=<value>`
 | Route | Method | Effect |
 |---|---|---|
 | `/health` | GET | `{"ok":true}` |
-| `/status` | GET | mode, killed, trades, realized PnL, opportunities, per-venue connector health (socket state reported separately from fresh-book counts), paused strategies |
+| `/status` | GET | mode, killed, trades, realized PnL, opportunities, per-venue connector health (socket state reported separately from fresh-book counts), paused strategies, portfolio (per-venue balances, equity, realized/unrealized PnL) |
 | `/metrics` | GET | text metrics incl. per-strategy funnel counters (scans, intents, risk rejects, fill failures, trades, PnL) and per-venue book freshness |
 | `/flows` | GET | JSON snapshot of the last 200 trades (for the viewer) |
 | `/viewer` | GET | built-in HTML trade-flow viewer |
@@ -326,6 +326,8 @@ if `API_TOKEN` is set in env, the POST rows below need `?token=<value>`
 
 Copy `config.example.toml` to `config.toml` (a working paper default is
 committed). Secrets only via env (see `.env.example`) — never in config.
+`arb-engine` auto-loads `./.env` at startup (real env wins), so plain
+`cargo run -p arb-engine` picks up keys with no wrapper.
 The live Indodax feed additionally needs `INDODAX_WS_TOKEN`, the public
 static market-data token from Indodax's WebSocket docs; without it that
 venue is disabled at startup with one error instead of reconnecting.
@@ -334,7 +336,7 @@ Top-level `venues` / `symbols` must stay above the first `[table]` header.
 | Key | Default (committed config) | Meaning |
 |---|---|---|
 | `venues` | binance, bybit, okx, indodax | CEX venues to run |
-| `symbols` | BTC, ETH, SOL, XRP, DOGE `/USDT` | traded pairs |
+| `symbols` | BTC, ETH, SOL, XRP, DOGE, BNB, ADA, LINK, TRX, LTC, DOT, AVAX, UNI, ATOM, NEAR, XLM, ETC, ALGO, FIL, SUI `/USDT` | traded pairs |
 | `[engine] mode` | `paper` | `paper` \| `live` (live still needs env keys + armed check) |
 | `[engine] feed` | `live` | `live` (real WS books, paper fills) \| `synthetic` |
 | `[engine] tick_ms` | 250 | tick-loop period |
@@ -343,8 +345,8 @@ Top-level `venues` / `symbols` must stay above the first `[table]` header.
 | `[strategies]` | all `true` | toggles for `cross_exchange`, `triangular`, `funding_rate`, `cex_dex` (`lag_chase`/`fx_triangle` ride on `cross_exchange`) |
 | `[params]` | see [Shared contract](#shared-contract) | `min_edge_bps`, `slip_buffer_bps`, `target_notional_quote`, `max_book_age_ms`, `ttl_ms` |
 | `[params] min_funding_annualized_bps` | 500 | funding-rate entry bar |
-| `[risk] max_notional_quote_per_trade` | 5000 | per-leg cap |
-| `[risk] max_notional_quote_per_venue` | 25000 | open-exposure cap per venue |
+| `[risk] max_notional_quote_per_trade` | 50 | per-leg cap |
+| `[risk] max_notional_quote_per_venue` | 250 | open-exposure cap per venue |
 | `[dex] uniswap / pancakeswap / jupiter` | all `true` | quote sources for `cex_dex` |
 | `[dex] evm_gas_quote` | 1 | USD gas estimate per EVM swap (raise for L1) |
 | `[dex] solana_fee_quote` | 1 | USD fee estimate per Jupiter swap |
@@ -352,8 +354,7 @@ Top-level `venues` / `symbols` must stay above the first `[table]` header.
 | `[indodax] rate_max_age_ms` | 30000 | max age of the live USDT/IDR book used as divisor |
 | `[indodax] rate_max_spread_bps` | 50 | max USDT/IDR top-of-book spread (bps of mid) |
 | `[indodax] rate_max_deviation_bps` | 300 | max deviation vs independent consensus before Indodax is withheld |
-| `[paper] start_quote_per_venue` | 1,000,000 | seeded USDT/USDC per venue incl. DEX wallets |
-| `[paper] start_base_per_asset` | 100 | seeded base units per symbol asset |
+| `[paper] start_quote_per_venue` | 500 | seeded USDT/USDC per venue incl. DEX wallets (base per asset is dynamic: ~2x target notional at the reference price) |
 
 Before going live, set `[paper]` amounts to your real planned capital per
 venue so the paper soak behaves like the live book.

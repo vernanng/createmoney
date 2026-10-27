@@ -64,7 +64,16 @@ fn levels(arr: &Value) -> Result<Vec<BookLevel>, FeedError> {
 }
 
 /// Public endpoints (verified against official docs; see README sources).
-pub fn ws_url(venue: Venue) -> &'static str {
+/// `BINANCE_WS_URL` overrides the Binance base (e.g. the spot testnet
+/// `wss://testnet.binance.vision`); empty/unset keeps mainnet.
+pub fn ws_url(venue: Venue) -> String {
+    if venue == Venue::Binance {
+        if let Ok(u) = std::env::var("BINANCE_WS_URL") {
+            if !u.trim().is_empty() {
+                return u;
+            }
+        }
+    }
     match venue {
         Venue::Binance => "wss://stream.binance.com:9443",
         Venue::Bybit => "wss://stream.bybit.com/v5/public/spot",
@@ -72,6 +81,7 @@ pub fn ws_url(venue: Venue) -> &'static str {
         Venue::Indodax => "wss://ws3.indodax.com/ws/",
         Venue::Uniswap | Venue::Pancakeswap | Venue::Jupiter => "",
     }
+    .to_string()
 }
 
 pub fn perp_ws_url(venue: Venue) -> &'static str {

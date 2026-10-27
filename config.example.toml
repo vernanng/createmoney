@@ -20,14 +20,14 @@ cex_dex = true
 [params]
 min_edge_bps = 15
 slip_buffer_bps = 5
-target_notional_quote = 1000
+target_notional_quote = 10
 max_book_age_ms = 2000
 ttl_ms = 1500
 min_funding_annualized_bps = 500
 
 [risk]
-max_notional_quote_per_trade = 5000
-max_notional_quote_per_venue = 25000
+max_notional_quote_per_trade = 50
+max_notional_quote_per_venue = 250
 
 [dex]
 uniswap = true
@@ -48,5 +48,5 @@ rate_max_deviation_bps = 300   # vs independent consensus (Upbit ID + implied cr
 # the paper soak behaves like the live book. Amounts are not secrets, so
 # they live here, not in env (env is API keys only).
 [paper]
-start_quote_per_venue = 1000000
-start_base_per_asset = 100
+start_quote_per_venue = 500
+# Base per asset is dynamic: ~2x target notional at the reference price.
