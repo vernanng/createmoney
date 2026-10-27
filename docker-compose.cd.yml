@@ -12,13 +12,9 @@ name: createmoney-cd
 services:
   arb-engine:
     image: ghcr.io/vernanng/createmoney:latest
-    # TODO: drop this pin once the multi-arch publish workflow (same
-    # branch) has landed on main and published once, then re-run
-    # `docker compose -f docker-compose.cd.yml up -d` to switch to the
-    # native arm64 image. Until then the published image is amd64-only:
-    # it runs through Rosetta, and Watchtower polls but cannot pull
-    # updates (no arm64 manifest to compare against).
-    platform: linux/amd64
+    # No platform pin: the publish workflow builds linux/amd64 and
+    # linux/arm64, so Apple Silicon pulls the native arm64 image.
+    # Watchtower requires this host-arch manifest to auto-update.
     restart: unless-stopped
     # config.toml binds the control API to 127.0.0.1, which inside a
     # container is unreachable through Docker's port publish. Rewrite just
