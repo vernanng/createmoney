@@ -92,12 +92,18 @@ impl PaperExecutor {
             let px = match leg.market {
                 MarketKind::Perp => leg.price, // perp fills at mark; no spot book walk
                 MarketKind::Spot => {
-                    let book = books
-                        .get(&(leg.venue, leg.symbol.to_string()))
-                        .ok_or_else(|| format!("no book for {} {}", leg.venue, leg.symbol))?;
-                    let mut px = book
-                        .vwap(leg.side, leg.qty_base)
-                        .map_err(|e| e.to_string())?;
+                    // DEX legs fill at their quote price: AMM/aggregator
+                    // quotes are already size-aware executable prices, and
+                    // DEX venues never have an order book to walk.
+                    let mut px = if leg.venue.is_dex() {
+                        leg.price
+                    } else {
+                        let book = books
+                            .get(&(leg.venue, leg.symbol.to_string()))
+                            .ok_or_else(|| format!("no book for {} {}", leg.venue, leg.symbol))?;
+                        book.vwap(leg.side, leg.qty_base)
+                            .map_err(|e| e.to_string())?
+                    };
                     // Extra slippage haircut: buys pay up, sells receive less.
                     let slip = px * self.cfg.extra_slip_bps / Decimal::new(10_000, 0);
                     px = match leg.side {
@@ -481,5 +487,53 @@ mod tests {
         };
         let mut ex = PaperExecutor::default();
         assert!(ex.execute(&intent, &books(), 0).is_err());
+    }
+
+    #[test]
+    fn dex_spot_leg_fills_at_quote_price_without_book() {
+        // Regression: cex_dex intents always fill-failed with "no book"
+        // because DEX venues never have an OrderBook. DEX legs must fill
+        // at their (already size-aware) quote price.
+        let s = Symbol::new("BTC", "USDT");
+        let intent = Intent {
+            strategy: "cex_dex".into(),
+            expected_edge_bps: dec!(100),
+            ttl_ms: 1000,
+            created_ms: 0,
+            roundtrip: true,
+            legs: vec![
+                TradeLeg {
+                    venue: Venue::Binance,
+                    symbol: s.clone(),
+                    side: Side::Buy,
+                    price: dec!(100),
+                    qty_base: dec!(1),
+                    market: MarketKind::Spot,
+                },
+                TradeLeg {
+                    venue: Venue::Jupiter,
+                    symbol: s,
+                    side: Side::Sell,
+                    price: dec!(102),
+                    qty_base: dec!(1),
+                    market: MarketKind::Spot,
+                },
+            ],
+        };
+        let mut ex = PaperExecutor::new(PaperConfig {
+            fee_bps_override: Some(dec!(10)),
+            extra_slip_bps: dec!(0),
+        });
+        ex.seed(Venue::Binance, "USDT", dec!(10000));
+        ex.seed(Venue::Jupiter, "BTC", dec!(10));
+        // books() holds no Jupiter book, by construction.
+        let r = ex.execute(&intent, &books(), 10).unwrap();
+        assert_eq!(r.fills[1].venue, Venue::Jupiter);
+        assert_eq!(r.fills[1].price, dec!(102));
+        // Gross +2. Fees: 0.1% of 100 + 0.1% of 102 = 0.202. Net = 1.798.
+        assert_eq!(r.realized_pnl_quote, Some(dec!(1.798)));
+        assert_eq!(ex.balance(Venue::Jupiter, "BTC"), dec!(9));
+        assert_eq!(ex.balance(Venue::Jupiter, "USDT"), dec!(101.898));
+        assert_eq!(ex.trades, 1);
     }
 }

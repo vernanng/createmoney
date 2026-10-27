@@ -477,8 +477,15 @@ impl Engine {
                 view.put(book);
             }
         }
-        // DEX quotes from local V2 pool math (paper reserves track the anchor).
+        // DEX quotes from local V2 pool math (paper reserves track the
+        // hardcoded anchors, not live books). Like synthetic funding below,
+        // they exist only for the synthetic feed: in live mode there are
+        // deliberately no DEX quotes until real quote feeds land, so the
+        // soak cannot accumulate invented cex_dex entries.
         for sym in &self.symbols {
+            if live_mode {
+                break;
+            }
             let anchor = anchors
                 .get(&sym.to_string())
                 .copied()
