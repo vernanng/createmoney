@@ -311,7 +311,7 @@ if `API_TOKEN` is set in env, the POST rows below need `?token=<value>`
 |---|---|---|
 | `/health` | GET | `{"ok":true}` |
 | `/status` | GET | mode, killed, engine start (`started_ms`, viewer shows uptime), trades, realized PnL, opportunities, per-venue connector health (socket state reported separately from fresh-book counts), paused strategies, portfolio (per-venue balances, equity, realized/unrealized PnL) |
-| `/metrics` | GET | text metrics incl. per-strategy funnel counters (scans, intents, fill failures, trades, PnL; `risk_rejected` stays 0 — the pre-trade gate is removed) and per-venue book freshness |
+| `/metrics` | GET | text metrics incl. per-strategy funnel counters (scans, intents, fill failures, `dup_skipped` same-top refills, trades, PnL; `risk_rejected` stays 0 — the pre-trade gate is removed) and per-venue book freshness |
 | `/flows` | GET | JSON snapshot of the last 200 trades (for the viewer) |
 | `/viewer` | GET | built-in HTML trade-flow viewer |
 | `/kill` | POST | trip the kill-switch |
