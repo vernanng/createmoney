@@ -65,10 +65,19 @@ fn levels(arr: &Value) -> Result<Vec<BookLevel>, FeedError> {
 
 /// Public endpoints (verified against official docs; see README sources).
 /// `BINANCE_WS_URL` overrides the Binance base (e.g. the spot testnet
-/// `wss://testnet.binance.vision`); empty/unset keeps mainnet.
+/// `wss://testnet.binance.vision`); `BYBIT_WS_URL` overrides the Bybit spot
+/// base (e.g. `wss://stream-testnet.bybit.com/v5/public/spot`);
+/// empty/unset keeps mainnet.
 pub fn ws_url(venue: Venue) -> String {
     if venue == Venue::Binance {
         if let Ok(u) = std::env::var("BINANCE_WS_URL") {
+            if !u.trim().is_empty() {
+                return u;
+            }
+        }
+    }
+    if venue == Venue::Bybit {
+        if let Ok(u) = std::env::var("BYBIT_WS_URL") {
             if !u.trim().is_empty() {
                 return u;
             }

@@ -78,6 +78,8 @@ pub enum ExecError {
     RejectedHost(String),
     #[error("Binance order rejected (HTTP {status}): {body}")]
     BinanceRejected { status: u16, body: String },
+    #[error("Bybit order rejected (HTTP {status}): {body}")]
+    BybitRejected { status: u16, body: String },
     #[error("Binance transport error: {0}")]
     Transport(String),
 }
@@ -194,6 +196,105 @@ pub async fn send_binance_limit(
         Ok(body)
     } else {
         Err(ExecError::BinanceRejected {
+            status: status.as_u16(),
+            body,
+        })
+    }
+}
+
+// --- Bybit V5 spot testnet sender. Same best-effort contract as Binance. ---
+// Auth: `X-BAPI-API-KEY` + `X-BAPI-TIMESTAMP` + `X-BAPI-RECV-WINDOW` +
+// `X-BAPI-SIGN` (HMAC-SHA256 hex of `timestamp + api_key + recv_window + body`).
+
+/// Default REST base for Bybit testnet; override with `BYBIT_API_BASE`.
+pub const BYBIT_TESTNET_BASE: &str = "https://api-testnet.bybit.com";
+/// Fail-closed allowlist: signed order requests go only to this host over HTTPS.
+const BYBIT_HOSTS: &[&str] = &["api-testnet.bybit.com"];
+/// Fixed receive window (ms) sent with every Bybit order.
+pub const BYBIT_RECV_WINDOW: &str = "5000";
+
+/// REST base for Bybit order sends (`BYBIT_API_BASE`, else the testnet default).
+pub fn bybit_api_base() -> String {
+    std::env::var("BYBIT_API_BASE")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| BYBIT_TESTNET_BASE.to_string())
+}
+
+/// Full `POST {base}/v5/order/create` endpoint. Pure: no network.
+/// Fails closed on any base outside the testnet allowlist.
+pub fn bybit_order_endpoint(base: &str) -> Result<String, ExecError> {
+    let url = reqwest::Url::parse(base).map_err(|_| ExecError::RejectedHost(base.to_string()))?;
+    let host = url.host_str().unwrap_or_default().to_string();
+    if url.scheme() != "https" || !BYBIT_HOSTS.contains(&host.as_str()) {
+        return Err(ExecError::RejectedHost(
+            url.host_str().unwrap_or(base).to_string(),
+        ));
+    }
+    Ok(format!("{}/v5/order/create", base.trim_end_matches('/')))
+}
+
+/// Tiny GTC LIMIT order body mirroring the paper-filled leg. Pure: no network.
+pub fn bybit_order_body(leg: &TradeLeg) -> String {
+    let side = match leg.side {
+        Side::Buy => "Buy",
+        Side::Sell => "Sell",
+    };
+    serde_json::json!({
+        "category": "spot",
+        "symbol": format!("{}{}", leg.symbol.base, leg.symbol.quote),
+        "side": side,
+        "orderType": "Limit",
+        "qty": leg.qty_base.to_string(),
+        "price": leg.price.to_string(),
+        "timeInForce": "GTC",
+    })
+    .to_string()
+}
+
+/// Bybit V5 signature: `hmac(secret, timestamp + api_key + recv_window + body)`.
+pub fn bybit_sign(api_secret: &str, timestamp_ms: i64, api_key: &str, body: &str) -> String {
+    let payload = format!("{timestamp_ms}{api_key}{}{body}", BYBIT_RECV_WINDOW);
+    hmac_sha256_hex(api_secret.as_bytes(), payload.as_bytes())
+}
+
+/// Send one paper-filled Bybit leg as a LIMIT order. Returns the raw body on
+/// 2xx. Call only after [`LiveExecutor::guard`] passes; tests cover body shape
+/// instead (no network in tests).
+pub async fn send_bybit_limit(
+    leg: &TradeLeg,
+    keys: &VenueKeys,
+    base: &str,
+    now_ms: i64,
+) -> Result<String, ExecError> {
+    let url = bybit_order_endpoint(base)?;
+    let body = bybit_order_body(leg);
+    let sign = bybit_sign(&keys.api_secret, now_ms, &keys.api_key, &body);
+    // Same explicit ring provider as arb-feed's live WS tasks.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let client = reqwest::Client::builder()
+        .build()
+        .map_err(|e| ExecError::Transport(e.to_string()))?;
+    let resp = client
+        .post(url)
+        .header("X-BAPI-API-KEY", &keys.api_key)
+        .header("X-BAPI-TIMESTAMP", now_ms.to_string())
+        .header("X-BAPI-RECV-WINDOW", BYBIT_RECV_WINDOW)
+        .header("X-BAPI-SIGN", sign)
+        .header("Content-Type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .map_err(|e| ExecError::Transport(e.to_string()))?;
+    let status = resp.status();
+    let body = resp
+        .text()
+        .await
+        .map_err(|e| ExecError::Transport(e.to_string()))?;
+    if status.is_success() {
+        Ok(body)
+    } else {
+        Err(ExecError::BybitRejected {
             status: status.as_u16(),
             body,
         })
@@ -320,6 +421,53 @@ mod tests {
                     binance_order_url(&leg, "s", base, 1),
                     Err(ExecError::RejectedHost(_))
                 ),
+                "{base}"
+            );
+        }
+    }
+
+    fn bybit_buy_leg() -> TradeLeg {
+        TradeLeg {
+            venue: Venue::Bybit,
+            symbol: Symbol::new("BTC", "USDT"),
+            side: Side::Buy,
+            price: dec!(80000),
+            qty_base: dec!(0.001),
+            market: MarketKind::Spot,
+        }
+    }
+
+    #[test]
+    fn bybit_order_body_shapes_limit() {
+        let body = bybit_order_body(&bybit_buy_leg());
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["category"], "spot");
+        assert_eq!(v["symbol"], "BTCUSDT");
+        assert_eq!(v["side"], "Buy");
+        assert_eq!(v["orderType"], "Limit");
+        assert_eq!(v["qty"], "0.001");
+        assert_eq!(v["price"], "80000");
+        assert_eq!(v["timeInForce"], "GTC");
+        let endpoint = bybit_order_endpoint(BYBIT_TESTNET_BASE).unwrap();
+        assert_eq!(endpoint, "https://api-testnet.bybit.com/v5/order/create");
+        // Signature reuses the timestamp + key + window + body payload.
+        let sig = bybit_sign("secret", 1_700_000_000_000, "key", &body);
+        assert_eq!(sig.len(), 64);
+        assert!(sig.chars().all(|c| c.is_ascii_hexdigit()));
+        let payload = format!("1700000000000key5000{body}");
+        assert_eq!(sig, hmac_sha256_hex(b"secret", payload.as_bytes()));
+    }
+
+    #[test]
+    fn bybit_allowlist_refuses_non_testnet() {
+        for base in [
+            "https://api.bybit.com",        // mainnet
+            "http://api-testnet.bybit.com", // plain HTTP to the right host
+            "https://api-testnet.bybit.com.evil.com",
+            "not a url",
+        ] {
+            assert!(
+                matches!(bybit_order_endpoint(base), Err(ExecError::RejectedHost(_))),
                 "{base}"
             );
         }

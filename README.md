@@ -290,8 +290,9 @@ mattering, the corresponding cost model — or the test — is broken.
   intents; funding entries accrue over time instead.
 - **Live gate** (`crates/exec`): `LiveExecutor::guard` refuses to arm
   unless mode is `live`, venue keys are present in env, and the executor
-  was constructed armed. HMAC-SHA256 signing (`sign_query`) is done and
-  unit-tested; per-venue HTTP order senders are the remaining go-live work.
+  was constructed armed. Binance spot and Bybit V5 spot testnet senders
+  are wired + unit-tested (fail-closed to testnet hosts); other venues
+  are the remaining go-live work.
 - **Kill-switch**: `POST /kill` stops the tick loop emitting new intents;
   `POST /revive` clears it.
 
@@ -352,7 +353,7 @@ crates/core      types (Venue/Symbol/Intent), L2 book (snapshot/diff/VWAP/depth)
 crates/feed      Binance/Bybit/OKX/Indodax parsers, WS URLs/frames, live WS tasks, IDR->USD books (+ deterministic SyntheticFeed kept for the S8 harness)
 crates/strategy  Strategy trait + MarketView; all six strategies + imbalance filter (S6); fee_table (S7) / ablate (S8) test harnesses
 crates/paper     book-walking fill simulator (fees + slippage haircut, inventory-enforced)
-crates/exec      live send gate (armed check), env key loading, HMAC-SHA256 signing
+crates/exec      live send gate (armed check), env key loading, HMAC-SHA256 signing, Binance + Bybit testnet senders
 crates/dex-evm   Uniswap + PancakeSwap quoting (exact V2 math; V3 quoter types + addresses)
 crates/dex-sol   Jupiter quote URL building/parsing (mints, prices, DexQuote conversion)
 crates/store     Store trait + in-memory/JSONL backend + SQL schema for the DB backend
@@ -412,10 +413,10 @@ manifest to auto-update on Apple Silicon.
 1. Paper soak first — fills always walk real books.
    Confirm zero stale-book trades and sane PnL in the JSONL, and run
    `cargo xtask ablate` so you trust the cost models behind that PnL.
-2. Live WS books are already wired (`arb_feed::spawn_venue_tasks`); what is
-   missing is order placement: add per-venue HTTP senders behind
-   `LiveExecutor::guard` (signing is done: `arb_exec::sign_query`). Start on
-   testnet/demo where offered.
+2. Live WS books are already wired (`arb_feed::spawn_venue_tasks`);
+   Binance spot and Bybit V5 spot testnet senders sit behind
+   `LiveExecutor::guard`. Remaining venues still need per-venue HTTP
+   senders. Start on testnet/demo where offered.
 3. Replace paper quote sources: live funding prints for `funding_rate`
    (it gets none today and cannot fire), and
    for DEX an alloy provider +
@@ -440,7 +441,7 @@ manifest to auto-update on Apple Silicon.
 
 ## Current limitations (honest list)
 
-- Live mode: real books in, paper fills out — no venue order senders yet.
+- Live mode: real books in, paper fills out + Binance/Bybit testnet mirrors — other venues have no order senders yet.
 - `funding_rate` has no live data source yet: it receives no
   funding prints and cannot fire.
 - `cex_dex` has no live quote source yet: the engine carries no DEX
