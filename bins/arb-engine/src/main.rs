@@ -988,6 +988,18 @@ fn load_dotenv() {
     }
 }
 
+/// Address for the control API. Railway (and similar hosts) assigns the
+/// port at runtime via `$PORT`: when set, listen on all interfaces there.
+/// Otherwise use the configured address (local runs are unchanged).
+fn resolve_api_addr(configured: Option<String>) -> Option<String> {
+    std::env::var("PORT")
+        .ok()
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty())
+        .map(|p| format!("0.0.0.0:{p}"))
+        .or(configured)
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     load_dotenv();
@@ -999,7 +1011,7 @@ async fn main() -> anyhow::Result<()> {
 
     let args = Args::parse();
     let cfg = config::Config::load(&args.config)?;
-    let api_addr = cfg.engine.api_addr.clone();
+    let api_addr = resolve_api_addr(cfg.engine.api_addr.clone());
     let tick_ms = cfg.engine.tick_ms;
     let mut engine = Engine::new(cfg)?;
     engine.record_session_start();
@@ -1124,6 +1136,25 @@ mod tests {
         assert_eq!(parse_dotenv_line("NOEQUALS"), None);
         assert_eq!(parse_dotenv_line("=v"), None);
         assert_eq!(parse_dotenv_line("NOT A KEY=v"), None);
+    }
+
+    #[test]
+    fn port_env_overrides_configured_addr() {
+        let prev = std::env::var("PORT").ok();
+        std::env::set_var("PORT", "4321");
+        assert_eq!(
+            resolve_api_addr(Some("127.0.0.1:8787".into())),
+            Some("0.0.0.0:4321".into())
+        );
+        std::env::remove_var("PORT");
+        assert_eq!(
+            resolve_api_addr(Some("127.0.0.1:8787".into())),
+            Some("127.0.0.1:8787".into())
+        );
+        assert_eq!(resolve_api_addr(None), None);
+        if let Some(v) = prev {
+            std::env::set_var("PORT", v);
+        }
     }
 
     #[test]
