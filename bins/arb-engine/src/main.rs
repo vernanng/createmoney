@@ -280,7 +280,7 @@ impl Engine {
             for v in venues {
                 for a in &assets {
                     let amt = if a == "USDT" || a == "USDC" {
-                        cfg.paper.start_quote_per_venue
+                        cfg.paper.quote_for(v)
                     } else {
                         // Seed enough base to sell ~5x target notional at the
                         // reference price, so dynamic S2 sizes to ~$50 fill.

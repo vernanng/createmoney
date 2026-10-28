@@ -342,7 +342,7 @@ Top-level `venues` / `symbols` must stay above the first `[table]` header.
 | `[indodax] rate_max_age_ms` | 30000 | max age of the live USDT/IDR book used as divisor |
 | `[indodax] rate_max_spread_bps` | 50 | max USDT/IDR top-of-book spread (bps of mid) |
 | `[indodax] rate_max_deviation_bps` | 300 | max deviation vs independent consensus before Indodax is withheld |
-| `[paper] start_quote_per_venue` | 200 | seeded USDT/USDC per venue incl. DEX wallets (base per asset is dynamic: ~5x target notional at the reference price, so dynamic S2 sizes fill) |
+| `[paper] start_quote_per_venue` | 200 | seeded USDT/USDC per venue incl. DEX wallets (base per asset is dynamic: ~5x target notional at the reference price, so dynamic S2 sizes fill). `[paper.capital] <venue>` overrides one venue, e.g. `binance = 10000` |
 
 Before going live, set `[paper]` amounts to your real planned capital per
 venue so the paper soak behaves like the live book.

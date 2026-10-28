@@ -38,4 +38,7 @@ rate_max_deviation_bps = 300   # vs independent consensus (Upbit ID + implied cr
 # they live here, not in env (env is API keys only).
 [paper]
 start_quote_per_venue = 200
+# Per-venue quote override; concentrated start lives here:
+# [paper.capital]
+# binance = 10000
 # Base per asset is dynamic: ~5x target notional at the reference price.

@@ -2,6 +2,7 @@ use arb_core::{Symbol, Venue};
 use arb_strategy::StrategyParams;
 use rust_decimal::Decimal;
 use serde::Deserialize;
+use std::collections::BTreeMap;
 
 #[derive(Debug, Deserialize)]
 pub struct Config {
@@ -25,11 +26,24 @@ pub struct Config {
 pub struct PaperCfg {
     #[serde(default = "default_start_quote")]
     pub start_quote_per_venue: Decimal,
+    /// Optional per-venue quote override (`[paper.capital] binance = 10000`).
+    /// Missing venues fall back to `start_quote_per_venue`.
+    #[serde(default)]
+    pub capital: BTreeMap<Venue, Decimal>,
+}
+impl PaperCfg {
+    pub fn quote_for(&self, venue: Venue) -> Decimal {
+        self.capital
+            .get(&venue)
+            .copied()
+            .unwrap_or(self.start_quote_per_venue)
+    }
 }
 impl Default for PaperCfg {
     fn default() -> Self {
         Self {
             start_quote_per_venue: default_start_quote(),
+            capital: BTreeMap::new(),
         }
     }
 }
@@ -237,5 +251,40 @@ imbalance_threshold = 0.2
 "#;
         let cfg: Config = toml::from_str(gated).unwrap();
         assert_eq!(cfg.params.imbalance_threshold, Some(Decimal::new(2, 1)));
+    }
+
+    #[test]
+    fn per_venue_capital_overrides_fallback() {
+        let text = r#"
+[engine]
+mode = "paper"
+
+[params]
+min_edge_bps = 15
+slip_buffer_bps = 5
+target_notional_quote = 1000
+max_book_age_ms = 2000
+
+[paper]
+start_quote_per_venue = 200
+
+[paper.capital]
+binance = 10000
+"#;
+        let cfg: Config = toml::from_str(text).unwrap();
+        assert_eq!(cfg.paper.quote_for(Venue::Binance), Decimal::new(10_000, 0));
+        assert_eq!(cfg.paper.quote_for(Venue::Bybit), Decimal::new(200, 0));
+        let bare = r#"
+[engine]
+mode = "paper"
+
+[params]
+min_edge_bps = 15
+slip_buffer_bps = 5
+target_notional_quote = 1000
+max_book_age_ms = 2000
+"#;
+        let cfg: Config = toml::from_str(bare).unwrap();
+        assert_eq!(cfg.paper.quote_for(Venue::Binance), Decimal::new(200, 0));
     }
 }

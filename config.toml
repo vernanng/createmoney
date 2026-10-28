@@ -33,4 +33,7 @@ rate_max_deviation_bps = 300   # vs independent consensus (Upbit ID + implied cr
 
 [paper]
 start_quote_per_venue = 200  # USDT/USDC seeded per venue (incl. DEX wallets)
+
+[paper.capital]
+binance = 10000  # concentrated start; missing venues use start_quote_per_venue
 # Base per asset is dynamic: ~5x target notional at the reference price, so dynamic S2 sizes fill.
