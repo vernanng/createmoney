@@ -9,11 +9,8 @@ arb-core.workspace = true
 arb-feed.workspace = true
 arb-exec.workspace = true
 arb-strategy.workspace = true
-arb-risk.workspace = true
 arb-paper.workspace = true
 arb-store.workspace = true
-arb-dex-evm.workspace = true
-arb-dex-sol.workspace = true
 arb-api.workspace = true
 
 anyhow.workspace = true

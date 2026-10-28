@@ -1,5 +1,4 @@
 use arb_core::{Symbol, Venue};
-use arb_risk::RiskLimits;
 use arb_strategy::StrategyParams;
 use rust_decimal::Decimal;
 use serde::Deserialize;
@@ -14,9 +13,6 @@ pub struct Config {
     #[serde(default)]
     pub strategies: StrategiesCfg,
     pub params: ParamsCfg,
-    pub risk: RiskCfg,
-    #[serde(default)]
-    pub dex: DexCfg,
     #[serde(default)]
     pub indodax: IndodaxCfg,
     #[serde(default)]
@@ -38,13 +34,12 @@ impl Default for PaperCfg {
     }
 }
 fn default_start_quote() -> Decimal {
-    Decimal::new(500, 0)
+    Decimal::new(200, 0)
 }
 
 #[derive(Debug, Deserialize)]
 pub struct EngineCfg {
     pub mode: String, // paper | live
-    pub feed: String, // synthetic | live
     #[serde(default = "default_tick")]
     pub tick_ms: u64,
     #[serde(default)]
@@ -119,44 +114,11 @@ impl ParamsCfg {
 }
 
 #[derive(Debug, Deserialize)]
-pub struct RiskCfg {
-    pub max_notional_quote_per_trade: Decimal,
-    pub max_notional_quote_per_venue: Decimal,
-}
-impl RiskCfg {
-    pub fn to_limits(&self, min_edge_bps: Decimal, max_book_age_ms: i64) -> RiskLimits {
-        RiskLimits {
-            max_notional_quote_per_trade: self.max_notional_quote_per_trade,
-            max_notional_quote_per_venue: self.max_notional_quote_per_venue,
-            min_edge_bps,
-            max_book_age_ms,
-        }
-    }
-}
-
-#[derive(Debug, Deserialize, Default)]
-pub struct DexCfg {
-    #[serde(default = "yes")]
-    pub uniswap: bool,
-    #[serde(default = "yes")]
-    pub pancakeswap: bool,
-    #[serde(default = "yes")]
-    pub jupiter: bool,
-    /// Flat gas estimate in quote (USD) per EVM swap for paper quoting.
-    #[serde(default = "default_gas")]
-    pub evm_gas_quote: Decimal,
-    #[serde(default = "default_gas")]
-    pub solana_fee_quote: Decimal,
-}
-fn default_gas() -> Decimal {
-    Decimal::new(1, 0)
-}
-
-#[derive(Debug, Deserialize)]
 pub struct IndodaxCfg {
-    /// Synthetic-feed reference for IDR books. Live mode never uses this:
-    /// it converts with the streamed USDT/IDR rate (see `arb_feed::fx`)
-    /// and withholds Indodax books when no live rate is acceptable.
+    /// Fallback USD/IDR reference for the FX-triangle strategy's own math.
+    /// Book conversion itself always uses the streamed live rate
+    /// (see `arb_feed::fx`) and withholds Indodax books when no live
+    /// rate is acceptable.
     #[serde(default = "default_usdidr")]
     pub usd_idr: Decimal,
     /// Max age of the Indodax USDT/IDR book before it stops being a divisor.
@@ -223,17 +185,12 @@ symbols = ["BTC/USDT", "SOL/USDT"]
 
 [engine]
 mode = "paper"
-feed = "synthetic"
 
 [params]
 min_edge_bps = 15
 slip_buffer_bps = 5
 target_notional_quote = 1000
 max_book_age_ms = 2000
-
-[risk]
-max_notional_quote_per_trade = 5000
-max_notional_quote_per_venue = 25000
 "#;
         let cfg: Config = toml::from_str(text).unwrap();
         assert_eq!(cfg.venues, vec![Venue::Binance, Venue::Bybit]);

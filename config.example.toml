@@ -6,7 +6,6 @@ symbols = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "DOGE/USDT"]
 
 [engine]
 mode = "paper"
-feed = "live"
 tick_ms = 250
 api_addr = "127.0.0.1:8787"
 jsonl_path = "paper-trades.jsonl"
@@ -25,19 +24,8 @@ max_book_age_ms = 2000
 ttl_ms = 1500
 min_funding_annualized_bps = 500
 
-[risk]
-max_notional_quote_per_trade = 50
-max_notional_quote_per_venue = 250
-
-[dex]
-uniswap = true
-pancakeswap = true
-jupiter = true
-evm_gas_quote = 1
-solana_fee_quote = 1
-
 [indodax]
-usd_idr = 19000        # synthetic feed only; live mode streams USDT/IDR and never uses this
+usd_idr = 19000        # fallback reference for the FX-triangle strategy; book conversion always uses the streamed live rate
 rate_max_age_ms = 30000        # live USDT/IDR book older than this stops being the divisor
 rate_max_spread_bps = 50       # live USDT/IDR top-of-book spread cap (bps of mid)
 rate_max_deviation_bps = 300   # vs independent consensus (Upbit ID + implied crosses); beyond it Indodax is withheld
@@ -48,5 +36,5 @@ rate_max_deviation_bps = 300   # vs independent consensus (Upbit ID + implied cr
 # the paper soak behaves like the live book. Amounts are not secrets, so
 # they live here, not in env (env is API keys only).
 [paper]
-start_quote_per_venue = 500
-# Base per asset is dynamic: ~2x target notional at the reference price.
+start_quote_per_venue = 200
+# Base per asset is dynamic: ~5x target notional at the reference price.

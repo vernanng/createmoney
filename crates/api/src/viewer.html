@@ -11,10 +11,25 @@
   html, body { margin: 0; height: 100%; overflow: hidden; background: #05070f;
     font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; color: #dbe4f3; }
   #scene { position: fixed; inset: 0; width: 100%; height: 100%; display: block; }
-  #hud { position: fixed; top: 12px; left: 12px; max-width: min(360px, 70vw);
-    background: rgba(8, 12, 24, .78); border: 1px solid #1e293b; border-radius: 10px;
-    padding: 10px 12px; font-size: 12px; line-height: 1.5; backdrop-filter: blur(4px); }
+  #left { position: fixed; top: 12px; left: 12px; max-width: min(360px, 70vw);
+    display: flex; flex-direction: column; gap: 8px; }
+  #hud, #money { background: rgba(8, 12, 24, .78); border: 1px solid #1e293b;
+    border-radius: 10px; padding: 10px 12px; font-size: 12px; line-height: 1.5;
+    backdrop-filter: blur(4px); }
+  #hud { border-color: #22d3ee44; box-shadow: 0 0 24px rgba(34, 211, 238, .10); }
+  #money { border-color: #f59e0b66; box-shadow: 0 0 24px rgba(245, 158, 11, .14); }
   #hud h1 { margin: 0 0 4px; font-size: 13px; letter-spacing: .04em; color: #7dd3fc; }
+  #money h1 { margin: 0 0 4px; font-size: 13px; letter-spacing: .04em; color: #fcd34d; }
+  #uptime { background: rgba(8, 12, 24, .85); border: 1px solid #f59e0b88;
+    border-radius: 10px; padding: 6px 12px; font-size: 12px; line-height: 1.2;
+    backdrop-filter: blur(4px); box-shadow: 0 0 28px rgba(245, 158, 11, .20); }
+  #uptimeVal { display: block; font-size: 26px; font-weight: 800; color: #fbbf24;
+    letter-spacing: .02em; font-variant-numeric: tabular-nums; }
+  #uptimeLabel { color: #94a3b8; font-size: 11px; letter-spacing: .14em; }
+  .num { font-weight: 700; color: #fff; }
+  .pos { font-weight: 700; color: #34d399; }
+  .neg { font-weight: 700; color: #f87171; }
+  .dim { color: #94a3b8; }
   #hud .row { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
   #hud button { background: #0f172a; color: #dbe4f3; border: 1px solid #334155;
     border-radius: 6px; font: inherit; font-size: 11px; padding: 4px 8px; cursor: pointer; }
@@ -34,7 +49,8 @@
   @media (max-width: 640px) {
     #detail { display: none; }
     #detail.open { display: block; top: auto; bottom: 76px; }
-    #hud { font-size: 11px; padding: 8px 10px; }
+    #left { max-width: 70vw; }
+    #hud, #money { font-size: 11px; padding: 8px 10px; }
   }
 </style>
 <script type="importmap">
@@ -46,12 +62,18 @@
 </head>
 <body>
 <canvas id="scene"></canvas>
+<div id="left">
+<div id="uptime"><span id="uptimeVal">—</span><span id="uptimeLabel">UPTIME</span></div>
 <div id="hud">
   <h1>strategy-flow</h1>
   <div id="status">connecting…</div>
-  <div id="portfolio">portfolio: waiting for status…</div>
   <div class="row" id="filters"></div>
   <div class="row"><button id="liveBtn" aria-pressed="true">live</button></div>
+</div>
+<div id="money">
+  <h1>money</h1>
+  <div id="portfolio">waiting for status…</div>
+</div>
 </div>
 <div id="detail"><h2>venues</h2><div id="detailBody">Click a venue node for detail. Drag to orbit, scroll to zoom.</div></div>
 <div id="replay">
@@ -325,13 +347,15 @@ function rebuildFlows() {
   $('replayLabel').textContent = state.replayHead < 0
     ? `all · ${list.length} shown`
     : `#${state.replayHead + 1}/${state.flows.length}`;
+  refreshChips();
 }
-{ // filter chips
+{ // filter chips, labeled with live per-strategy flow counts
   const box = $('filters');
+  const chipBtns = {};
   for (const [name, hex] of Object.entries(STRATS)) {
     const b = document.createElement('button');
     const css = '#' + hex.toString(16).padStart(6, '0');
-    b.textContent = name; b.style.color = css;
+    b.textContent = `${name} (0)`; b.style.color = css;
     b.setAttribute('aria-pressed', 'true');
     b.addEventListener('click', () => {
       if (state.enabled.has(name)) { state.enabled.delete(name); b.setAttribute('aria-pressed', 'false'); }
@@ -339,7 +363,15 @@ function rebuildFlows() {
       rebuildFlows();
     });
     box.appendChild(b);
+    chipBtns[name] = b;
   }
+  window.__chipBtns = chipBtns;
+}
+function refreshChips() {
+  const btns = window.__chipBtns || {};
+  const counts = {};
+  for (const t of state.flows) counts[t.intent.strategy] = (counts[t.intent.strategy] || 0) + 1;
+  for (const [name, b] of Object.entries(btns)) b.textContent = `${name} (${counts[name] || 0})`;
 }
 $('replayRange').addEventListener('input', (ev) => {
   const v = parseInt(ev.target.value, 10);
@@ -364,22 +396,40 @@ async function loadFlows() {
   rebuildFlows();
   if (selected) selectVenue(selected);
 }
+function fmtUp(ms) {
+  if (ms == null || ms < 0) return '—';
+  const s = Math.floor(ms / 1000);
+  const d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600), m = Math.floor(s % 3600 / 60);
+  if (d > 0) return `${d}d ${h}h`;
+  if (h > 0) return `${h}h ${m}m`;
+  if (m > 0) return `${m}m ${s % 60}s`;
+  return `${s}s`;
+}
 async function loadStatus() {
   try {
     const res = await fetch('/status', { cache: 'no-store' });
     if (!res.ok) return;
     const s = await res.json();
-    $('status').textContent =
-      `mode=${s.mode} killed=${s.killed} trades=${s.trades} opps=${s.opportunities_seen} flows=${state.total}`;
+    const up = fmtUp(Date.now() - (s.started_ms || 0));
+    $('uptimeVal').textContent = up;
+    $('status').innerHTML =
+      `mode=<span class="num">${s.mode}</span> ` +
+      `killed=<span class="${s.killed ? 'neg' : 'pos'}">${s.killed}</span><br>` +
+      `trades=<span class="num">${s.trades}</span> ` +
+      `opps=<span class="num">${s.opportunities_seen}</span> ` +
+      `flows=<span class="num">${state.total}</span>`;
     const p = s.portfolio;
     if (p) {
       const fmt = (n) => (typeof n === 'number' ? n : Number(n)).toLocaleString('en-US', { maximumFractionDigits: 2 });
+      const pnl = (n) => Number(n) < 0 ? 'neg' : 'pos';
       const lines = (p.per_venue || [])
         .filter((b) => Number(b.amount) !== 0)
         .map((b) => `${b.venue} ${b.asset} ${fmt(b.amount)}`);
-      $('portfolio').textContent =
-        `equity=${fmt(p.equity_quote)} realized=${fmt(p.realized_pnl_quote)} unrealized=${fmt(p.unrealized_pnl_quote)} | ` +
-        lines.join(' · ');
+      $('portfolio').innerHTML =
+        `equity=<span class="num">${fmt(p.equity_quote)}</span> ` +
+        `realized=<span class="${pnl(p.realized_pnl_quote)}">${fmt(p.realized_pnl_quote)}</span> ` +
+        `unrealized=<span class="${pnl(p.unrealized_pnl_quote)}">${fmt(p.unrealized_pnl_quote)}</span>` +
+        (lines.length ? `<br><span class="dim">${lines.join(' · ')}</span>` : '');
     }
   } catch { /* status is best-effort; flows carry the scene */ }
 }

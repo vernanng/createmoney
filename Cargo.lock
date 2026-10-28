@@ -126,12 +126,9 @@ dependencies = [
  "anyhow",
  "arb-api",
  "arb-core",
- "arb-dex-evm",
- "arb-dex-sol",
  "arb-exec",
  "arb-feed",
  "arb-paper",
- "arb-risk",
  "arb-store",
  "arb-strategy",
  "clap",
@@ -180,19 +177,6 @@ dependencies = [
 
 [[package]]
 name = "arb-paper"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "arb-core",
- "rust_decimal",
- "rust_decimal_macros",
- "serde",
- "serde_json",
- "thiserror",
-]
-
-[[package]]
-name = "arb-risk"
 version = "0.1.0"
 dependencies = [
  "anyhow",

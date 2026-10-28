@@ -220,7 +220,7 @@ mod tests {
         for f in [
             "bins/arb-engine/src/main.rs",
             "crates/api/src/lib.rs",
-            "crates/risk/src/lib.rs",
+            "crates/paper/src/lib.rs",
             "crates/core/src/lib.rs",
             "bins/other/src/main.rs",
         ] {

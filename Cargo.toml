@@ -5,7 +5,6 @@ members = [
   "crates/feed",
   "crates/exec",
   "crates/strategy",
-  "crates/risk",
   "crates/paper",
   "crates/store",
   "crates/dex-evm",
@@ -25,7 +24,6 @@ arb-core = { path = "crates/core" }
 arb-feed = { path = "crates/feed" }
 arb-exec = { path = "crates/exec" }
 arb-strategy = { path = "crates/strategy" }
-arb-risk = { path = "crates/risk" }
 arb-paper = { path = "crates/paper" }
 arb-store = { path = "crates/store" }
 arb-dex-evm = { path = "crates/dex-evm" }

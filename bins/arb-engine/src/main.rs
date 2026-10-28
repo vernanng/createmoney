@@ -5,22 +5,20 @@ use arb_api::{
     EngineStatus, PortfolioStatus, StrategyMetrics, UsdtIdrHealth, VenueBalance,
 };
 use arb_core::{now_ms, Symbol, Venue};
-use arb_dex_evm::{to_dex_quote, DexKind, V2Pool};
 use arb_exec::{keys_from_env, ExecMode, LiveExecutor};
 use arb_feed::{
     implied_usdt_idr, pick_fresh, resolve_usdt_idr, FxCrossCheck, LiveBooks, LiveConnectors,
-    RateDecision, SyntheticFeed, UsdtIdrRate,
+    RateDecision, UsdtIdrRate,
 };
 use arb_paper::PaperExecutor;
-use arb_risk::RiskEngine;
 use arb_store::{MemoryStore, SessionStart, Store, StoredTrade};
 use arb_strategy::{
-    CexDex, CrossExchange, FundingRate, FundingStrategy, FxTriangle, LagChase, MarketView,
-    Strategy, Triangular,
+    CexDex, CrossExchange, FundingStrategy, FxTriangle, LagChase, MarketView, Strategy, Triangular,
 };
 use clap::Parser;
 use rust_decimal::Decimal;
 use std::collections::BTreeMap;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -44,7 +42,7 @@ struct Shared {
     per_strategy: Mutex<BTreeMap<String, StrategyMetrics>>,
     /// Pre-rendered `/flows` snapshot (last `FLOWS_SNAPSHOT` trades).
     flows: Mutex<String>,
-    /// Live venue books (empty unless `feed = "live"` tasks are spawned).
+    /// Live venue books written by the WS tasks (empty before first frames).
     live_books: LiveBooks,
     /// Socket-level state written by the live venue tasks.
     live_connectors: LiveConnectors,
@@ -65,28 +63,6 @@ fn new_session_id() -> String {
         std::process::id(),
         SESSION_SEQ.fetch_add(1, Ordering::SeqCst)
     )
-}
-
-/// Funding snapshot used only by the synthetic feed. Live mode must never
-/// invent funding: until real perp feeds land, `funding_rate` simply has
-/// no data there and cannot fire.
-fn synthetic_funding(feed: &str, symbols: &[Symbol], now: i64) -> Vec<FundingRate> {
-    if feed == "live" {
-        return Vec::new();
-    }
-    let mut out = Vec::new();
-    for v in [Venue::Binance, Venue::Bybit, Venue::Okx] {
-        for sym in symbols {
-            out.push(FundingRate {
-                venue: v,
-                symbol: sym.clone(),
-                rate_per_interval: Decimal::new(1, 4),
-                interval_hours: Decimal::new(8, 0),
-                next_funding_ms: now + 3_600_000,
-            });
-        }
-    }
-    out
 }
 
 /// Pairs with a filled, still-open funding entry in stored history.
@@ -159,16 +135,15 @@ struct Engine {
     cfg: config::Config,
     symbols: Vec<Symbol>,
     strategies: Vec<Box<dyn Strategy>>,
-    risk: RiskEngine,
     paper: PaperExecutor,
-    funding_notionals: BTreeMap<(Venue, String), Decimal>,
     store: MemoryStore,
     shared: Arc<Shared>,
-    feed: SyntheticFeed,
     opportunities: u64,
     per_strategy: BTreeMap<String, StrategyMetrics>,
     live: LiveExecutor,
     session_id: String,
+    /// Wall-clock start of this run, surfaced via status for viewer uptime.
+    started_ms: i64,
     /// Last tick's USDT/IDR rate decision, surfaced via status/metrics.
     last_fx: RateDecision,
 }
@@ -221,8 +196,8 @@ impl Engine {
             )));
         }
         // S1 + S3: lead-lag and FX-triangle ride on the cross-exchange flag.
-        // Conservative jump threshold so synthetic paper stays quiet until a
-        // real dislocation prints; only wired when both venues exist.
+        // Conservative jump threshold so paper stays quiet until a real
+        // dislocation prints; only wired when both venues exist.
         if cfg.strategies.cross_exchange
             && cex.contains(&Venue::Binance)
             && cex.contains(&Venue::Indodax)
@@ -243,28 +218,16 @@ impl Engine {
             )));
         }
 
-        let mut risk = RiskEngine::new(
-            cfg.risk
-                .to_limits(cfg.params.min_edge_bps, cfg.params.max_book_age_ms),
-        );
-        // Restored open (non-roundtrip) positions still consume venue caps.
-        let mut funding_notionals: BTreeMap<(Venue, String), Decimal> = BTreeMap::new();
-        for t in store.trades() {
-            if !t.intent.roundtrip {
-                risk.settle(&t.intent);
-                if t.intent.strategy == "funding_rate" {
-                    if let Some(leg) = t.intent.legs.first() {
-                        let n: Decimal = t.intent.legs.iter().map(|l| l.notional_quote()).sum();
-                        funding_notionals.insert((leg.venue, leg.symbol.to_string()), n);
-                    }
-                }
-            }
-        }
+        // One clock for the whole run: the viewer renders uptime from it.
+        let started_ms = now_ms();
         let shared = Arc::new(Shared {
-            control: Mutex::new(Control::new(risk.kill_handle())),
+            // The kill flag lives here now that the risk gate is gone: when
+            // set, the tick loop emits no intents until revived.
+            control: Mutex::new(Control::new(Arc::new(AtomicBool::new(false)))),
             status: Mutex::new(EngineStatus {
                 mode: cfg.engine.mode.clone(),
                 killed: false,
+                started_ms,
                 trades: 0,
                 realized_pnl_quote: Decimal::ZERO,
                 opportunities_seen: 0,
@@ -316,8 +279,8 @@ impl Engine {
                     let amt = if a == "USDT" || a == "USDC" {
                         cfg.paper.start_quote_per_venue
                     } else {
-                        // Seed enough base to sell ~2x target notional at the
-                        // reference price, so cheap assets can actually trade.
+                        // Seed enough base to sell ~5x target notional at the
+                        // reference price, so dynamic S2 sizes to ~$50 fill.
                         // Exact USDT pair first: a prefix match would catch the
                         // ETH/BTC triangle cross (0.03) and overseed ETH ~666x.
                         let ref_px = anchor_tbl
@@ -330,29 +293,27 @@ impl Engine {
                                     .map(|(_, v)| *v)
                             })
                             .unwrap_or(Decimal::new(100, 0));
-                        Decimal::new(2, 0) * cfg.params.target_notional_quote / ref_px
+                        Decimal::new(5, 0) * cfg.params.target_notional_quote / ref_px
                     };
                     paper.seed(v, a, amt);
                 }
             }
         }
         // Baseline for unrealized P/L: mark the seeded ledger at the reference
-        // prices, the same marks the synthetic feed would use.
+        // prices, the same marks live mids fall back to.
         paper.starting_equity = paper.equity_quote(&anchor_marks());
         Ok(Self {
             cfg,
             symbols,
             strategies,
-            risk,
             paper,
-            funding_notionals,
             store,
             shared,
-            feed: SyntheticFeed::new(0xC0FFEE, Decimal::new(100_000, 0)),
             opportunities: 0,
             per_strategy: BTreeMap::new(),
             live,
             session_id: new_session_id(),
+            started_ms,
             last_fx: RateDecision::default(),
         })
     }
@@ -363,7 +324,7 @@ impl Engine {
             self.session_id.clone(),
             ENGINE_VERSION.into(),
             self.cfg.engine.mode.clone(),
-            self.cfg.engine.feed.clone(),
+            "live".into(),
             now_ms(),
             self.store.trades().len(),
         );
@@ -438,7 +399,6 @@ impl Engine {
             now_ms: now,
             ..Default::default()
         };
-        let anchors = anchors();
         let mut needed: Vec<Symbol> = self.symbols.clone();
         for cyc_sym in [
             Symbol::new("BTC", "USDT"),
@@ -449,9 +409,8 @@ impl Engine {
                 needed.push(cyc_sym);
             }
         }
-        // Live books, when the WS tasks run: fresh ones win, stale venues
-        // are skipped (never backfilled) so paper only sees real spreads.
-        let live_mode = self.cfg.engine.feed == "live";
+        // Live books only: fresh ones win, stale venues are skipped (never
+        // backfilled) so paper only sees real spreads.
         let live_map = self
             .shared
             .live_books
@@ -460,159 +419,78 @@ impl Engine {
             .unwrap_or_default();
         // One snapshot, one divisor: every IDR book this tick converts at
         // the same selected rate (or not at all, when the decision has none).
-        let fx = if live_mode {
-            self.fx_decision(&live_map, &needed, now)
-        } else {
-            RateDecision::default()
-        };
-        if live_mode {
-            self.last_fx = fx;
-        }
+        let fx = self.fx_decision(&live_map, &needed, now);
+        self.last_fx = fx;
         for sym in &needed {
-            let anchor = anchors
-                .get(&sym.to_string())
-                .copied()
-                .unwrap_or(Decimal::new(100, 0));
-            // One shared synthetic stream: books evolve per call, venues differ.
             let venues = self.cfg.venues.clone();
             for v in &venues {
                 if !v.is_cex() {
                     continue;
                 }
-                if live_mode {
-                    if *v == Venue::Indodax {
-                        // Raw IDR books convert only under an accepted live
-                        // rate. Without one the venue is invisible this tick:
-                        // no static-rate fallback, no phantom edge.
-                        if sym.quote == "USDT" {
-                            if let (Some(rate), Some(raw)) = (
-                                fx.rate,
-                                pick_fresh(
-                                    &live_map,
-                                    *v,
-                                    &format!("{}/IDR", sym.base),
-                                    now,
-                                    self.cfg.params.max_book_age_ms,
-                                ),
-                            ) {
-                                view.put(arb_feed::idr_book_to_usd(&raw, rate.mid));
-                            }
+                if *v == Venue::Indodax {
+                    // Raw IDR books convert only under an accepted live
+                    // rate. Without one the venue is invisible this tick:
+                    // no static-rate fallback, no phantom edge.
+                    if sym.quote == "USDT" {
+                        if let (Some(rate), Some(raw)) = (
+                            fx.rate,
+                            pick_fresh(
+                                &live_map,
+                                *v,
+                                &format!("{}/IDR", sym.base),
+                                now,
+                                self.cfg.params.max_book_age_ms,
+                            ),
+                        ) {
+                            view.put(arb_feed::idr_book_to_usd(&raw, rate.mid));
                         }
-                        continue;
-                    }
-                    if let Some(b) = pick_fresh(
-                        &live_map,
-                        *v,
-                        &sym.to_string(),
-                        now,
-                        self.cfg.params.max_book_age_ms,
-                    ) {
-                        view.put(b);
                     }
                     continue;
                 }
-                if *v == Venue::Indodax && sym.quote == "USDT" {
-                    // Indodax quotes in IDR: build an IDR book, normalize to USD.
-                    let idr_sym = Symbol::new(&sym.base, "IDR");
-                    let idr_anchor = anchor * self.cfg.indodax.usd_idr;
-                    let idr_book = self.feed.book_at(*v, &idr_sym, idr_anchor, now);
-                    view.put(arb_feed::idr_book_to_usd(
-                        &idr_book,
-                        self.cfg.indodax.usd_idr,
-                    ));
-                    continue;
-                }
-                let book = self.feed.book_at(*v, sym, anchor, now);
-                view.put(book);
-            }
-        }
-        // DEX quotes from local V2 pool math (paper reserves track the
-        // hardcoded anchors, not live books). Like synthetic funding below,
-        // they exist only for the synthetic feed: in live mode there are
-        // deliberately no DEX quotes until real quote feeds land, so the
-        // soak cannot accumulate invented cex_dex entries.
-        for sym in &self.symbols {
-            if live_mode {
-                break;
-            }
-            let anchor = anchors
-                .get(&sym.to_string())
-                .copied()
-                .unwrap_or(Decimal::new(100, 0));
-            let qty = self.cfg.params.target_notional_quote / anchor;
-            if self.cfg.dex.uniswap {
-                let pool = V2Pool {
-                    kind: DexKind::UniswapV2,
-                    symbol: sym.clone(),
-                    reserve_base: Decimal::new(500, 0),
-                    reserve_quote: anchor * Decimal::new(500, 0),
-                    fee_bps: DexKind::UniswapV2.default_fee_bps(),
-                };
-                if let Some(q) = to_dex_quote(&pool, qty, self.cfg.dex.evm_gas_quote, now) {
-                    view.dex_quotes.push(q);
-                }
-            }
-            if self.cfg.dex.pancakeswap {
-                let pool = V2Pool {
-                    kind: DexKind::PancakeV2,
-                    symbol: sym.clone(),
-                    reserve_base: Decimal::new(400, 0),
-                    reserve_quote: anchor * Decimal::new(400, 0) * Decimal::new(1001, 3),
-                    fee_bps: DexKind::PancakeV2.default_fee_bps(),
-                };
-                if let Some(q) = to_dex_quote(&pool, qty, self.cfg.dex.evm_gas_quote, now) {
-                    view.dex_quotes.push(q);
-                }
-            }
-            if self.cfg.dex.jupiter {
-                // Paper Jupiter quote: anchor ± small dislocation. Live mode
-                // replaces this with arb_dex_sol::quote_url + HTTP GET.
-                if arb_dex_sol::quote_url(sym, qty, true, 50).is_some() {
-                    view.dex_quotes.push(arb_strategy::DexQuote {
-                        venue: Venue::Jupiter,
-                        symbol: sym.clone(),
-                        buy_px: anchor * Decimal::new(10015, 4),
-                        sell_px: anchor * Decimal::new(9985, 4),
-                        gas_quote: self.cfg.dex.solana_fee_quote,
-                        ts_ms: now,
-                    });
+                if let Some(b) = pick_fresh(
+                    &live_map,
+                    *v,
+                    &sym.to_string(),
+                    now,
+                    self.cfg.params.max_book_age_ms,
+                ) {
+                    view.put(b);
                 }
             }
         }
-        // Synthetic funding exists only for the synthetic feed. In live
-        // mode there is deliberately no funding data until real perp
-        // feeds land, so the soak cannot accumulate invented entries.
-        view.funding
-            .extend(synthetic_funding(&self.cfg.engine.feed, &self.symbols, now));
+        // No DEX quotes until real quote feeds land, and no funding data
+        // until real perp feeds land: the engine cannot invent entries, so
+        // `cex_dex` and `funding_rate` simply have nothing to fire on.
         // Publish the divisor for provenance (FxTriangle records it).
-        if live_mode {
-            view.usdt_idr_mid = fx.rate.map(|r| r.mid);
-            view.usdt_idr_ts_ms = fx.rate.map(|r| r.ts_ms);
-        } else {
-            view.usdt_idr_mid = Some(self.cfg.indodax.usd_idr);
-        }
+        view.usdt_idr_mid = fx.rate.map(|r| r.mid);
+        view.usdt_idr_ts_ms = fx.rate.map(|r| r.ts_ms);
         view
     }
 
     fn tick(&mut self) {
         let view = self.build_view();
         let now = view.now_ms;
-        let paused: Vec<String> = self
+        // No pre-trade risk gate: every emitted intent goes to the paper
+        // executor, which still enforces inventory. The kill-switch stays:
+        // when set, no intents are generated until revived.
+        let (killed, paused): (bool, Vec<String>) = self
             .shared
             .control
             .lock()
-            .map(|c| c.paused())
+            .map(|c| (c.is_killed(), c.paused()))
             .unwrap_or_default();
         let mut intents = Vec::new();
-        for st in self.strategies.iter_mut() {
-            if paused.iter().any(|p| p == st.name()) {
-                continue;
+        if !killed {
+            for st in self.strategies.iter_mut() {
+                if paused.iter().any(|p| p == st.name()) {
+                    continue;
+                }
+                self.per_strategy
+                    .entry(st.name().to_string())
+                    .or_default()
+                    .scans += 1;
+                intents.extend(st.on_tick(&view));
             }
-            self.per_strategy
-                .entry(st.name().to_string())
-                .or_default()
-                .scans += 1;
-            intents.extend(st.on_tick(&view));
         }
         for intent in intents {
             self.opportunities += 1;
@@ -620,14 +498,6 @@ impl Engine {
                 .entry(intent.strategy.clone())
                 .or_default()
                 .emitted += 1;
-            if let Err(e) = self.risk.check(&intent, now) {
-                self.per_strategy
-                    .entry(intent.strategy.clone())
-                    .or_default()
-                    .risk_rejected += 1;
-                tracing::debug!(strategy = %intent.strategy, reject = %e, "intent rejected");
-                continue;
-            }
             // Live gate: even in live mode, sends must pass the armed check.
             if self.live.mode == ExecMode::Live {
                 if let Err(e) = self.live.guard(&intent) {
@@ -636,15 +506,6 @@ impl Engine {
             }
             match self.paper.execute(&intent, &view.books, now) {
                 Ok(result) => {
-                    // Settle exposure or per-venue caps can never bind.
-                    self.risk.settle(&intent);
-                    if intent.strategy == "funding_rate" && !intent.roundtrip {
-                        if let Some(leg) = intent.legs.first() {
-                            let n: Decimal = intent.legs.iter().map(|l| l.notional_quote()).sum();
-                            self.funding_notionals
-                                .insert((leg.venue, leg.symbol.to_string()), n);
-                        }
-                    }
                     {
                         let m = self
                             .per_strategy
@@ -682,14 +543,11 @@ impl Engine {
         self.publish();
     }
 
-    /// Funding exits free their venue-cap exposure again.
+    /// Drain reported funding exits so the closed set cannot grow without
+    /// bound. Re-entry is owned by the funding strategy's open set.
     fn release_closed(&mut self) {
         for st in self.strategies.iter_mut() {
-            for (v, s) in st.take_closed() {
-                if let Some(n) = self.funding_notionals.remove(&(v, s.to_string())) {
-                    self.risk.release(v, n);
-                }
-            }
+            for _ in st.take_closed() {}
         }
     }
 
@@ -719,7 +577,6 @@ impl Engine {
             .lock()
             .map(|c| (c.is_killed(), c.paused()))
             .unwrap_or_default();
-        let live_mode = self.cfg.engine.feed == "live";
         let now = now_ms();
         let live_map = self
             .shared
@@ -733,20 +590,18 @@ impl Engine {
             .lock()
             .map(|m| m.clone())
             .unwrap_or_default();
-        // Portfolio marks: fresh live-book mids win; anchors fill the rest
-        // (and all of it in synthetic mode). Non-USDT pairs never mark.
+        // Portfolio marks: fresh live-book mids win; anchors fill the rest.
+        // Non-USDT pairs never mark.
         let mut marks = anchor_marks();
-        if live_mode {
-            for ((_, sym), book) in &live_map {
-                let mut parts = sym.split('/');
-                if let (Some(base), Some("USDT")) = (parts.next(), parts.next()) {
-                    if now - book.ts_ms <= self.cfg.params.max_book_age_ms && !book.is_crossed() {
-                        if let (Some(bid), Some(ask)) = (book.best_bid(), book.best_ask()) {
-                            marks.insert(
-                                base.to_string(),
-                                (bid.price + ask.price) / Decimal::new(2, 0),
-                            );
-                        }
+        for ((_, sym), book) in &live_map {
+            let mut parts = sym.split('/');
+            if let (Some(base), Some("USDT")) = (parts.next(), parts.next()) {
+                if now - book.ts_ms <= self.cfg.params.max_book_age_ms && !book.is_crossed() {
+                    if let (Some(bid), Some(ask)) = (book.best_bid(), book.best_ask()) {
+                        marks.insert(
+                            base.to_string(),
+                            (bid.price + ask.price) / Decimal::new(2, 0),
+                        );
                     }
                 }
             }
@@ -773,6 +628,7 @@ impl Engine {
         EngineStatus {
             mode: self.cfg.engine.mode.clone(),
             killed,
+            started_ms: self.started_ms,
             trades: self.paper.trades,
             realized_pnl_quote: self.paper.realized_pnl,
             opportunities_seen: self.opportunities,
@@ -791,37 +647,24 @@ impl Engine {
                         .map(|(_, b)| b)
                         .collect();
                     let conn = conn_map.get(v);
-                    if live_mode {
-                        ConnectorHealth {
-                            venue: *v,
-                            connected: conn.map(|c| c.connected).unwrap_or(false),
-                            last_msg_ms: conn.and_then(|c| c.last_msg_ms),
-                            last_book_ms: venue_books.iter().map(|b| b.ts_ms).max(),
-                            books: venue_books.len(),
-                            fresh_books: venue_books
-                                .iter()
-                                .filter(|b| {
-                                    now - b.ts_ms <= self.cfg.params.max_book_age_ms
-                                        && !b.is_crossed()
-                                })
-                                .count(),
-                            last_error: conn.and_then(|c| c.last_error.clone()),
-                        }
-                    } else {
-                        ConnectorHealth {
-                            venue: *v,
-                            connected: true,
-                            last_msg_ms: Some(now),
-                            last_book_ms: Some(now),
-                            books: self.symbols.len(),
-                            fresh_books: self.symbols.len(),
-                            last_error: None,
-                        }
+                    ConnectorHealth {
+                        venue: *v,
+                        connected: conn.map(|c| c.connected).unwrap_or(false),
+                        last_msg_ms: conn.and_then(|c| c.last_msg_ms),
+                        last_book_ms: venue_books.iter().map(|b| b.ts_ms).max(),
+                        books: venue_books.len(),
+                        fresh_books: venue_books
+                            .iter()
+                            .filter(|b| {
+                                now - b.ts_ms <= self.cfg.params.max_book_age_ms && !b.is_crossed()
+                            })
+                            .count(),
+                        last_error: conn.and_then(|c| c.last_error.clone()),
                     }
                 })
                 .collect(),
             paused_strategies,
-            usdt_idr: if live_mode {
+            usdt_idr: {
                 let d = &self.last_fx;
                 UsdtIdrHealth {
                     mid: d.rate.map(|r| r.mid),
@@ -834,14 +677,6 @@ impl Engine {
                     deviation_bps: d.deviation_bps,
                     independent_sources: d.independent_sources,
                     state: d.state.as_str().into(),
-                }
-            } else {
-                UsdtIdrHealth {
-                    mid: Some(self.cfg.indodax.usd_idr),
-                    fresh: true,
-                    degraded: false,
-                    state: "synthetic".into(),
-                    ..UsdtIdrHealth::default()
                 }
             },
         }
@@ -905,6 +740,7 @@ async fn serve_api(addr: String, token: Option<String>, shared: Arc<Shared>) {
                     .unwrap_or(EngineStatus {
                         mode: "unknown".into(),
                         killed: true,
+                        started_ms: 0,
                         trades: 0,
                         realized_pnl_quote: Decimal::ZERO,
                         opportunities_seen: 0,
@@ -1010,33 +846,30 @@ async fn main() -> anyhow::Result<()> {
     let cfg = config::Config::load(&args.config)?;
     let api_addr = cfg.engine.api_addr.clone();
     let tick_ms = cfg.engine.tick_ms;
-    let feed_kind = cfg.engine.feed.clone();
     let mut engine = Engine::new(cfg)?;
     engine.record_session_start();
 
-    tracing::info!(session = %engine.session_id, mode = %engine.status().mode, feed = %feed_kind, venues = ?engine.cfg.venues,
+    tracing::info!(session = %engine.session_id, mode = %engine.status().mode, venues = ?engine.cfg.venues,
         symbols = ?engine.cfg.symbols, strategies = engine.strategies.len(), "arb-engine starting");
-    if feed_kind == "live" {
-        // Live venue books in, paper execution unchanged: fills stay simulated
-        // and the live-send gate is untouched. Stale venues are skipped.
-        // Indodax additionally needs its published static market-data token
-        // from the environment; it is not a trading credential.
-        let indodax_token = std::env::var("INDODAX_WS_TOKEN")
-            .ok()
-            .filter(|t| !t.trim().is_empty());
-        arb_feed::spawn_venue_tasks(
-            &engine.shared.live_books,
-            &engine.shared.live_connectors,
-            engine.cfg.venues.clone(),
-            engine.symbols.clone(),
-            indodax_token,
-        );
-        if engine.cfg.venues.contains(&Venue::Indodax) {
-            // Independent USDT/IDR cross-check for the live divisor.
-            arb_feed::spawn_upbit_usdt_idr_task(&engine.shared.fx_cross);
-        }
-        tracing::info!("live WS feeds starting (paper execution)");
+    // Live venue books in, paper execution unchanged: fills stay simulated
+    // and the live-send gate is untouched. Stale venues are skipped.
+    // Indodax additionally needs its published static market-data token
+    // from the environment; it is not a trading credential.
+    let indodax_token = std::env::var("INDODAX_WS_TOKEN")
+        .ok()
+        .filter(|t| !t.trim().is_empty());
+    arb_feed::spawn_venue_tasks(
+        &engine.shared.live_books,
+        &engine.shared.live_connectors,
+        engine.cfg.venues.clone(),
+        engine.symbols.clone(),
+        indodax_token,
+    );
+    if engine.cfg.venues.contains(&Venue::Indodax) {
+        // Independent USDT/IDR cross-check for the live divisor.
+        arb_feed::spawn_upbit_usdt_idr_task(&engine.shared.fx_cross);
     }
+    tracing::info!("live WS feeds starting (paper execution)");
 
     if let Some(addr) = api_addr {
         // Secret from env only, like venue keys — never from the config file.
@@ -1101,40 +934,57 @@ symbols = ["BTC/USDT", "ETH/USDT"]
 
 [engine]
 mode = "paper"
-feed = "synthetic"
 
 [params]
 min_edge_bps = 15
 slip_buffer_bps = 5
 target_notional_quote = 1000
 max_book_age_ms = 2000
-
-[risk]
-max_notional_quote_per_trade = 5000
-max_notional_quote_per_venue = 25000
 "#,
         )
         .unwrap();
         let engine = Engine::new(cfg).unwrap();
-        // Dynamic rule: 2x target notional at the USDT anchor, no fixed floor.
-        // BTC: 2000/80000 = 0.025 exact. ETH must be 2000/2300, not the
+        // Dynamic rule: 5x target notional at the USDT anchor, no fixed floor.
+        // BTC: 5000/80000 = 0.0625 exact. ETH must be 5000/2300, not the
         // 66666.67 the old prefix match produced from the ETH/BTC cross.
         assert_eq!(
             engine.paper.balance(Venue::Binance, "BTC"),
-            Decimal::new(25, 3)
+            Decimal::new(625, 4)
         );
         let eth = engine.paper.balance(Venue::Binance, "ETH");
-        assert!(eth > Decimal::ZERO && eth < Decimal::ONE, "ETH seed: {eth}");
+        assert!(
+            eth > Decimal::ONE && eth < Decimal::new(3, 0),
+            "ETH seed: {eth}"
+        );
     }
 
     #[test]
-    fn live_feed_never_invents_funding() {
+    fn no_live_books_means_no_quotes_or_funding() {
         // Regression: the paper soak accumulated 90 synthetic funding
-        // entries against live books. Live mode must see no funding data
-        // until real perp feeds exist.
-        let syms = vec![Symbol::new("BTC", "USDT"), Symbol::new("ETH", "USDT")];
-        assert!(synthetic_funding("live", &syms, 1_000).is_empty());
-        assert_eq!(synthetic_funding("synthetic", &syms, 1_000).len(), 6);
+        // entries against live books. With no live books connected, the
+        // view must carry no funding and no DEX quotes — the engine
+        // cannot invent entries, so those strategies stay quiet.
+        let cfg: config::Config = toml::from_str(
+            r#"
+venues = ["binance"]
+symbols = ["BTC/USDT"]
+
+[engine]
+mode = "paper"
+
+[params]
+min_edge_bps = 15
+slip_buffer_bps = 5
+target_notional_quote = 1000
+max_book_age_ms = 2000
+"#,
+        )
+        .unwrap();
+        let mut engine = Engine::new(cfg).unwrap();
+        let view = engine.build_view();
+        assert!(view.funding.is_empty());
+        assert!(view.dex_quotes.is_empty());
+        assert!(view.books.is_empty());
     }
 
     fn stored(strategy: &str, roundtrip: bool, venue: Venue, base: &str) -> StoredTrade {
@@ -1182,7 +1032,10 @@ max_notional_quote_per_venue = 25000
 
     /// Stub strategy that reports one closed funding pair, so the engine
     /// drain path runs without a full tick.
-    struct Closer(Vec<(Venue, Symbol)>);
+    struct Closer {
+        pairs: Vec<(Venue, Symbol)>,
+        drained: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
     impl Strategy for Closer {
         fn name(&self) -> &'static str {
             "test_closer"
@@ -1191,12 +1044,14 @@ max_notional_quote_per_venue = 25000
             vec![]
         }
         fn take_closed(&mut self) -> Vec<(Venue, Symbol)> {
-            std::mem::take(&mut self.0)
+            self.drained
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            std::mem::take(&mut self.pairs)
         }
     }
 
     #[test]
-    fn closed_funding_pairs_release_venue_caps() {
+    fn closed_funding_pairs_drain() {
         let cfg: config::Config = toml::from_str(
             r#"
 venues = ["binance"]
@@ -1204,49 +1059,27 @@ symbols = ["BTC/USDT"]
 
 [engine]
 mode = "paper"
-feed = "synthetic"
 
 [params]
 min_edge_bps = 15
 slip_buffer_bps = 5
 target_notional_quote = 1000
 max_book_age_ms = 2000
-
-[risk]
-max_notional_quote_per_trade = 5000
-max_notional_quote_per_venue = 25000
 "#,
         )
         .unwrap();
         let mut engine = Engine::new(cfg).unwrap();
-        // Stage an open funding position: two 1000-notional legs on Binance.
-        let leg = |side| TradeLeg {
-            venue: Venue::Binance,
-            symbol: Symbol::new("BTC", "USDT"),
-            side,
-            price: Decimal::new(100, 0),
-            qty_base: Decimal::new(10, 0),
-            market: MarketKind::Spot,
-        };
-        let entry = Intent {
-            strategy: "funding_rate".into(),
-            expected_edge_bps: Decimal::new(500, 0),
-            ttl_ms: 100,
-            created_ms: 0,
-            roundtrip: false,
-            legs: vec![leg(Side::Buy), leg(Side::Sell)],
-        };
-        engine.risk.record(&entry);
-        engine
-            .funding_notionals
-            .insert((Venue::Binance, "BTC/USDT".into()), Decimal::new(2_000, 0));
-        assert_eq!(engine.risk.exposure(Venue::Binance), Decimal::new(2_000, 0));
-        engine.strategies = vec![Box::new(Closer(vec![(
-            Venue::Binance,
-            Symbol::new("BTC", "USDT"),
-        )]))];
+        let drained = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        engine.strategies = vec![Box::new(Closer {
+            pairs: vec![(Venue::Binance, Symbol::new("BTC", "USDT"))],
+            drained: drained.clone(),
+        })];
+        // Draining must consume the reported pair so the closed set cannot
+        // grow without bound.
         engine.release_closed();
-        assert_eq!(engine.risk.exposure(Venue::Binance), Decimal::ZERO);
-        assert!(engine.funding_notionals.is_empty());
+        assert!(
+            drained.load(std::sync::atomic::Ordering::SeqCst),
+            "release_closed must drain take_closed"
+        );
     }
 }

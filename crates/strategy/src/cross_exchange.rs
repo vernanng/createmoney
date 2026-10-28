@@ -1,9 +1,7 @@
 //! Cross-exchange spot: buy the cheap venue, sell the rich venue.
 //! Assumes pre-funded inventory on every venue (no transfers in the loop).
 
-use crate::{
-    fresh, imbalance::both_sided_agrees, size_for_notional, MarketView, Strategy, StrategyParams,
-};
+use crate::{fresh, imbalance::both_sided_agrees, MarketView, Strategy, StrategyParams};
 use arb_core::{net_edge_bps, Intent, MarketKind, Side, Symbol, TradeLeg, Venue};
 use rust_decimal::Decimal;
 
@@ -32,9 +30,56 @@ impl CrossExchange {
     }
 }
 
-/// S2 depth-adaptive sizing grid (Karpathy-style: try small first, prove the
-/// hump). Fixed $1000 leaves money in deep books and pays impact in thin ones.
-pub const ADAPTIVE_NOTIONALS: [i64; 4] = [100, 500, 1000, 2500];
+/// S2 dynamic sizing: no fixed grid. For each venue pair, walk the two books
+/// level by level and keep the largest quantity whose combined VWAP still
+/// clears `min_edge_bps` net of fees. Size follows the opportunity.
+fn max_profitable_qty(
+    asks: &[arb_core::BookLevel],
+    bids: &[arb_core::BookLevel],
+    buy_fee_bps: Decimal,
+    sell_fee_bps: Decimal,
+    slip_buffer_bps: Decimal,
+    min_edge_bps: Decimal,
+) -> Option<(Decimal, Decimal, Decimal)> {
+    // (qty_base, buy_vwap, sell_vwap)
+    let (mut ai, mut bi) = (0usize, 0usize);
+    let (mut aq, mut bq) = (
+        asks.first().map(|l| l.qty).unwrap_or(Decimal::ZERO),
+        bids.first().map(|l| l.qty).unwrap_or(Decimal::ZERO),
+    );
+    let (mut cost, mut proceeds, mut total) = (Decimal::ZERO, Decimal::ZERO, Decimal::ZERO);
+    let mut best: Option<(Decimal, Decimal, Decimal)> = None;
+    while ai < asks.len() && bi < bids.len() {
+        let q = aq.min(bq);
+        if q <= Decimal::ZERO {
+            break;
+        }
+        cost += q * asks[ai].price;
+        proceeds += q * bids[bi].price;
+        total += q;
+        aq -= q;
+        bq -= q;
+        let edge = net_edge_bps(
+            cost / total,
+            proceeds / total,
+            buy_fee_bps,
+            sell_fee_bps,
+            slip_buffer_bps,
+        );
+        if edge >= min_edge_bps {
+            best = Some((total, cost / total, proceeds / total));
+        }
+        if aq <= Decimal::ZERO {
+            ai += 1;
+            aq = asks.get(ai).map(|l| l.qty).unwrap_or(Decimal::ZERO);
+        }
+        if bq <= Decimal::ZERO {
+            bi += 1;
+            bq = bids.get(bi).map(|l| l.qty).unwrap_or(Decimal::ZERO);
+        }
+    }
+    best
+}
 
 impl Strategy for CrossExchange {
     fn name(&self) -> &'static str {
@@ -53,88 +98,60 @@ impl Strategy for CrossExchange {
 }
 
 impl CrossExchange {
-    /// S2: scan the notional grid via VWAP + net edge, keep the max net edge.
-    /// Skips notionals that exceed book depth (VWAP error). Returns None when
-    /// no notional clears `min_edge_bps`.
+    /// S2: size each venue pair to its profitable depth, keep the best edge.
+    /// Returns None when no pair clears `min_edge_bps` at any quantity.
     fn best_sized_intent(&self, view: &MarketView, sym: &Symbol) -> Option<Intent> {
-        let mut best: Option<(Venue, Venue, Decimal, Decimal, Decimal, Decimal)> = None;
         // (buy_v, sell_v, qty, buy_px, sell_px, edge)
-        for n in ADAPTIVE_NOTIONALS {
-            let notional = Decimal::new(n, 0);
-            let mut best_buy: Option<(Venue, Decimal, Decimal)> = None;
-            let mut best_sell: Option<(Venue, Decimal, Decimal)> = None;
-            for v in &self.venues {
-                let Some(b) = view.book(*v, sym) else {
+        let mut best: Option<(Venue, Venue, Decimal, Decimal, Decimal, Decimal)> = None;
+        for buy_v in &self.venues {
+            for sell_v in &self.venues {
+                if buy_v == sell_v {
+                    continue;
+                }
+                let (Some(buy_b), Some(sell_b)) = (view.book(*buy_v, sym), view.book(*sell_v, sym))
+                else {
                     continue;
                 };
-                if !fresh(b, view.now_ms, self.params.max_book_age_ms) {
+                if !fresh(buy_b, view.now_ms, self.params.max_book_age_ms)
+                    || !fresh(sell_b, view.now_ms, self.params.max_book_age_ms)
+                {
                     continue;
                 }
-                let Some(touch) = b.best_ask() else { continue };
-                let qty = size_for_notional(notional, touch.price);
-                if qty <= Decimal::ZERO {
-                    continue;
-                }
-                if let Ok(vwap) = b.vwap(Side::Buy, qty) {
-                    if best_buy.map(|(_, p, _)| vwap < p).unwrap_or(true) {
-                        best_buy = Some((*v, vwap, qty));
+                // S6 gate: require both-sided imbalance agreement when enabled.
+                if let Some(t) = self.imbalance_threshold {
+                    let (Some(bq), Some(sq)) = (buy_b.quote(), sell_b.quote()) else {
+                        continue;
+                    };
+                    if !both_sided_agrees(&bq, &sq, t) {
+                        continue;
                     }
                 }
-                if let Ok(vwap) = b.vwap(Side::Sell, qty) {
-                    if best_sell.map(|(_, p, _)| vwap > p).unwrap_or(true) {
-                        best_sell = Some((*v, vwap, qty));
-                    }
-                }
-            }
-            let (Some((buy_v, buy_px, qty)), Some((sell_v, sell_px, _))) = (best_buy, best_sell)
-            else {
-                continue;
-            };
-            if buy_v == sell_v {
-                continue;
-            }
-            // S6 gate: require both-sided imbalance agreement when enabled.
-            if let Some(t) = self.imbalance_threshold {
-                let (Some(bb), Some(sb)) = (view.book(buy_v, sym), view.book(sell_v, sym)) else {
+                let Some((qty, buy_px, sell_px)) = max_profitable_qty(
+                    &buy_b.asks_vec(),
+                    &sell_b.bids_vec(),
+                    buy_v.default_taker_bps(),
+                    sell_v.default_taker_bps(),
+                    self.params.slip_buffer_bps,
+                    self.params.min_edge_bps,
+                ) else {
                     continue;
                 };
-                let (Some(bq), Some(sq)) = (bb.quote(), sb.quote()) else {
-                    continue;
-                };
-                if !both_sided_agrees(&bq, &sq, t) {
-                    continue;
+                let edge = net_edge_bps(
+                    buy_px,
+                    sell_px,
+                    buy_v.default_taker_bps(),
+                    sell_v.default_taker_bps(),
+                    self.params.slip_buffer_bps,
+                );
+                let replace = best
+                    .map(|(_, _, q, _, _, e)| edge > e || (edge == e && qty > q))
+                    .unwrap_or(true);
+                if replace {
+                    best = Some((*buy_v, *sell_v, qty, buy_px, sell_px, edge));
                 }
             }
-            let edge = net_edge_bps(
-                buy_px,
-                sell_px,
-                buy_v.default_taker_bps(),
-                sell_v.default_taker_bps(),
-                self.params.slip_buffer_bps,
-            );
-            if edge < self.params.min_edge_bps {
-                continue;
-            }
-            let replace = best.map(|(_, _, _, _, _, e)| edge > e).unwrap_or(true);
-            if replace {
-                best = Some((buy_v, sell_v, qty, buy_px, sell_px, edge));
-            }
         }
-        let (buy_v, sell_v, qty, buy_px, _, _) = best?;
-        // shortcut: both legs execute the same quantity, so price the sell
-        // side at the buy quantity instead of the discarded sell size.
-        let sell_book = view.book(sell_v, sym)?;
-        let sell_px = sell_book.vwap(Side::Sell, qty).ok()?;
-        let edge = net_edge_bps(
-            buy_px,
-            sell_px,
-            buy_v.default_taker_bps(),
-            sell_v.default_taker_bps(),
-            self.params.slip_buffer_bps,
-        );
-        if edge < self.params.min_edge_bps {
-            return None;
-        }
+        let (buy_v, sell_v, qty, buy_px, sell_px, edge) = best?;
         Some(Intent {
             strategy: self.name().into(),
             expected_edge_bps: edge,
@@ -238,9 +255,9 @@ mod tests {
     }
 
     #[test]
-    fn adaptive_skips_infeasible_large_size() {
-        // Thin books: only the small notionals fit, so the adaptive scan must
-        // still fire instead of dying on the 2500 grid point.
+    fn dynamic_sizes_to_profitable_depth() {
+        // Thin books cap the walk at 1.5; deep books below let it run past
+        // any fixed grid point, so size follows the opportunity.
         use arb_core::{BookLevel, OrderBook};
         let s = Symbol::new("BTC", "USDT");
         let mut v = MarketView {
@@ -287,6 +304,45 @@ mod tests {
             qty <= dec!(1.5),
             "picked qty must fit thin depth, got {qty}"
         );
+    }
+
+    #[test]
+    fn deep_books_size_past_old_grid() {
+        // $2500 at px 100 was 25 base; profitable depth of 100 must be taken
+        // whole now that no fixed grid caps the walk.
+        use arb_core::{BookLevel, OrderBook};
+        let s = Symbol::new("BTC", "USDT");
+        let mut v = MarketView {
+            now_ms: 1_000,
+            ..Default::default()
+        };
+        for (venue, bid, ask) in [
+            (Venue::Binance, dec!(100), dec!(100.05)),
+            (Venue::Bybit, dec!(101), dec!(101.05)),
+        ] {
+            let mut b = OrderBook::new(venue, s.clone());
+            b.apply_snapshot(
+                vec![BookLevel {
+                    price: bid,
+                    qty: dec!(100),
+                }],
+                vec![BookLevel {
+                    price: ask,
+                    qty: dec!(100),
+                }],
+                1,
+                1_000,
+            );
+            v.put(b);
+        }
+        let mut st = CrossExchange::new(
+            StrategyParams::default(),
+            vec![Venue::Binance, Venue::Bybit],
+            vec![s],
+        );
+        let hits = st.on_tick(&v);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].legs[0].qty_base, dec!(100));
     }
 
     #[test]

@@ -39,8 +39,7 @@ pub struct StrategyMetrics {
 
 /// Health of the live USDT/IDR divisor used to normalize Indodax books.
 /// `fresh` means a rate was accepted for conversion; `degraded` means the
-/// cross-checks could not confirm it (or no rate at all). In synthetic
-/// mode `mid` echoes the configured reference with state `synthetic`.
+/// cross-checks could not confirm it (or no rate at all).
 #[derive(Debug, Clone, Serialize)]
 pub struct UsdtIdrHealth {
     pub mid: Option<Decimal>,
@@ -96,6 +95,8 @@ pub struct PortfolioStatus {
 pub struct EngineStatus {
     pub mode: String,
     pub killed: bool,
+    /// Wall-clock start of this engine run; the viewer renders uptime from it.
+    pub started_ms: i64,
     pub trades: u64,
     pub realized_pnl_quote: Decimal,
     pub opportunities_seen: u64,
@@ -347,6 +348,7 @@ mod tests {
         let st = EngineStatus {
             mode: "paper".into(),
             killed: false,
+            started_ms: 1_000,
             trades: 3,
             realized_pnl_quote: dec!(1.5),
             opportunities_seen: 9,
@@ -422,6 +424,7 @@ mod tests {
         assert!(body.contains("\"state\":\"ok\""), "status body: {body}");
         assert!(body.contains("\"triangular\""), "status body: {body}");
         assert!(body.contains("\"killed\":true"), "status body: {body}");
+        assert!(body.contains("\"started_ms\":1000"), "status body: {body}");
         assert!(body.contains("\"portfolio\""), "status body: {body}");
         assert!(
             body.contains("\"equity_quote\":\"100\""),
@@ -437,6 +440,7 @@ mod tests {
         let st = EngineStatus {
             mode: "paper".into(),
             killed: false,
+            started_ms: 1_000,
             trades: 0,
             realized_pnl_quote: dec!(0),
             opportunities_seen: 0,

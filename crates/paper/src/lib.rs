@@ -1,4 +1,4 @@
-//! Paper executor: fills intents against live (or synthetic) books.
+//! Paper executor: fills intents against live books.
 //! Fills walk the book (VWAP) and pay taker fees, so paper PnL is honest
 //! about depth. A leg that cannot fill aborts the whole intent — in live
 //! trading that maps to the hedge/rollback path in `arb-exec`.

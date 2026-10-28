@@ -2,7 +2,7 @@
 
 Multi-venue, multi-strategy arbitrage engine in Rust (edition 2021, tokio,
 `rust_decimal` — no floats for money). **Paper-first**: real strategy logic
-and real (or synthetic) order books, simulated book-walking fills. Live order
+and real order books, simulated book-walking fills. Live order
 sending stays locked behind `mode = "live"` + env keys + the armed check in
 `arb-exec`; even in live mode the paper executor still handles fills until
 venue HTTP senders land (see [Going live](#going-live-read-before-flipping-anything)).
@@ -10,15 +10,16 @@ venue HTTP senders land (see [Going live](#going-live-read-before-flipping-anyth
 One binary, `arb-engine`, runs a tick loop (default 250 ms):
 
 ```
-feed (live WS | synthetic) ──▶ MarketView (books + DEX quotes + funding)
-  ──▶ strategies emit Intents ──▶ risk check ──▶ paper fill (VWAP + fees)
+feed (live WS books; no DEX quotes or funding until real feeds land) ──▶ MarketView
+  ──▶ strategies emit Intents ──▶ paper fill (VWAP + fees)
   ──▶ store (memory + JSONL) ──▶ control API (:8787)
 ```
 
 Strategies never place orders. Each one reads a read-only `MarketView` and
 emits `Intent`s (typed multi-leg trades with `expected_edge_bps`, `ttl_ms`,
-`created_ms`, and a `roundtrip` flag); the risk engine and executors own
-everything after that.
+`created_ms`, and a `roundtrip` flag); the executors own everything after
+that. No pre-trade gate: every emitted intent goes to the paper fill, which
+still enforces inventory; `POST /kill` stops the loop emitting until revived.
 
 ## Quick start
 
@@ -51,7 +52,7 @@ cargo xtask ablate    # S8 ablation matrix, then the full suite
 | Binance | CEX | spot books, perp funding, lag leader | 10 bps (0.10%) |
 | Bybit | CEX | spot books, perp funding | 10 bps |
 | OKX | CEX | spot books, perp funding | 10 bps |
-| Indodax | CEX (IDR) | IDR books normalized via live USDT/IDR rate (own book, cross-checked; `[indodax] usd_idr` is synthetic-only) | 51 bps (~0.51% incl. tax) |
+| Indodax | CEX (IDR) | IDR books normalized via live USDT/IDR rate (own book, cross-checked; `[indodax] usd_idr` is only a fallback reference for the strategy's own math) | 51 bps (~0.51% incl. tax) |
 | Uniswap | DEX (EVM) | V2 pools quoted locally; V3 quoter types/addresses | 30 bps V2 (0.30%) |
 | PancakeSwap | DEX (EVM) | V2 pools quoted locally; V3 quoter types/addresses | 25 bps V2 (0.25%) |
 | Jupiter | DEX (Solana) | Swap API quote URL building + parsing | 0 bps (inside the route) |
@@ -66,13 +67,11 @@ the triangular cycles can price.
 
 **Feeds** (`crates/feed`): parsers for Binance depth/partial/bookTicker,
 Bybit orderbook, OKX books, and Indodax depth, plus `ws_url` /
-`subscribe_frame` helpers. With `feed = "live"`, the binary spawns one
+`subscribe_frame` helpers. The binary spawns one
 reconnecting WebSocket task per CEX venue (`spawn_venue_tasks`, 1 s → 30 s
 backoff); fresh live books win and stale venues are skipped — never
-backfilled with synthetic data. With `feed = "synthetic"`, a seeded
-deterministic feed (`SyntheticFeed`, seed `0xC0FFEE`) walks prices around
-reference anchors with per-venue offsets. Indodax IDR books are converted
-with `idr_book_to_usd` at the configured reference rate either way.
+backfilled. Indodax IDR books are converted
+with `idr_book_to_usd` at the streamed live rate.
 
 ## Strategies
 
@@ -101,7 +100,7 @@ All strategies share `StrategyParams` (from `[params]` in config):
 | `slip_buffer_bps` | 5 | Extra bps subtracted from every edge before comparing |
 | `target_notional_quote` | 10 | Base order size in quote (USD/USDT) terms |
 | `max_book_age_ms` | 2000 | Books older than this, or crossed, never trade (`fresh()`) |
-| `ttl_ms` | 1500 | Intent lifetime; risk rejects anything older |
+| `ttl_ms` | 1500 | Intent lifetime |
 
 Net edge everywhere is `net_edge_bps` from `crates/core`:
 `gross_bps − buy_fee − sell_fee − slip_buffer`. Prices come from book
@@ -119,12 +118,12 @@ Classic spot arbitrage across CEXs: buy on the venue with the lowest VWAP,
 sell on the venue with the highest VWAP, same symbol, same quantity.
 Assumes pre-funded inventory on every venue — no transfers inside the loop.
 
-- **S2 depth-adaptive sizing**: instead of one fixed size, it scans the
-  grid `ADAPTIVE_NOTIONALS = [100, 500, 1000, 2500]` quote and keeps the
-  notional with the best net edge. Fixed $1000 leaves money in deep books
-  and pays impact in thin ones; notionals the book cannot fill (VWAP
-  error) are skipped. Note the grid replaces `target_notional_quote` for
-  this strategy.
+- **S2 dynamic sizing**: no fixed size or grid. For each venue pair it
+  walks both books level by level and keeps the largest quantity whose
+  combined VWAP still clears `min_edge_bps` net of fees — size follows the
+  opportunity. Deep books fill big, thin books fill small; anything the
+  book cannot fill never emits. This replaces `target_notional_quote`
+  for this strategy.
 - Buy and sell venues must differ. Edge is net of both venues' taker fees
   plus `slip_buffer_bps`.
 - Optional **S6 imbalance gate** (`with_imbalance(t)`): also require the
@@ -162,20 +161,17 @@ collecting funding each interval. Legs carry explicit `MarketKind::Spot` /
   (2 × taker fee + slippage buffer). Reported edge is annualized funding
   net of entry cost. Sized from `target_notional_quote` at the spot ask.
 - `roundtrip = false`: this opens a position. Paper PnL is *not* booked at
-  fill; funding accrues over time (`accrued(notional, rate, hours)`), and
-  the position consumes venue risk exposure until unwound.
+  fill; funding accrues over time (`accrued(notional, rate, hours)`).
 - **Fire-once**: an open (venue, symbol) pair never re-fires until closed
   (`mark_closed`), so the strategy cannot churn every tick. This holds
   across restarts and redeploys: filled entries reload from the JSONL
-  store at startup and re-seed the open set (with their risk exposure).
+  store at startup and re-seed the open set.
 - **S4 exit timing** (`with_exit(window, threshold)`, defaults: last 5
   prints vs `min_funding_annualized_bps`): the strategy records annualized
   prints per pair; when the window mean drops below the exit threshold
   (funding flipped cold), the pair is marked closed and may re-enter later.
-- Caveat: the synthetic funding snapshot (1 bp / 8 h ≈ 1095 bps/yr on
-  every pair) exists only on the synthetic feed. In live mode the engine
-  deliberately provides no funding data until real perp feeds land, so
-  this strategy cannot fire there instead of accumulating invented
+- Caveat: the engine provides no funding data until real perp feeds
+  land, so this strategy cannot fire instead of accumulating invented
   entries against real books.
 
 ### 4. `cex_dex` — CEX book vs DEX quote (includes S5)
@@ -218,7 +214,7 @@ leg on Binance.
   most marginal chases, by design.
 - Engine wiring: no separate config flag. It is added automatically when
   `cross_exchange = true` and both Binance and Indodax are in `venues`,
-  with a conservative 30 bps jump threshold so synthetic paper stays quiet
+  with a conservative 30 bps jump threshold so paper stays quiet
   until a real dislocation prints. `roundtrip = true`.
 - Falsifier (in tests): shuffling timestamps / staleness must kill the
   edge — stale books never fire.
@@ -242,8 +238,8 @@ the live USDT/IDR rate) and Binance's USDT books. Checks both directions
   independent consensus by more than `[indodax] rate_max_deviation_bps`
   (default 300), Indodax books are withheld entirely — there is no
   fallback rate. Cash USD/IDR (Google, ECB reference) is never used: it
-  prices bank dollars, not USDT. `[indodax] usd_idr` now applies to the
-  synthetic feed only. Rate state is visible at `/status` (`usdt_idr`)
+  prices bank dollars, not USDT. `[indodax] usd_idr` is only a fallback
+  reference for the strategy's own math. Rate state is visible at `/status` (`usdt_idr`)
   and as `arb_usdt_idr_*` metrics, and the strategy records the divisor
   it actually saw (`usd_idr_used`).
 - Engine wiring: same auto-enable rule as `lag_chase` (`cross_exchange`
@@ -280,16 +276,12 @@ books must hurt. Run it with `cargo xtask ablate` (runs the `arb-strategy`
 suite verbosely, then the full workspace suite). If an ablation ever stops
 mattering, the corresponding cost model — or the test — is broken.
 
-## Risk, paper execution, and the live gate
+## Paper execution and the live gate
 
-- **Risk** (`crates/risk`): every intent passes `RiskEngine::check` before
-  any executor sees it. Rejects: kill-switch on, empty intent, expired
-  (`age > ttl_ms`), edge below `min_edge_bps`, any leg over
-  `max_notional_quote_per_trade` (default 50), venue exposure over
-  `max_notional_quote_per_venue` (default 250), or a leg on a paused
-  venue. After a fill the engine calls `settle`: round-trips release
-  exposure immediately; position-opening intents (funding entries) keep
-  consuming the venue cap until released.
+- **No pre-trade gate**: every emitted intent goes straight to the paper
+  executor. Strategies still self-gate on net edge (`min_edge_bps`); the
+  paper fill enforces inventory (unfunded buys and sells of unheld assets
+  abort the whole intent).
 - **Paper fills** (`crates/paper`): fills walk the book (VWAP) and pay real
   taker fees plus a 2 bps extra-slippage haircut by default, against
   simulated balances seeded from `[paper]`. Inventory is enforced: an
@@ -300,7 +292,7 @@ mattering, the corresponding cost model — or the test — is broken.
   unless mode is `live`, venue keys are present in env, and the executor
   was constructed armed. HMAC-SHA256 signing (`sign_query`) is done and
   unit-tested; per-venue HTTP order senders are the remaining go-live work.
-- **Kill-switch**: `POST /kill` blocks all new intents at the risk layer;
+- **Kill-switch**: `POST /kill` stops the tick loop emitting new intents;
   `POST /revive` clears it.
 
 ## Control API
@@ -313,8 +305,8 @@ if `API_TOKEN` is set in env, the POST rows below need `?token=<value>`
 | Route | Method | Effect |
 |---|---|---|
 | `/health` | GET | `{"ok":true}` |
-| `/status` | GET | mode, killed, trades, realized PnL, opportunities, per-venue connector health (socket state reported separately from fresh-book counts), paused strategies, portfolio (per-venue balances, equity, realized/unrealized PnL) |
-| `/metrics` | GET | text metrics incl. per-strategy funnel counters (scans, intents, risk rejects, fill failures, trades, PnL) and per-venue book freshness |
+| `/status` | GET | mode, killed, engine start (`started_ms`, viewer shows uptime), trades, realized PnL, opportunities, per-venue connector health (socket state reported separately from fresh-book counts), paused strategies, portfolio (per-venue balances, equity, realized/unrealized PnL) |
+| `/metrics` | GET | text metrics incl. per-strategy funnel counters (scans, intents, fill failures, trades, PnL; `risk_rejected` stays 0 — the pre-trade gate is removed) and per-venue book freshness |
 | `/flows` | GET | JSON snapshot of the last 200 trades (for the viewer) |
 | `/viewer` | GET | built-in HTML trade-flow viewer |
 | `/kill` | POST | trip the kill-switch |
@@ -338,23 +330,17 @@ Top-level `venues` / `symbols` must stay above the first `[table]` header.
 | `venues` | binance, bybit, okx, indodax | CEX venues to run |
 | `symbols` | BTC, ETH, SOL, XRP, DOGE, BNB, ADA, LINK, TRX, LTC, DOT, AVAX, UNI, ATOM, NEAR, XLM, ETC, ALGO, FIL, SUI `/USDT` | traded pairs |
 | `[engine] mode` | `paper` | `paper` \| `live` (live still needs env keys + armed check) |
-| `[engine] feed` | `live` | `live` (real WS books, paper fills) \| `synthetic` |
 | `[engine] tick_ms` | 250 | tick-loop period |
 | `[engine] api_addr` | `127.0.0.1:8787` | control-API bind; omit to disable |
 | `[engine] jsonl_path` | `paper-trades.jsonl` | paper-trade log; each start appends a `session_start` record, trades carry `session_id` + `engine_version`, and history reloads at startup |
 | `[strategies]` | all `true` | toggles for `cross_exchange`, `triangular`, `funding_rate`, `cex_dex` (`lag_chase`/`fx_triangle` ride on `cross_exchange`) |
 | `[params]` | see [Shared contract](#shared-contract) | `min_edge_bps`, `slip_buffer_bps`, `target_notional_quote`, `max_book_age_ms`, `ttl_ms` |
 | `[params] min_funding_annualized_bps` | 500 | funding-rate entry bar |
-| `[risk] max_notional_quote_per_trade` | 50 | per-leg cap |
-| `[risk] max_notional_quote_per_venue` | 250 | open-exposure cap per venue |
-| `[dex] uniswap / pancakeswap / jupiter` | all `true` | quote sources for `cex_dex` |
-| `[dex] evm_gas_quote` | 1 | USD gas estimate per EVM swap (raise for L1) |
-| `[dex] solana_fee_quote` | 1 | USD fee estimate per Jupiter swap |
-| `[indodax] usd_idr` | 19000 | synthetic-feed IDR reference only; live mode streams USDT/IDR (code fallback: 16000) |
+| `[indodax] usd_idr` | 19000 | fallback reference for the strategy's own math; book conversion always uses the streamed live rate |
 | `[indodax] rate_max_age_ms` | 30000 | max age of the live USDT/IDR book used as divisor |
 | `[indodax] rate_max_spread_bps` | 50 | max USDT/IDR top-of-book spread (bps of mid) |
 | `[indodax] rate_max_deviation_bps` | 300 | max deviation vs independent consensus before Indodax is withheld |
-| `[paper] start_quote_per_venue` | 500 | seeded USDT/USDC per venue incl. DEX wallets (base per asset is dynamic: ~2x target notional at the reference price) |
+| `[paper] start_quote_per_venue` | 200 | seeded USDT/USDC per venue incl. DEX wallets (base per asset is dynamic: ~5x target notional at the reference price, so dynamic S2 sizes fill) |
 
 Before going live, set `[paper]` amounts to your real planned capital per
 venue so the paper soak behaves like the live book.
@@ -363,9 +349,8 @@ venue so the paper soak behaves like the live book.
 
 ```
 crates/core      types (Venue/Symbol/Intent), L2 book (snapshot/diff/VWAP/depth), decimal money math
-crates/feed      Binance/Bybit/OKX/Indodax parsers, WS URLs/frames, live WS tasks, IDR->USD books, synthetic feed
+crates/feed      Binance/Bybit/OKX/Indodax parsers, WS URLs/frames, live WS tasks, IDR->USD books (+ deterministic SyntheticFeed kept for the S8 harness)
 crates/strategy  Strategy trait + MarketView; all six strategies + imbalance filter (S6); fee_table (S7) / ablate (S8) test harnesses
-crates/risk      pre-trade checks, per-trade/per-venue caps, kill-switch, exposure settle
 crates/paper     book-walking fill simulator (fees + slippage haircut, inventory-enforced)
 crates/exec      live send gate (armed check), env key loading, HMAC-SHA256 signing
 crates/dex-evm   Uniswap + PancakeSwap quoting (exact V2 math; V3 quoter types + addresses)
@@ -423,7 +408,7 @@ manifest to auto-update on Apple Silicon.
 
 ## Going live (read before flipping anything)
 
-1. Paper soak first — with `feed = "live"` so fills walk real books.
+1. Paper soak first — fills always walk real books.
    Confirm zero stale-book trades and sane PnL in the JSONL, and run
    `cargo xtask ablate` so you trust the cost models behind that PnL.
 2. Live WS books are already wired (`arb_feed::spawn_venue_tasks`); what is
@@ -431,7 +416,7 @@ manifest to auto-update on Apple Silicon.
    `LiveExecutor::guard` (signing is done: `arb_exec::sign_query`). Start on
    testnet/demo where offered.
 3. Replace paper quote sources: live funding prints for `funding_rate`
-   (synthesized only on the synthetic feed; live mode gets none), and
+   (it gets none today and cannot fire), and
    for DEX an alloy provider +
    signer in `dex-evm` (V3 via Quoter `eth_call`) plus Jupiter `/swap`
    build + Solana send in `dex-sol`.
@@ -455,10 +440,10 @@ manifest to auto-update on Apple Silicon.
 ## Current limitations (honest list)
 
 - Live mode: real books in, paper fills out — no venue order senders yet.
-- `funding_rate` has no live data source yet: in live mode it receives no
-  funding prints and cannot fire. Only the synthetic feed synthesizes them.
-- DEX quotes in the engine are paper pools / paper Jupiter prices; the
-  quoting math is real, the reserves are not yet read from chain.
+- `funding_rate` has no live data source yet: it receives no
+  funding prints and cannot fire.
+- `cex_dex` has no live quote source yet: the engine carries no DEX
+  quotes, so it cannot fire either.
 - S6 imbalance gate is implemented and tested but off in the engine
   binary's wiring; S7 fee table is a test-only harness, not engine-wired.
 - Cross-exchange assumes pre-funded balances on both venues; rebalancing

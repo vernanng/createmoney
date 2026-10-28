@@ -32,16 +32,34 @@ impl Venue {
     pub fn is_dex(&self) -> bool {
         !self.is_cex()
     }
-    /// Default taker fee in bps. Override per-account in config.
+    /// Taker fee in bps (all strategies take liquidity). VIP0 spot
+    /// schedules: Binance/Bybit/OKX all 0.10%. Indodax stacks the 0.20%
+    /// pair fee (live /api/pairs) with PPh + CFX levies; 51bps holds a
+    /// small conservative margin over that stack.
     pub fn default_taker_bps(&self) -> Decimal {
         match self {
-            Self::Binance => Decimal::new(10, 2), // 0.10%
+            Self::Binance => Decimal::new(10, 2),
             Self::Bybit => Decimal::new(10, 2),
             Self::Okx => Decimal::new(10, 2),
-            Self::Indodax => Decimal::new(51, 2), // ~0.51% incl. tax; verify per pair
+            Self::Indodax => Decimal::new(51, 2),
             Self::Uniswap => Decimal::new(30, 2), // 0.30% pool tier default
             Self::Pancakeswap => Decimal::new(25, 2), // 0.25%
             Self::Jupiter => Decimal::ZERO,       // fee lives inside the quoted route
+        }
+    }
+
+    /// Minimum order notional in quote terms. Verified 2026-10-27 against
+    /// each venue's live instrument API (Binance NOTIONAL filter, Bybit
+    /// minOrderAmt, OKX minSz at market, Indodax Rp25k Pro minimum).
+    /// shortcut: Binance varies per symbol (1-5 seen), OKX is per-instrument
+    /// (~$1); upgrade to a per-symbol table if sizing ever nears the floor.
+    pub fn min_notional_quote(&self) -> Decimal {
+        match self {
+            Self::Binance => Decimal::new(5, 0),
+            Self::Bybit => Decimal::new(5, 0),
+            Self::Okx => Decimal::ONE,
+            Self::Indodax => Decimal::new(15, 1), // Rp25k at ~16.7k/USD
+            Self::Uniswap | Self::Pancakeswap | Self::Jupiter => Decimal::ZERO,
         }
     }
 }

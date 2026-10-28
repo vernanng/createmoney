@@ -1,6 +1,6 @@
 //! Live venue tasks: one WebSocket loop per CEX venue feeding shared books.
 //! Paper mode consumes these through [`pick_fresh`]; stale venues are
-//! skipped, never backfilled with synthetic data.
+//! skipped, never backfilled.
 
 use super::fx::{parse_upbit_orderbook, upbit_subscribe_frame, FxCrossCheck, UPBIT_ID_WS_URL};
 use super::{
