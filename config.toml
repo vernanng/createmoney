@@ -40,7 +40,7 @@ transfer_delay_ms = 0   # settlement delay before the receiver can spend it
 
 [paper.capital]
 binance = 10000  # concentrated start; missing venues use start_quote_per_venue
-# Base per asset is dynamic: ~5x target notional at the reference price, so dynamic S2 sizes fill.
+# Base is seeded only on Binance (BTC/ETH/SOL, one fill each); everything else starts at zero.
 
 [dex]
 jupiter_enabled = true   # public HTTP quotes for SOL/USDT, SOL/USDC; no key needed
