@@ -56,11 +56,11 @@ jobs:
           tags: createmoney:smoke
           cache-from: type=gha
       - run: |
-          docker run -d --name smoke --entrypoint bash createmoney:smoke -c 'sed "s|^api_addr *=.*|api_addr = \"0.0.0.0:8787\"|" /etc/arb-engine/config.toml > /tmp/smoke.toml && exec arb-engine --config /tmp/smoke.toml'
+          docker run -d --name smoke -p 127.0.0.1:8787:8787 --entrypoint bash createmoney:smoke -c 'sed "s|^api_addr *=.*|api_addr = \"0.0.0.0:8787\"|" /etc/arb-engine/config.toml > /tmp/smoke.toml && exec arb-engine --config /tmp/smoke.toml'
           for i in $(seq 1 30); do
             curl -sf http://127.0.0.1:8787/health && break || sleep 2
           done
-          curl -sf http://127.0.0.1:8787/health
+          curl -sf http://127.0.0.1:8787/health || { docker logs smoke; exit 1; }
           docker rm -f smoke
       - uses: docker/build-push-action@v6
         with:
