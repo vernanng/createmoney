@@ -5,8 +5,10 @@
 //! pure and unit-tested; HTTP transport is wired per-venue at go-live.
 
 use arb_core::{Intent, Side, TradeLeg, Venue};
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::{Mutex, OnceLock};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct VenueKeys {
@@ -235,7 +237,8 @@ pub fn bybit_order_endpoint(base: &str) -> Result<String, ExecError> {
 }
 
 /// Tiny GTC LIMIT order body mirroring the paper-filled leg. Pure: no network.
-pub fn bybit_order_body(leg: &TradeLeg) -> String {
+/// Takes already-quantized price/qty (see [`round_to_tick`]).
+pub fn bybit_order_body(leg: &TradeLeg, qty: Decimal, price: Decimal) -> String {
     let side = match leg.side {
         Side::Buy => "Buy",
         Side::Sell => "Sell",
@@ -245,11 +248,93 @@ pub fn bybit_order_body(leg: &TradeLeg) -> String {
         "symbol": format!("{}{}", leg.symbol.base, leg.symbol.quote),
         "side": side,
         "orderType": "Limit",
-        "qty": leg.qty_base.to_string(),
-        "price": leg.price.to_string(),
+        "qty": qty.to_string(),
+        "price": price.to_string(),
         "timeInForce": "GTC",
     })
     .to_string()
+}
+
+/// Bybit answers logic errors with HTTP 200 plus a nonzero `retCode`, so a
+/// bare 2xx check reports failures as sent. Pure: split for tests.
+pub fn bybit_check_response(status: u16, body: &str) -> Result<String, ExecError> {
+    let ok = (200..300).contains(&status)
+        && serde_json::from_str::<serde_json::Value>(body)
+            .ok()
+            .and_then(|v| v.get("retCode")?.as_i64())
+            == Some(0);
+    if ok {
+        Ok(body.to_string())
+    } else {
+        Err(ExecError::BybitRejected {
+            status,
+            body: body.to_string(),
+        })
+    }
+}
+
+/// Round down to a tick multiple (floor never exceeds inventory or budget).
+/// Non-positive tick = no venue info; return the value untouched. Pure.
+pub fn round_to_tick(value: Decimal, tick: Decimal) -> Decimal {
+    if tick <= Decimal::ZERO {
+        return value;
+    }
+    (value / tick).floor() * tick
+}
+
+/// (price tick, qty step) per spot symbol, fetched once from
+/// instruments-info and cached for the process lifetime.
+static BYBIT_TICKS: OnceLock<Mutex<HashMap<String, (Decimal, Decimal)>>> = OnceLock::new();
+
+/// Price tick + qty step for a spot symbol, via `GET
+/// /v5/market/instruments-info`. Cached per process; `None` on any failure,
+/// in which case the caller sends unquantized (still best-effort).
+async fn bybit_tick_info(
+    client: &reqwest::Client,
+    base: &str,
+    symbol: &str,
+) -> Option<(Decimal, Decimal)> {
+    if let Some(hit) = BYBIT_TICKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .ok()
+        .and_then(|m| m.get(symbol).copied())
+    {
+        return Some(hit);
+    }
+    // Reuse the order-send gate: same host, same HTTPS rule.
+    bybit_order_endpoint(base).ok()?;
+    let url = format!(
+        "{}/v5/market/instruments-info?category=spot&symbol={symbol}",
+        base.trim_end_matches('/')
+    );
+    let resp = client.get(url).send().await.ok()?;
+    let status = resp.status().as_u16();
+    let body = resp.text().await.ok()?;
+    let body = bybit_check_response(status, &body).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&body).ok()?;
+    let info = v.get("result")?.get("list")?.get(0)?;
+    let tick = info
+        .get("priceFilter")?
+        .get("tickSize")?
+        .as_str()?
+        .parse::<Decimal>()
+        .ok()?;
+    let step = info
+        .get("lotSizeFilter")?
+        .get("qtyStep")?
+        .as_str()?
+        .parse::<Decimal>()
+        .ok()?;
+    if tick <= Decimal::ZERO || step <= Decimal::ZERO {
+        return None;
+    }
+    BYBIT_TICKS
+        .get()?
+        .lock()
+        .ok()?
+        .insert(symbol.to_string(), (tick, step));
+    Some((tick, step))
 }
 
 /// Bybit V5 signature: `hmac(secret, timestamp + api_key + recv_window + body)`.
@@ -259,8 +344,8 @@ pub fn bybit_sign(api_secret: &str, timestamp_ms: i64, api_key: &str, body: &str
 }
 
 /// Send one paper-filled Bybit leg as a LIMIT order. Returns the raw body on
-/// 2xx. Call only after [`LiveExecutor::guard`] passes; tests cover body shape
-/// instead (no network in tests).
+/// success (`retCode == 0`). Call only after [`LiveExecutor::guard`] passes;
+/// tests cover body shape and response handling instead (no network in tests).
 pub async fn send_bybit_limit(
     leg: &TradeLeg,
     keys: &VenueKeys,
@@ -268,13 +353,29 @@ pub async fn send_bybit_limit(
     now_ms: i64,
 ) -> Result<String, ExecError> {
     let url = bybit_order_endpoint(base)?;
-    let body = bybit_order_body(leg);
-    let sign = bybit_sign(&keys.api_secret, now_ms, &keys.api_key, &body);
     // Same explicit ring provider as arb-feed's live WS tasks.
     let _ = rustls::crypto::ring::default_provider().install_default();
     let client = reqwest::Client::builder()
         .build()
         .map_err(|e| ExecError::Transport(e.to_string()))?;
+    // Quantize to venue ticks; unquantized when the lookup fails.
+    let symbol = format!("{}{}", leg.symbol.base, leg.symbol.quote);
+    let (price, qty) = match bybit_tick_info(&client, base, &symbol).await {
+        Some((tick, step)) => (
+            round_to_tick(leg.price, tick),
+            round_to_tick(leg.qty_base, step),
+        ),
+        None => (leg.price, leg.qty_base),
+    };
+    if price <= Decimal::ZERO || qty <= Decimal::ZERO {
+        // shortcut: dust below the venue minimum; reported, never sent.
+        return Err(ExecError::BybitRejected {
+            status: 0,
+            body: "price or quantity below venue minimum after tick rounding".into(),
+        });
+    }
+    let body = bybit_order_body(leg, qty, price);
+    let sign = bybit_sign(&keys.api_secret, now_ms, &keys.api_key, &body);
     let resp = client
         .post(url)
         .header("X-BAPI-API-KEY", &keys.api_key)
@@ -286,19 +387,12 @@ pub async fn send_bybit_limit(
         .send()
         .await
         .map_err(|e| ExecError::Transport(e.to_string()))?;
-    let status = resp.status();
+    let status = resp.status().as_u16();
     let body = resp
         .text()
         .await
         .map_err(|e| ExecError::Transport(e.to_string()))?;
-    if status.is_success() {
-        Ok(body)
-    } else {
-        Err(ExecError::BybitRejected {
-            status: status.as_u16(),
-            body,
-        })
-    }
+    bybit_check_response(status, &body)
 }
 
 // --- HMAC-SHA256 via the audited RustCrypto `sha2` + `hmac` crates. ---
@@ -439,7 +533,8 @@ mod tests {
 
     #[test]
     fn bybit_order_body_shapes_limit() {
-        let body = bybit_order_body(&bybit_buy_leg());
+        let leg = bybit_buy_leg();
+        let body = bybit_order_body(&leg, leg.qty_base, leg.price);
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["category"], "spot");
         assert_eq!(v["symbol"], "BTCUSDT");
@@ -456,6 +551,29 @@ mod tests {
         assert!(sig.chars().all(|c| c.is_ascii_hexdigit()));
         let payload = format!("1700000000000key5000{body}");
         assert_eq!(sig, hmac_sha256_hex(b"secret", payload.as_bytes()));
+    }
+
+    #[test]
+    fn bybit_rejects_nonzero_retcode_on_http_200() {
+        let ok = r#"{"retCode":0,"retMsg":"OK","result":{"orderId":"x"}}"#;
+        assert!(bybit_check_response(200, ok).is_ok());
+        let bad = r#"{"retCode":10001,"retMsg":"price invalid."}"#;
+        assert!(matches!(
+            bybit_check_response(200, bad),
+            Err(ExecError::BybitRejected { status: 200, .. })
+        ));
+        assert!(bybit_check_response(400, bad).is_err());
+        assert!(bybit_check_response(200, "not json").is_err());
+    }
+
+    #[test]
+    fn round_to_tick_floors_to_multiple() {
+        assert_eq!(
+            round_to_tick(dec!(0.103769242), Decimal::new(1, 5)),
+            dec!(0.10376)
+        );
+        assert_eq!(round_to_tick(dec!(80000), dec!(1)), dec!(80000));
+        assert_eq!(round_to_tick(dec!(0.5), Decimal::ZERO), dec!(0.5));
     }
 
     #[test]
