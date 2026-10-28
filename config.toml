@@ -33,6 +33,8 @@ rate_max_deviation_bps = 300   # vs independent consensus (Upbit ID + implied cr
 
 [paper]
 start_quote_per_venue = 200  # USDT/USDC seeded per venue (incl. DEX wallets)
+transfer_fee_bps = 0    # burned from the sender on each virtual rebalance
+transfer_delay_ms = 0   # settlement delay before the receiver can spend it
 
 [paper.capital]
 binance = 10000  # concentrated start; missing venues use start_quote_per_venue

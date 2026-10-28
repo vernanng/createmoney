@@ -4,14 +4,15 @@ use arb_api::{
     render_flows_envelope, render_metrics, route, route_viewer, ConnectorHealth, Control,
     EngineStatus, OpenPosition, PortfolioStatus, StrategyMetrics, UsdtIdrHealth, VenueBalance,
 };
+use arb_core::Intent;
 use arb_core::{now_ms, Symbol, Venue};
 use arb_exec::{keys_from_env, ExecMode, LiveExecutor};
 use arb_feed::{
     implied_usdt_idr, pick_fresh, resolve_usdt_idr, FxCrossCheck, LiveBooks, LiveConnectors,
     RateDecision, UsdtIdrRate,
 };
-use arb_paper::PaperExecutor;
-use arb_store::{MemoryStore, SessionStart, Store, StoredTrade};
+use arb_paper::{PaperConfig, PaperExecutor, PaperFill};
+use arb_store::{MemoryStore, SessionStart, Store, StoredTrade, StoredTransfer};
 use arb_strategy::{
     CexDex, CrossExchange, FundingStrategy, FxTriangle, LagChase, MarketView, Strategy, Triangular,
 };
@@ -238,6 +239,7 @@ impl Engine {
                 open_positions: vec![],
                 usdt_idr: UsdtIdrHealth::default(),
                 portfolio: PortfolioStatus::default(),
+                transfers: 0,
             }),
             per_strategy: Mutex::new(BTreeMap::new()),
             flows: Mutex::new(render_flows_envelope(&[], 0)),
@@ -254,7 +256,11 @@ impl Engine {
         // Seed paper inventory: quote cash + base assets on every venue that
         // can receive a leg (CEXs plus DEX wallets). Sells of unheld assets
         // and unfunded buys abort in the paper executor.
-        let mut paper = PaperExecutor::default();
+        let mut paper = PaperExecutor::new(PaperConfig {
+            transfer_fee_bps: cfg.paper.transfer_fee_bps,
+            transfer_delay_ms: cfg.paper.transfer_delay_ms,
+            ..Default::default()
+        });
         {
             let mut venues: Vec<Venue> = cfg.venues.clone();
             for dv in [Venue::Uniswap, Venue::Pancakeswap, Venue::Jupiter] {
@@ -473,6 +479,9 @@ impl Engine {
     fn tick(&mut self) {
         let view = self.build_view();
         let now = view.now_ms;
+        // Settle due virtual transfers before pricing new intents, so a
+        // delayed rebalance becomes spendable exactly when its delay elapses.
+        self.paper.settle_due(now);
         // No pre-trade risk gate: every emitted intent goes to the paper
         // executor, which still enforces inventory. The kill-switch stays:
         // when set, no intents are generated until revived.
@@ -508,73 +517,109 @@ impl Engine {
                 }
             }
             match self.paper.execute(&intent, &view.books, now) {
-                Ok(result) => {
-                    // Live Binance/Bybit legs (testnet): collect while `intent`
-                    // is still borrowed; sends spawn after the paper accounting
-                    // below, so a send failure can only log — never lose paper.
-                    let live_legs =
-                        if self.live.mode == ExecMode::Live && self.live.guard(&intent).is_ok() {
-                            intent
-                                .legs
-                                .iter()
-                                .filter(|l| l.venue == Venue::Binance || l.venue == Venue::Bybit)
-                                .filter_map(|leg| {
-                                    self.live.keys_for(leg.venue).map(|k| (leg.clone(), k))
-                                })
-                                .collect::<Vec<_>>()
-                        } else {
-                            Vec::new()
-                        };
-                    {
-                        let m = self
-                            .per_strategy
+                Ok(result) => self.on_paper_fill(intent, result, now),
+                Err(e) => {
+                    // Self-rebalance (paper-only, never a live movement):
+                    // cover inventory shortfalls with virtual venue-to-venue
+                    // transfers, then retry the intent once at these prices.
+                    let moved = self.paper.rebalance_for(&intent, &view.books, now);
+                    if moved.is_empty() {
+                        self.per_strategy
                             .entry(intent.strategy.clone())
-                            .or_default();
-                        m.filled += 1;
-                        if let Some(p) = result.realized_pnl_quote {
-                            m.realized_pnl_quote += p;
+                            .or_default()
+                            .fill_failed += 1;
+                        tracing::debug!(%e, "paper fill failed");
+                        continue;
+                    }
+                    for t in moved {
+                        tracing::info!(from = %t.from, to = %t.to, asset = %t.asset,
+                            amount = %t.amount, fee = %t.fee, "paper rebalance");
+                        let stored = StoredTransfer {
+                            event: "transfer".into(),
+                            from: t.from,
+                            to: t.to,
+                            asset: t.asset,
+                            amount: t.amount,
+                            fee: t.fee,
+                            ts_ms: t.ts_ms,
+                            available_at_ms: t.available_at_ms,
+                            session_id: self.session_id.clone(),
+                        };
+                        if let Err(e) = self.store.record_transfer(stored) {
+                            tracing::error!(%e, "store write failed");
                         }
                     }
-                    tracing::info!(strategy = %intent.strategy, edge_bps = %intent.expected_edge_bps,
-                        pnl = ?result.realized_pnl_quote, legs = intent.legs.len(), "paper trade");
-                    let stored = StoredTrade {
-                        intent,
-                        fills: result.fills,
-                        realized_pnl_quote: result.realized_pnl_quote,
-                        ts_ms: now,
-                        session_id: self.session_id.clone(),
-                        engine_version: ENGINE_VERSION.into(),
-                    };
-                    if let Err(e) = self.store.record_trade(stored) {
-                        tracing::error!(%e, "store write failed");
+                    match self.paper.execute(&intent, &view.books, now) {
+                        Ok(result) => self.on_paper_fill(intent, result, now),
+                        Err(e) => {
+                            self.per_strategy
+                                .entry(intent.strategy.clone())
+                                .or_default()
+                                .fill_failed += 1;
+                            tracing::debug!(%e, "paper fill failed after rebalance");
+                        }
                     }
-                    for (leg, keys) in live_legs {
-                        tokio::spawn(async move {
-                            let now = arb_core::now_ms();
-                            let res = if leg.venue == Venue::Bybit {
-                                let base = arb_exec::bybit_api_base();
-                                arb_exec::send_bybit_limit(&leg, &keys, &base, now).await
-                            } else {
-                                let base = arb_exec::binance_api_base();
-                                arb_exec::send_binance_limit(&leg, &keys, &base, now).await
-                            };
-                            if let Err(e) = res {
-                                tracing::error!(%e, "live send failed; paper fill kept");
-                            }
-                        });
-                    }
-                }
-                Err(e) => {
-                    self.per_strategy
-                        .entry(intent.strategy.clone())
-                        .or_default()
-                        .fill_failed += 1;
-                    tracing::debug!(%e, "paper fill failed");
                 }
             }
         }
         self.release_closed();
         self.publish();
+    }
+
+    /// Paper accounting for one filled intent: metrics, JSONL, and (live
+    /// mode only) best-effort testnet sends that can only log, never mutate.
+    fn on_paper_fill(&mut self, intent: Intent, result: PaperFill, now: i64) {
+        // Live Binance/Bybit legs (testnet): collect while `intent`
+        // is still borrowed; sends spawn after the paper accounting
+        // below, so a send failure can only log — never lose paper.
+        let live_legs = if self.live.mode == ExecMode::Live && self.live.guard(&intent).is_ok() {
+            intent
+                .legs
+                .iter()
+                .filter(|l| l.venue == Venue::Binance || l.venue == Venue::Bybit)
+                .filter_map(|leg| self.live.keys_for(leg.venue).map(|k| (leg.clone(), k)))
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        {
+            let m = self
+                .per_strategy
+                .entry(intent.strategy.clone())
+                .or_default();
+            m.filled += 1;
+            if let Some(p) = result.realized_pnl_quote {
+                m.realized_pnl_quote += p;
+            }
+        }
+        tracing::info!(strategy = %intent.strategy, edge_bps = %intent.expected_edge_bps,
+            pnl = ?result.realized_pnl_quote, legs = intent.legs.len(), "paper trade");
+        let stored = StoredTrade {
+            intent,
+            fills: result.fills,
+            realized_pnl_quote: result.realized_pnl_quote,
+            ts_ms: now,
+            session_id: self.session_id.clone(),
+            engine_version: ENGINE_VERSION.into(),
+        };
+        if let Err(e) = self.store.record_trade(stored) {
+            tracing::error!(%e, "store write failed");
+        }
+        for (leg, keys) in live_legs {
+            tokio::spawn(async move {
+                let now = arb_core::now_ms();
+                let res = if leg.venue == Venue::Bybit {
+                    let base = arb_exec::bybit_api_base();
+                    arb_exec::send_bybit_limit(&leg, &keys, &base, now).await
+                } else {
+                    let base = arb_exec::binance_api_base();
+                    arb_exec::send_binance_limit(&leg, &keys, &base, now).await
+                };
+                if let Err(e) = res {
+                    tracing::error!(%e, "live send failed; paper fill kept");
+                }
+            });
+        }
     }
 
     /// Drain reported funding exits so the closed set cannot grow without
@@ -666,6 +711,7 @@ impl Engine {
             trades: self.paper.trades,
             realized_pnl_quote: self.paper.realized_pnl,
             opportunities_seen: self.opportunities,
+            transfers: self.paper.transfers,
             portfolio,
             connectors: self
                 .cfg
@@ -799,6 +845,7 @@ async fn serve_api(addr: String, token: Option<String>, shared: Arc<Shared>) {
                         open_positions: vec![],
                         usdt_idr: UsdtIdrHealth::default(),
                         portfolio: PortfolioStatus::default(),
+                        transfers: 0,
                     });
                 let per = shared
                     .per_strategy

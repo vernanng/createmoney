@@ -2,7 +2,7 @@
 //! the SQL backend (Postgres/SQLite via sqlx) drops in without touching callers.
 //! JSONL export gives durable, diffable paper-trade history today.
 
-use arb_core::{Fill, Intent};
+use arb_core::{Fill, Intent, Venue};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
@@ -58,9 +58,31 @@ impl SessionStart {
     }
 }
 
+/// One virtual venue-to-venue rebalance (paper-only, never a live movement).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoredTransfer {
+    #[serde(default = "transfer_event")]
+    pub event: String,
+    pub from: Venue,
+    pub to: Venue,
+    pub asset: String,
+    pub amount: Decimal,
+    pub fee: Decimal,
+    pub ts_ms: i64,
+    pub available_at_ms: i64,
+    #[serde(default)]
+    pub session_id: String,
+}
+
+fn transfer_event() -> String {
+    "transfer".into()
+}
+
 pub trait Store: Send {
     fn record_trade(&mut self, t: StoredTrade) -> anyhow::Result<()>;
     fn record_session_start(&mut self, s: SessionStart) -> anyhow::Result<()>;
+    /// Paper-only rebalance event. Visible in the JSONL history only.
+    fn record_transfer(&mut self, t: StoredTransfer) -> anyhow::Result<()>;
     fn trades(&self) -> &[StoredTrade];
     fn total_pnl(&self) -> Decimal {
         self.trades()
@@ -123,7 +145,10 @@ fn load_jsonl(path: &Path) -> anyhow::Result<Vec<StoredTrade>> {
             continue;
         }
         let parsed = serde_json::from_str::<serde_json::Value>(line).and_then(|v| {
-            if v.get("event").and_then(|e| e.as_str()) == Some("session_start") {
+            if matches!(
+                v.get("event").and_then(|e| e.as_str()),
+                Some("session_start" | "transfer")
+            ) {
                 Ok(None)
             } else {
                 serde_json::from_value::<StoredTrade>(v).map(Some)
@@ -160,6 +185,9 @@ impl Store for MemoryStore {
     }
     fn record_session_start(&mut self, s: SessionStart) -> anyhow::Result<()> {
         self.append_line(&serde_json::to_string(&s)?)
+    }
+    fn record_transfer(&mut self, t: StoredTransfer) -> anyhow::Result<()> {
+        self.append_line(&serde_json::to_string(&t)?)
     }
     fn trades(&self) -> &[StoredTrade] {
         &self.trades
@@ -231,6 +259,36 @@ mod tests {
         assert_eq!(st.total_pnl(), dec!(1));
         let content = std::fs::read_to_string(&dir).unwrap();
         assert_eq!(content.lines().count(), 2);
+    }
+
+    #[test]
+    fn transfer_lines_persist_but_reload_skips_them() {
+        let dir = std::env::temp_dir().join("arb-store-test-transfer.jsonl");
+        let _ = std::fs::remove_file(&dir);
+        {
+            let mut st = MemoryStore::with_jsonl(dir.clone()).unwrap();
+            st.record_trade(mk_trade(dec!(2), "s1")).unwrap();
+            st.record_transfer(StoredTransfer {
+                event: "transfer".into(),
+                from: Venue::Binance,
+                to: Venue::Bybit,
+                asset: "BTC".into(),
+                amount: dec!(1),
+                fee: dec!(0),
+                ts_ms: 10,
+                available_at_ms: 10,
+                session_id: "s1".into(),
+            })
+            .unwrap();
+        }
+        let reopened = MemoryStore::with_jsonl(dir.clone()).unwrap();
+        assert_eq!(reopened.trades().len(), 1);
+        assert_eq!(reopened.total_pnl(), dec!(2));
+        let content = std::fs::read_to_string(&dir).unwrap();
+        assert!(
+            content.contains("\"transfer\""),
+            "transfer event logged: {content}"
+        );
     }
 
     #[test]

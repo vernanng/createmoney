@@ -5,12 +5,18 @@
 
 use arb_core::{fee_amount, Balances, Fill, Intent, MarketKind, OrderBook, Side, Symbol, Venue};
 use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 #[derive(Debug, Clone)]
 pub struct PaperConfig {
     pub fee_bps_override: Option<Decimal>,
     pub extra_slip_bps: Decimal,
+    /// Withdrawal-style friction on virtual rebalances: this fee is burned
+    /// from the sender, and the receiver cannot spend the funds until
+    /// `transfer_delay_ms` has passed.
+    pub transfer_fee_bps: Decimal,
+    pub transfer_delay_ms: i64,
 }
 
 impl Default for PaperConfig {
@@ -18,6 +24,8 @@ impl Default for PaperConfig {
         Self {
             fee_bps_override: None,
             extra_slip_bps: Decimal::new(2, 0),
+            transfer_fee_bps: Decimal::ZERO,
+            transfer_delay_ms: 0,
         }
     }
 }
@@ -29,13 +37,39 @@ pub struct PaperFill {
     pub realized_pnl_quote: Option<Decimal>,
 }
 
+/// One virtual rebalance between venue ledgers. Paper-only: live mode never
+/// auto-moves funds. The sender is debited immediately (amount + fee, burned);
+/// the receiver is credited at `available_at_ms` when a delay is configured.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Transfer {
+    pub from: Venue,
+    pub to: Venue,
+    pub asset: String,
+    pub amount: Decimal,
+    pub fee: Decimal,
+    pub ts_ms: i64,
+    pub available_at_ms: i64,
+}
+
+#[derive(Debug, Clone)]
+struct PendingTransfer {
+    to: Venue,
+    asset: String,
+    amount: Decimal,
+    available_at_ms: i64,
+}
+
 pub struct PaperExecutor {
     pub cfg: PaperConfig,
     pub realized_pnl: Decimal,
     pub trades: u64,
+    /// Completed virtual rebalances (paper-only self-rebalance).
+    pub transfers: u64,
     /// Simulated free balances per venue/asset. Spot fills debit/credit these;
     /// a leg the balance cannot fund aborts the intent (no partial mutation).
     pub balances: Balances,
+    /// Transfers deducted from the sender but not yet credited (delay model).
+    pending: Vec<PendingTransfer>,
     /// Mark-to-market equity right after seeding. Unrealized P/L is measured
     /// against this: equity now minus baseline minus realized.
     pub starting_equity: Decimal,
@@ -53,7 +87,9 @@ impl PaperExecutor {
             cfg,
             realized_pnl: Decimal::ZERO,
             trades: 0,
+            transfers: 0,
             balances: Balances::new(),
+            pending: Vec::new(),
             starting_equity: Decimal::ZERO,
         }
     }
@@ -113,38 +149,7 @@ impl PaperExecutor {
         let mut ledger = self.balances.clone();
         let mut fills = Vec::new();
         for leg in &intent.legs {
-            let px = match leg.market {
-                // Perp fills at mark (no book to walk) with the same slip
-                // haircut as spot, so funding entries do not understate cost.
-                MarketKind::Perp => {
-                    let slip = leg.price * self.cfg.extra_slip_bps / Decimal::new(10_000, 0);
-                    match leg.side {
-                        Side::Buy => leg.price + slip,
-                        Side::Sell => leg.price - slip,
-                    }
-                }
-                MarketKind::Spot => {
-                    // DEX legs fill at their quote price: AMM/aggregator
-                    // quotes are already size-aware executable prices, and
-                    // DEX venues never have an order book to walk.
-                    let mut px = if leg.venue.is_dex() {
-                        leg.price
-                    } else {
-                        let book = books
-                            .get(&(leg.venue, leg.symbol.to_string()))
-                            .ok_or_else(|| format!("no book for {} {}", leg.venue, leg.symbol))?;
-                        book.vwap(leg.side, leg.qty_base)
-                            .map_err(|e| e.to_string())?
-                    };
-                    // Extra slippage haircut: buys pay up, sells receive less.
-                    let slip = px * self.cfg.extra_slip_bps / Decimal::new(10_000, 0);
-                    px = match leg.side {
-                        Side::Buy => px + slip,
-                        Side::Sell => px - slip,
-                    };
-                    px
-                }
-            };
+            let px = self.fill_price(leg, books)?;
             let fee = fee_amount(px * leg.qty_base, self.fee_bps(leg.venue));
             apply_to_ledger(&mut ledger, leg, px, fee)?;
             fills.push(Fill {
@@ -175,6 +180,173 @@ impl PaperExecutor {
             fills,
             realized_pnl_quote: pnl,
         })
+    }
+
+    /// Executable price for one leg, with the same slip haircut as `execute`.
+    fn fill_price(
+        &self,
+        leg: &arb_core::TradeLeg,
+        books: &BTreeMap<(Venue, String), OrderBook>,
+    ) -> Result<Decimal, String> {
+        match leg.market {
+            // Perp fills at mark (no book to walk).
+            MarketKind::Perp => {
+                let slip = leg.price * self.cfg.extra_slip_bps / Decimal::new(10_000, 0);
+                Ok(match leg.side {
+                    Side::Buy => leg.price + slip,
+                    Side::Sell => leg.price - slip,
+                })
+            }
+            MarketKind::Spot => {
+                // DEX legs fill at their quote price: AMM/aggregator
+                // quotes are already size-aware executable prices, and
+                // DEX venues never have an order book to walk.
+                let mut px = if leg.venue.is_dex() {
+                    leg.price
+                } else {
+                    let book = books
+                        .get(&(leg.venue, leg.symbol.to_string()))
+                        .ok_or_else(|| format!("no book for {} {}", leg.venue, leg.symbol))?;
+                    book.vwap(leg.side, leg.qty_base)
+                        .map_err(|e| e.to_string())?
+                };
+                // Extra slippage haircut: buys pay up, sells receive less.
+                let slip = px * self.cfg.extra_slip_bps / Decimal::new(10_000, 0);
+                px = match leg.side {
+                    Side::Buy => px + slip,
+                    Side::Sell => px - slip,
+                };
+                Ok(px)
+            }
+        }
+    }
+
+    /// Credit transfers whose settlement delay has passed. Call once per tick.
+    pub fn settle_due(&mut self, now_ms: i64) -> usize {
+        let mut n = 0;
+        let mut i = 0;
+        while i < self.pending.len() {
+            if self.pending[i].available_at_ms <= now_ms {
+                let p = self.pending.remove(i);
+                adjust(&mut self.balances, p.to, &p.asset, p.amount);
+                n += 1;
+            } else {
+                i += 1;
+            }
+        }
+        n
+    }
+
+    /// In-flight credits to a venue/asset (deducted from the sender, not yet
+    /// settled). Shortfall math must count these or a delayed transfer repeats.
+    fn pending_to(&self, venue: Venue, asset: &str) -> Decimal {
+        self.pending
+            .iter()
+            .filter(|p| p.to == venue && p.asset == asset)
+            .map(|p| p.amount)
+            .sum()
+    }
+
+    /// What one leg needs that its venue ledger lacks, if anything.
+    /// Returns (asset, shortfall) in asset units. Counts in-flight delayed
+    /// credits alongside settled balances.
+    fn shortfall(
+        &self,
+        ledger: &Balances,
+        leg: &arb_core::TradeLeg,
+        px: Decimal,
+        fee: Decimal,
+    ) -> Option<(String, Decimal)> {
+        let (base, quote) = (leg.symbol.base.clone(), leg.symbol.quote.clone());
+        let (asset, need) = match leg.market {
+            MarketKind::Perp => (quote, fee),
+            MarketKind::Spot => match leg.side {
+                Side::Buy => (quote, px * leg.qty_base + fee),
+                Side::Sell => (base, leg.qty_base),
+            },
+        };
+        let have = bal(ledger, leg.venue, &asset) + self.pending_to(leg.venue, &asset);
+        if have < need {
+            Some((asset, need - have))
+        } else {
+            None
+        }
+    }
+
+    /// Cover an intent's inventory shortfalls with virtual venue-to-venue
+    /// transfers (paper-only). Loops until every leg is fundable or no donor
+    /// covers the next shortfall. Each transfer burns `transfer_fee_bps`
+    /// from the sender and honors `transfer_delay_ms` before crediting.
+    pub fn rebalance_for(
+        &mut self,
+        intent: &Intent,
+        books: &BTreeMap<(Venue, String), OrderBook>,
+        ts_ms: i64,
+    ) -> Vec<Transfer> {
+        let mut out = Vec::new();
+        // Price every leg once; a leg whose book is missing aborts the whole
+        // rebalance — moving funds cannot fix a missing market.
+        let mut priced = Vec::new();
+        for leg in &intent.legs {
+            let Ok(px) = self.fill_price(leg, books) else {
+                return Vec::new();
+            };
+            priced.push((
+                leg,
+                px,
+                fee_amount(px * leg.qty_base, self.fee_bps(leg.venue)),
+            ));
+        }
+        loop {
+            let mut next: Option<(Venue, String, Decimal)> = None; // (venue, asset, short)
+            for (leg, px, fee) in &priced {
+                if let Some((asset, short)) = self.shortfall(&self.balances, leg, *px, *fee) {
+                    next = Some((leg.venue, asset, short));
+                    break;
+                }
+            }
+            let Some((venue, asset, short)) = next else {
+                break;
+            };
+            let tfee = fee_amount(short, self.cfg.transfer_fee_bps);
+            // Richest other venue that covers shortfall + fee wins.
+            let mut donor: Option<Venue> = None;
+            let mut best = Decimal::ZERO;
+            for (v, m) in &self.balances {
+                if *v == venue {
+                    continue;
+                }
+                let have = m.get(&asset).copied().unwrap_or_default();
+                if have >= short + tfee && have > best {
+                    best = have;
+                    donor = Some(*v);
+                }
+            }
+            let Some(from) = donor else { break };
+            adjust(&mut self.balances, from, &asset, -(short + tfee));
+            let available_at_ms = ts_ms + self.cfg.transfer_delay_ms.max(0);
+            if available_at_ms <= ts_ms {
+                adjust(&mut self.balances, venue, &asset, short);
+            } else {
+                self.pending.push(PendingTransfer {
+                    to: venue,
+                    asset: asset.clone(),
+                    amount: short,
+                    available_at_ms,
+                });
+            }
+            self.transfers += 1;
+            out.push(Transfer {
+                from,
+                to: venue,
+                asset,
+                amount: short,
+                fee: tfee,
+                ts_ms,
+                available_at_ms,
+            });
+        }
+        out
     }
 }
 
@@ -379,6 +551,7 @@ mod tests {
         let mut ex = PaperExecutor::new(PaperConfig {
             fee_bps_override: Some(dec!(10)),
             extra_slip_bps: dec!(0),
+            ..Default::default()
         });
         ex.seed(Venue::Binance, "USDT", dec!(10000));
         ex.seed(Venue::Bybit, "BTC", dec!(10));
@@ -511,6 +684,7 @@ mod tests {
         let mut ex = PaperExecutor::new(PaperConfig {
             fee_bps_override: Some(dec!(10)),
             extra_slip_bps: dec!(0),
+            ..Default::default()
         });
         ex.seed(Venue::Bybit, "USDT", dec!(1000));
         // Empty book map: perp leg must not need one.
@@ -603,6 +777,7 @@ mod tests {
         let mut ex = PaperExecutor::new(PaperConfig {
             fee_bps_override: Some(dec!(10)),
             extra_slip_bps: dec!(0),
+            ..Default::default()
         });
         ex.seed(Venue::Binance, "USDT", dec!(10000));
         ex.seed(Venue::Jupiter, "BTC", dec!(10));
@@ -615,5 +790,92 @@ mod tests {
         assert_eq!(ex.balance(Venue::Jupiter, "BTC"), dec!(9));
         assert_eq!(ex.balance(Venue::Jupiter, "USDT"), dec!(101.898));
         assert_eq!(ex.trades, 1);
+    }
+
+    fn cross_intent() -> Intent {
+        let s = Symbol::new("BTC", "USDT");
+        Intent {
+            strategy: "cross_exchange".into(),
+            expected_edge_bps: dec!(100),
+            ttl_ms: 1000,
+            created_ms: 0,
+            roundtrip: true,
+            legs: vec![
+                TradeLeg {
+                    venue: Venue::Binance,
+                    symbol: s.clone(),
+                    side: Side::Buy,
+                    price: dec!(100),
+                    qty_base: dec!(1),
+                    market: MarketKind::Spot,
+                },
+                TradeLeg {
+                    venue: Venue::Bybit,
+                    symbol: s,
+                    side: Side::Sell,
+                    price: dec!(102),
+                    qty_base: dec!(1),
+                    market: MarketKind::Spot,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn rebalance_covers_shortfall_then_fill_succeeds() {
+        let intent = cross_intent();
+        let mut ex = PaperExecutor::new(PaperConfig {
+            fee_bps_override: Some(dec!(10)),
+            extra_slip_bps: dec!(0),
+            ..Default::default()
+        });
+        ex.seed(Venue::Binance, "USDT", dec!(10000));
+        ex.seed(Venue::Binance, "BTC", dec!(5));
+        // Bybit holds nothing to sell: fill must abort with balances untouched.
+        assert!(ex.execute(&intent, &books(), 10).is_err());
+        let moved = ex.rebalance_for(&intent, &books(), 10);
+        assert_eq!(moved.len(), 1);
+        assert_eq!((moved[0].from, moved[0].to), (Venue::Binance, Venue::Bybit));
+        assert_eq!(moved[0].asset, "BTC");
+        assert_eq!(moved[0].amount, dec!(1));
+        assert_eq!(ex.transfers, 1);
+        // Donor debited, receiver credited, retry fills.
+        assert_eq!(ex.balance(Venue::Binance, "BTC"), dec!(4));
+        ex.execute(&intent, &books(), 10).unwrap();
+        assert_eq!(ex.trades, 1);
+    }
+
+    #[test]
+    fn rebalance_burns_fee_and_honors_delay() {
+        let intent = cross_intent();
+        let mut ex = PaperExecutor::new(PaperConfig {
+            fee_bps_override: Some(dec!(10)),
+            extra_slip_bps: dec!(0),
+            transfer_fee_bps: dec!(100), // 1% burned from the sender
+            transfer_delay_ms: 1000,
+        });
+        ex.seed(Venue::Binance, "USDT", dec!(10000));
+        ex.seed(Venue::Binance, "BTC", dec!(5));
+        let moved = ex.rebalance_for(&intent, &books(), 10);
+        assert_eq!(moved.len(), 1);
+        assert_eq!(moved[0].fee, dec!(0.01));
+        assert_eq!(moved[0].available_at_ms, 1010);
+        // Sender debited amount + fee; receiver locked until settle.
+        assert_eq!(ex.balance(Venue::Binance, "BTC"), dec!(3.99));
+        assert_eq!(ex.balance(Venue::Bybit, "BTC"), dec!(0));
+        assert_eq!(ex.settle_due(500), 0);
+        assert_eq!(ex.settle_due(1010), 1);
+        assert_eq!(ex.balance(Venue::Bybit, "BTC"), dec!(1));
+        ex.execute(&intent, &books(), 1010).unwrap();
+    }
+
+    #[test]
+    fn rebalance_stops_when_no_donor_covers() {
+        let intent = cross_intent();
+        let mut ex = PaperExecutor::default();
+        ex.seed(Venue::Binance, "USDT", dec!(1)); // neither leg fundable
+        let moved = ex.rebalance_for(&intent, &books(), 10);
+        assert!(moved.is_empty());
+        assert_eq!(ex.transfers, 0);
     }
 }

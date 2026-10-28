@@ -115,6 +115,8 @@ pub struct EngineStatus {
     pub open_positions: Vec<OpenPosition>,
     pub usdt_idr: UsdtIdrHealth,
     pub portfolio: PortfolioStatus,
+    /// Completed paper-only venue rebalances (live never auto-moves).
+    pub transfers: u64,
 }
 
 pub struct Control {
@@ -402,6 +404,7 @@ mod tests {
                 realized_pnl_quote: dec!(1.5),
                 unrealized_pnl_quote: dec!(-1.5),
             },
+            transfers: 0,
         };
         let m = render_metrics(
             &st,
@@ -481,6 +484,7 @@ mod tests {
                 realized_pnl_quote: dec!(0),
                 unrealized_pnl_quote: dec!(0),
             },
+            transfers: 0,
         };
         // Reads stay open; control posts are rejected without the token.
         assert_eq!(

@@ -30,6 +30,12 @@ pub struct PaperCfg {
     /// Missing venues fall back to `start_quote_per_venue`.
     #[serde(default)]
     pub capital: BTreeMap<Venue, Decimal>,
+    /// Withdrawal-style friction on virtual rebalances: fee in bps burned
+    /// from the sender plus settlement delay in ms before crediting.
+    #[serde(default)]
+    pub transfer_fee_bps: Decimal,
+    #[serde(default)]
+    pub transfer_delay_ms: i64,
 }
 impl PaperCfg {
     pub fn quote_for(&self, venue: Venue) -> Decimal {
@@ -44,6 +50,8 @@ impl Default for PaperCfg {
         Self {
             start_quote_per_venue: default_start_quote(),
             capital: BTreeMap::new(),
+            transfer_fee_bps: Decimal::ZERO,
+            transfer_delay_ms: 0,
         }
     }
 }
