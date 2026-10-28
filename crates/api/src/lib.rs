@@ -34,6 +34,10 @@ pub struct StrategyMetrics {
     pub risk_rejected: u64,
     pub fill_failed: u64,
     pub filled: u64,
+    /// Intents dropped because every leg's top of book was byte-identical
+    /// to the last fill's (paper never consumes depth, so without this the
+    /// same print refires every tick).
+    pub dup_skipped: u64,
     pub realized_pnl_quote: Decimal,
 }
 
@@ -207,6 +211,10 @@ pub fn render_metrics(
         s.push_str(&format!(
             "arb_strategy_fill_failed_total{{strategy=\"{k}\"}} {}\n",
             m.fill_failed
+        ));
+        s.push_str(&format!(
+            "arb_strategy_dup_skipped_total{{strategy=\"{k}\"}} {}\n",
+            m.dup_skipped
         ));
         s.push_str(&format!(
             "arb_strategy_trades_total{{strategy=\"{k}\"}} {}\n",
@@ -416,6 +424,7 @@ mod tests {
                     risk_rejected: 1,
                     fill_failed: 1,
                     filled: 3,
+                    dup_skipped: 2,
                     realized_pnl_quote: dec!(1.5),
                 },
             )]),
@@ -423,6 +432,7 @@ mod tests {
         assert!(m.contains("arb_trades_total 3"));
         assert!(m.contains("arb_strategy_intents_total{strategy=\"cross_exchange\"} 5"));
         assert!(m.contains("arb_strategy_risk_rejected_total{strategy=\"cross_exchange\"} 1"));
+        assert!(m.contains("arb_strategy_dup_skipped_total{strategy=\"cross_exchange\"} 2"));
         assert!(
             m.contains("arb_connector_fresh_books{venue=\"binance\"} 1"),
             "{m}"

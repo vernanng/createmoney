@@ -159,6 +159,34 @@ fn venue_quote_exceeded(intent: &Intent, paper: &PaperExecutor, share_bps: Decim
     })
 }
 
+/// Key identifying one repeatable opportunity: same strategy, same legs.
+fn fill_key(intent: &Intent) -> String {
+    let mut k = intent.strategy.clone();
+    for leg in &intent.legs {
+        use std::fmt::Write as _;
+        let _ = write!(k, "|{:?}:{}/{:?}", leg.venue, leg.symbol, leg.side);
+    }
+    k
+}
+
+/// Fingerprint of the tops an intent would fill against, read from the same
+/// books `execute` uses. Two prints match only when every leg's top of book
+/// is identical — same prices, same sizes. Top levels (not timestamps: the
+/// parsers stamp arrival time, so `ts_ms` moves even when prices don't).
+fn fill_print(
+    intent: &Intent,
+    books: &BTreeMap<(Venue, String), arb_core::OrderBook>,
+) -> Option<String> {
+    let mut p = String::new();
+    for leg in &intent.legs {
+        let b = books.get(&(leg.venue, leg.symbol.to_string()))?;
+        let (ask, bid) = (b.best_ask()?, b.best_bid()?);
+        use std::fmt::Write as _;
+        let _ = write!(p, "{}/{}/{}/{}|", ask.price, ask.qty, bid.price, bid.qty);
+    }
+    Some(p)
+}
+
 struct Engine {
     cfg: config::Config,
     symbols: Vec<Symbol>,
@@ -168,6 +196,9 @@ struct Engine {
     shared: Arc<Shared>,
     opportunities: u64,
     per_strategy: BTreeMap<String, StrategyMetrics>,
+    /// Tops at the last fill per opportunity key. Paper fills never consume
+    /// book depth, so without this the same print refires every tick.
+    last_fill_print: BTreeMap<String, String>,
     live: LiveExecutor,
     session_id: String,
     /// Wall-clock start of this run, surfaced via status for viewer uptime.
@@ -354,6 +385,7 @@ impl Engine {
             shared,
             opportunities: 0,
             per_strategy: BTreeMap::new(),
+            last_fill_print: BTreeMap::new(),
             live,
             session_id: new_session_id(),
             started_ms,
@@ -552,6 +584,23 @@ impl Engine {
             }
         }
         for intent in intents {
+            // Repeat-fill guard: paper fills never consume book depth, so an
+            // unchanged top of book would refill every tick. Drop the intent
+            // when every leg's top matches the last fill's.
+            // shortcut: same-price refills are dropped, not sized down;
+            // upgrade to paper-local depth consumption when partial fills matter.
+            let key = fill_key(&intent);
+            let print = fill_print(&intent, &view.books);
+            if let Some(p) = &print {
+                if self.last_fill_print.get(&key) == Some(p) {
+                    self.per_strategy
+                        .entry(intent.strategy.clone())
+                        .or_default()
+                        .dup_skipped += 1;
+                    tracing::debug!(strategy = %intent.strategy, "unchanged tops since last fill; skipped");
+                    continue;
+                }
+            }
             self.opportunities += 1;
             self.per_strategy
                 .entry(intent.strategy.clone())
@@ -579,7 +628,12 @@ impl Engine {
                 continue;
             }
             match self.paper.execute(&intent, &view.books, now) {
-                Ok(result) => self.on_paper_fill(intent, result, now),
+                Ok(result) => {
+                    if let Some(p) = print.clone() {
+                        self.last_fill_print.insert(key.clone(), p);
+                    }
+                    self.on_paper_fill(intent, result, now)
+                }
                 Err(e) => {
                     // Self-rebalance (paper-only, never a live movement):
                     // cover inventory shortfalls with virtual venue-to-venue
@@ -612,7 +666,12 @@ impl Engine {
                         }
                     }
                     match self.paper.execute(&intent, &view.books, now) {
-                        Ok(result) => self.on_paper_fill(intent, result, now),
+                        Ok(result) => {
+                            if let Some(p) = print.clone() {
+                                self.last_fill_print.insert(key.clone(), p);
+                            }
+                            self.on_paper_fill(intent, result, now)
+                        }
                         Err(e) => {
                             self.per_strategy
                                 .entry(intent.strategy.clone())
@@ -1498,6 +1557,74 @@ max_book_age_ms = 2000
             m.filled + m.fill_failed + m.risk_rejected,
             "every intent accounted: {m:?}"
         );
+    }
+
+    /// Repeat-fill guard: paper never consumes book depth, so an unchanged
+    /// top of book must not refill every tick. Same tops -> skipped; moved
+    /// tops with the edge intact -> fills again.
+    #[test]
+    fn unchanged_tops_do_not_refill() {
+        let cfg: config::Config = toml::from_str(
+            r#"
+venues = ["binance", "bybit"]
+symbols = ["BTC/USDT"]
+
+[engine]
+mode = "paper"
+
+[params]
+min_edge_bps = 15
+slip_buffer_bps = 5
+target_notional_quote = 50
+max_book_age_ms = 2000
+"#,
+        )
+        .unwrap();
+        let mut engine = Engine::new(cfg).unwrap();
+        let now = now_ms();
+        let btc = Symbol::new("BTC", "USDT");
+        let qty = Decimal::new(5, 4);
+        engine.shared.live_books.lock().unwrap().insert(
+            (Venue::Binance, "BTC/USDT".into()),
+            book(
+                Venue::Binance,
+                btc.clone(),
+                Decimal::new(80400, 0),
+                Decimal::new(80480, 0),
+                qty,
+                now,
+            ),
+        );
+        engine.shared.live_books.lock().unwrap().insert(
+            (Venue::Bybit, "BTC/USDT".into()),
+            book(
+                Venue::Bybit,
+                btc.clone(),
+                Decimal::new(79850, 0),
+                Decimal::new(79950, 0),
+                qty,
+                now,
+            ),
+        );
+        engine.tick();
+        assert_eq!(engine.paper.trades, 1);
+        // Identical books next tick: the same print must not refill.
+        engine.tick();
+        assert_eq!(engine.paper.trades, 1, "unchanged tops must not refill");
+        // Moved Bybit ask, edge intact: fires again.
+        engine.shared.live_books.lock().unwrap().insert(
+            (Venue::Bybit, "BTC/USDT".into()),
+            book(
+                Venue::Bybit,
+                btc.clone(),
+                Decimal::new(79850, 0),
+                Decimal::new(79900, 0),
+                qty,
+                now_ms(),
+            ),
+        );
+        engine.tick();
+        assert_eq!(engine.paper.trades, 2, "moved tops must fill");
     }
 
     /// Stub strategy that reports one closed funding pair, so the engine
