@@ -312,13 +312,16 @@ impl Engine {
                 }
             }
             let anchor_tbl = anchors();
+            // The only pretend inventory in the book: Binance holds one full
+            // fill of each basket asset, so both legs can fire from tick one.
+            // Everything else starts at zero, so the seeded portfolio fits
+            // the configured starting capital instead of ~$372k of base.
+            const SEED_BASE_BASKET: [&str; 3] = ["BTC", "ETH", "SOL"];
             for v in venues {
                 for a in &assets {
                     let amt = if a == "USDT" || a == "USDC" {
                         cfg.paper.quote_for(v)
-                    } else {
-                        // Seed enough base to sell ~5x target notional at the
-                        // reference price, so dynamic S2 sizes to ~$50 fill.
+                    } else if v == Venue::Binance && SEED_BASE_BASKET.contains(&a.as_str()) {
                         // Exact USDT pair first: a prefix match would catch the
                         // ETH/BTC triangle cross (0.03) and overseed ETH ~666x.
                         let ref_px = anchor_tbl
@@ -331,7 +334,9 @@ impl Engine {
                                     .map(|(_, v)| *v)
                             })
                             .unwrap_or(Decimal::new(100, 0));
-                        Decimal::new(5, 0) * cfg.params.target_notional_quote / ref_px
+                        cfg.params.target_notional_quote / ref_px
+                    } else {
+                        continue;
                     };
                     paper.seed(v, a, amt);
                 }
@@ -1179,17 +1184,78 @@ max_book_age_ms = 2000
         )
         .unwrap();
         let engine = Engine::new(cfg).unwrap();
-        // Dynamic rule: 5x target notional at the USDT anchor, no fixed floor.
-        // BTC: 5000/80000 = 0.0625 exact. ETH must be 5000/2300, not the
-        // 66666.67 the old prefix match produced from the ETH/BTC cross.
+        // Budget rule: one fill (1x target) at the USDT anchor, no fixed
+        // floor. BTC: 1000/80000 = 0.0125 exact. ETH must be 1000/2300, not
+        // the 66666.67 the old prefix match produced from the ETH/BTC cross.
         assert_eq!(
             engine.paper.balance(Venue::Binance, "BTC"),
-            Decimal::new(625, 4)
+            Decimal::new(125, 4)
         );
         let eth = engine.paper.balance(Venue::Binance, "ETH");
         assert!(
-            eth > Decimal::ONE && eth < Decimal::new(3, 0),
+            eth > Decimal::new(43, 2) && eth < Decimal::new(44, 2),
             "ETH seed: {eth}"
+        );
+    }
+
+    #[test]
+    fn seeding_stays_within_starting_capital() {
+        // The paper portfolio must be holdable with the configured starting
+        // capital: base is seeded only on Binance for the majors basket, one
+        // full fill each. Everything else starts at zero, so equity and
+        // unrealized stay meaningful instead of ~$372k of pretend inventory.
+        let cfg: config::Config = toml::from_str(
+            r#"
+venues = ["binance", "bybit"]
+symbols = ["BTC/USDT", "ETH/USDT", "DOGE/USDT"]
+
+[engine]
+mode = "paper"
+
+[params]
+min_edge_bps = 15
+slip_buffer_bps = 5
+target_notional_quote = 1000
+max_book_age_ms = 2000
+
+[paper]
+start_quote_per_venue = 200
+
+[paper.capital]
+binance = 10000
+"#,
+        )
+        .unwrap();
+        let engine = Engine::new(cfg).unwrap();
+        // Quote side honors the capital map (USDT and USDC each).
+        assert_eq!(
+            engine.paper.balance(Venue::Binance, "USDT"),
+            Decimal::new(10_000, 0)
+        );
+        assert_eq!(
+            engine.paper.balance(Venue::Bybit, "USDT"),
+            Decimal::new(200, 0)
+        );
+        // Basket base on Binance only, one fill each at the USDT anchor.
+        assert_eq!(
+            engine.paper.balance(Venue::Binance, "BTC"),
+            Decimal::new(125, 4) // 1000/80000
+        );
+        let eth = engine.paper.balance(Venue::Binance, "ETH");
+        assert!(
+            eth > Decimal::new(43, 2) && eth < Decimal::new(44, 2),
+            "ETH seed: {eth}"
+        );
+        // Non-basket base is zero everywhere; basket base is zero off Binance.
+        assert_eq!(engine.paper.balance(Venue::Binance, "DOGE"), Decimal::ZERO);
+        assert_eq!(engine.paper.balance(Venue::Bybit, "BTC"), Decimal::ZERO);
+        assert_eq!(engine.paper.balance(Venue::Bybit, "DOGE"), Decimal::ZERO);
+        // Whole portfolio fits the starting capital: quote on both venues
+        // plus three basket fills, with headroom for anchor rounding.
+        assert!(
+            engine.paper.starting_equity < Decimal::new(25_000, 0),
+            "baseline: {}",
+            engine.paper.starting_equity
         );
     }
 
@@ -1320,21 +1386,21 @@ max_book_age_ms = 2000
         ));
     }
 
-    fn xrp_book(venue: Venue, bid: Decimal, ask: Decimal, ts_ms: i64) -> OrderBook {
-        let s = Symbol::new("XRP", "USDT");
-        let mut b = OrderBook::new(venue, s);
-        // Thin books (40 each side ≈ $40 notional): S2 sizes inside the
-        // 25%-of-$200 venue share, so the fill path — not the risk gate —
-        // is what this drill exercises.
+    fn book(
+        venue: Venue,
+        symbol: Symbol,
+        bid: Decimal,
+        ask: Decimal,
+        qty: Decimal,
+        ts_ms: i64,
+    ) -> OrderBook {
+        let mut b = OrderBook::new(venue, symbol);
+        // Thin books (≈$40 notional): S2 sizes inside the 25%-of-ledger venue
+        // share, so the fill path — not the risk gate — is what this drill
+        // exercises.
         b.apply_snapshot(
-            vec![BookLevel {
-                price: bid,
-                qty: Decimal::new(40, 0),
-            }],
-            vec![BookLevel {
-                price: ask,
-                qty: Decimal::new(40, 0),
-            }],
+            vec![BookLevel { price: bid, qty }],
+            vec![BookLevel { price: ask, qty }],
             1,
             ts_ms,
         );
@@ -1349,7 +1415,7 @@ max_book_age_ms = 2000
         let cfg: config::Config = toml::from_str(
             r#"
 venues = ["binance", "bybit"]
-symbols = ["XRP/USDT"]
+symbols = ["BTC/USDT"]
 
 [engine]
 mode = "paper"
@@ -1364,24 +1430,45 @@ max_book_age_ms = 2000
         .unwrap();
         let mut engine = Engine::new(cfg).unwrap();
         let now = now_ms();
-        // Stale rich book: a huge spread on an ancient book must not fire.
+        let btc = Symbol::new("BTC", "USDT");
+        // Depth fits the honestly seeded base: 0.0005 BTC ≈ $40, inside the
+        // $50 of BTC seeded on Binance (and inside the venue-share guard).
+        let qty = Decimal::new(5, 4);
+        // Stale rich book: Bybit's cheap ancient ask must not fire.
         engine.shared.live_books.lock().unwrap().insert(
-            (Venue::Binance, "XRP/USDT".into()),
-            xrp_book(Venue::Binance, Decimal::ONE, Decimal::new(101, 2), now),
+            (Venue::Binance, "BTC/USDT".into()),
+            book(
+                Venue::Binance,
+                btc.clone(),
+                Decimal::new(80400, 0),
+                Decimal::new(80480, 0),
+                qty,
+                now,
+            ),
         );
         engine.shared.live_books.lock().unwrap().insert(
-            (Venue::Bybit, "XRP/USDT".into()),
-            xrp_book(Venue::Bybit, Decimal::new(110, 2), Decimal::new(111, 2), 0),
+            (Venue::Bybit, "BTC/USDT".into()),
+            book(
+                Venue::Bybit,
+                btc.clone(),
+                Decimal::new(79850, 0),
+                Decimal::new(79950, 0),
+                qty,
+                0,
+            ),
         );
         engine.tick();
         assert_eq!(engine.paper.trades, 0, "stale books must never fire");
-        // Both fresh with a real spread: fills exactly once.
+        // Both fresh with a real spread: buys Bybit, sells Binance (where the
+        // seeded base lives) — fills exactly once.
         engine.shared.live_books.lock().unwrap().insert(
-            (Venue::Bybit, "XRP/USDT".into()),
-            xrp_book(
+            (Venue::Bybit, "BTC/USDT".into()),
+            book(
                 Venue::Bybit,
-                Decimal::new(105, 2),
-                Decimal::new(106, 2),
+                btc.clone(),
+                Decimal::new(79850, 0),
+                Decimal::new(79950, 0),
+                qty,
                 now_ms(),
             ),
         );
@@ -1393,7 +1480,7 @@ max_book_age_ms = 2000
             .live_books
             .lock()
             .unwrap()
-            .remove(&(Venue::Bybit, "XRP/USDT".into()));
+            .remove(&(Venue::Bybit, "BTC/USDT".into()));
         engine.tick();
         assert_eq!(engine.paper.trades, 1, "outage must not fill");
         for (venue, assets) in engine.paper.balances_snapshot() {
