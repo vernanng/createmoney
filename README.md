@@ -372,6 +372,7 @@ The newest green `main` build publishes `ghcr.io/vernanng/createmoney:latest`
 (plus a SHA tag) via the `publish` workflow, which only runs after `ci`
 passes. Publish runs share one concurrency group, so a superseded in-progress
 build is cancelled instead of letting an older commit move `latest` backward.
+Before pushing, publish boots the `amd64` image and gates on `/health`.
 Paper soak from the image:
 
 ```bash

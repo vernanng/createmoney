@@ -45,6 +45,23 @@ jobs:
           tags: |
             type=raw,value=latest
             type=sha,prefix=
+      # Smoke gate: boot the image and prove /health answers before pushing.
+      # Single-arch load (buildx cannot load multi-arch); the config binds
+      # loopback, so rewrite to 0.0.0.0 like the CD stack does.
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          tags: createmoney:smoke
+          cache-from: type=gha
+      - run: |
+          docker run -d --name smoke --entrypoint bash createmoney:smoke -c 'sed "s|^api_addr *=.*|api_addr = \"0.0.0.0:8787\"|" /etc/arb-engine/config.toml > /tmp/smoke.toml && exec arb-engine --config /tmp/smoke.toml'
+          for i in $(seq 1 30); do
+            curl -sf http://127.0.0.1:8787/health && break || sleep 2
+          done
+          curl -sf http://127.0.0.1:8787/health
+          docker rm -f smoke
       - uses: docker/build-push-action@v6
         with:
           context: .
