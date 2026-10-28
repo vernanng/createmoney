@@ -132,6 +132,10 @@ impl Strategy for FundingStrategy {
         self.drain_closed()
     }
 
+    fn open_positions(&self) -> Vec<(Venue, Symbol)> {
+        self.open.clone()
+    }
+
     fn on_tick(&mut self, view: &MarketView) -> Vec<Intent> {
         let mut out = Vec::new();
         // Clone pairs so we can mutate `open` while iterating.

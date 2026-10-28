@@ -77,6 +77,11 @@ pub trait Strategy: Send {
     fn take_closed(&mut self) -> Vec<(Venue, Symbol)> {
         Vec::new()
     }
+    /// Pairs the strategy currently holds open (funding entries). The
+    /// engine surfaces them as pending orders. Default: nothing open.
+    fn open_positions(&self) -> Vec<(Venue, Symbol)> {
+        Vec::new()
+    }
 }
 
 /// Size (base qty) for a target quote notional at a reference price.

@@ -91,6 +91,14 @@ pub struct PortfolioStatus {
     pub unrealized_pnl_quote: Decimal,
 }
 
+/// One open position held by a strategy, shown as a pending order.
+#[derive(Debug, Clone, Serialize)]
+pub struct OpenPosition {
+    pub strategy: String,
+    pub venue: Venue,
+    pub symbol: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct EngineStatus {
     pub mode: String,
@@ -102,6 +110,9 @@ pub struct EngineStatus {
     pub opportunities_seen: u64,
     pub connectors: Vec<ConnectorHealth>,
     pub paused_strategies: Vec<String>,
+    /// S6 gate threshold on `cross_exchange`; None = off.
+    pub imbalance_threshold: Option<Decimal>,
+    pub open_positions: Vec<OpenPosition>,
     pub usdt_idr: UsdtIdrHealth,
     pub portfolio: PortfolioStatus,
 }
@@ -362,6 +373,12 @@ mod tests {
                 last_error: None,
             }],
             paused_strategies: vec![],
+            imbalance_threshold: Some(dec!(0.2)),
+            open_positions: vec![OpenPosition {
+                strategy: "funding_rate".into(),
+                venue: Venue::Bybit,
+                symbol: "BTC/USDT".into(),
+            }],
             usdt_idr: UsdtIdrHealth {
                 mid: Some(dec!(18111.5)),
                 spread_bps: Some(dec!(0.55)),
@@ -421,6 +438,10 @@ mod tests {
         // the caller's snapshot still has paused_strategies=[].
         let (_, body) = route("GET", "/status", &mut c, &st, &m, None);
         assert!(body.contains("\"usdt_idr\""), "status body: {body}");
+        assert!(
+            body.contains("\"imbalance_threshold\""),
+            "status body: {body}"
+        );
         assert!(body.contains("\"state\":\"ok\""), "status body: {body}");
         assert!(body.contains("\"triangular\""), "status body: {body}");
         assert!(body.contains("\"killed\":true"), "status body: {body}");
@@ -428,6 +449,10 @@ mod tests {
         assert!(body.contains("\"portfolio\""), "status body: {body}");
         assert!(
             body.contains("\"equity_quote\":\"100\""),
+            "status body: {body}"
+        );
+        assert!(
+            body.contains("\"open_positions\":[{\"strategy\":\"funding_rate\",\"venue\":\"bybit\",\"symbol\":\"BTC/USDT\"}]"),
             "status body: {body}"
         );
         assert_eq!(route("GET", "/nope", &mut c, &st, &m, None).0, 404);
@@ -446,6 +471,8 @@ mod tests {
             opportunities_seen: 0,
             connectors: vec![],
             paused_strategies: vec![],
+            imbalance_threshold: None,
+            open_positions: vec![],
             usdt_idr: UsdtIdrHealth::default(),
             portfolio: PortfolioStatus {
                 per_venue: vec![],

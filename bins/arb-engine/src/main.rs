@@ -2,7 +2,7 @@ mod config;
 
 use arb_api::{
     render_flows_envelope, render_metrics, route, route_viewer, ConnectorHealth, Control,
-    EngineStatus, PortfolioStatus, StrategyMetrics, UsdtIdrHealth, VenueBalance,
+    EngineStatus, OpenPosition, PortfolioStatus, StrategyMetrics, UsdtIdrHealth, VenueBalance,
 };
 use arb_core::{now_ms, Symbol, Venue};
 use arb_exec::{keys_from_env, ExecMode, LiveExecutor};
@@ -234,6 +234,8 @@ impl Engine {
                 opportunities_seen: 0,
                 connectors: vec![],
                 paused_strategies: vec![],
+                imbalance_threshold: cfg.params.imbalance_threshold,
+                open_positions: vec![],
                 usdt_idr: UsdtIdrHealth::default(),
                 portfolio: PortfolioStatus::default(),
             }),
@@ -696,6 +698,21 @@ impl Engine {
                 })
                 .collect(),
             paused_strategies,
+            imbalance_threshold: self.cfg.params.imbalance_threshold,
+            open_positions: self
+                .strategies
+                .iter()
+                .flat_map(|st| {
+                    let name = st.name().to_string();
+                    st.open_positions()
+                        .into_iter()
+                        .map(move |(venue, symbol)| OpenPosition {
+                            strategy: name.clone(),
+                            venue,
+                            symbol: symbol.to_string(),
+                        })
+                })
+                .collect(),
             usdt_idr: {
                 let d = &self.last_fx;
                 UsdtIdrHealth {
@@ -778,6 +795,8 @@ async fn serve_api(addr: String, token: Option<String>, shared: Arc<Shared>) {
                         opportunities_seen: 0,
                         connectors: vec![],
                         paused_strategies: vec![],
+                        imbalance_threshold: None,
+                        open_positions: vec![],
                         usdt_idr: UsdtIdrHealth::default(),
                         portfolio: PortfolioStatus::default(),
                     });
