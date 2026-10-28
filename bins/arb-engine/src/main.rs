@@ -10,7 +10,7 @@ use arb_core::{now_ms, Symbol, Venue};
 use arb_exec::{keys_from_env, ExecMode, LiveExecutor};
 use arb_feed::{
     implied_usdt_idr, pick_fresh, resolve_usdt_idr, FxCrossCheck, LiveBooks, LiveConnectors,
-    LiveDexQuotes, RateDecision, UsdtIdrRate,
+    LiveDexQuotes, LiveFunding, RateDecision, UsdtIdrRate,
 };
 use arb_paper::{PaperConfig, PaperExecutor, PaperFill};
 use arb_store::{MemoryStore, SessionStart, Store, StoredTrade, StoredTransfer};
@@ -53,6 +53,9 @@ struct Shared {
     /// Latest polled DEX quotes, written by the DEX tasks. `cex_dex` drops
     /// any quote older than `dex_max_quote_age_ms` itself.
     live_dex: LiveDexQuotes,
+    /// Latest perp funding prints with receipt time. Entries older than
+    /// `max_book_age_ms` never reach the strategy.
+    live_funding: LiveFunding,
 }
 
 const ENGINE_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -271,6 +274,7 @@ impl Engine {
             live_connectors: LiveConnectors::default(),
             fx_cross: FxCrossCheck::default(),
             live_dex: LiveDexQuotes::default(),
+            live_funding: LiveFunding::default(),
         });
         let mode = ExecMode::parse(&cfg.engine.mode).unwrap_or(ExecMode::Paper);
         let keys = keys_from_env();
@@ -497,6 +501,16 @@ impl Engine {
         // degrades to no quotes, never to stale fills.
         if let Ok(dex) = self.shared.live_dex.lock() {
             view.dex_quotes.extend(dex.values().cloned());
+        }
+        // Real perp funding prints. Anything older than `max_book_age_ms`
+        // stays out of the view, so `funding_rate` only sees live prints.
+        if let Ok(funding) = self.shared.live_funding.lock() {
+            view.funding.extend(
+                funding
+                    .values()
+                    .filter(|(_, ts)| now - ts <= self.cfg.params.max_book_age_ms)
+                    .map(|(r, _)| r.clone()),
+            );
         }
         // Publish the divisor for provenance (FxTriangle records it).
         view.usdt_idr_mid = fx.rate.map(|r| r.mid);
@@ -1045,6 +1059,20 @@ async fn main() -> anyhow::Result<()> {
         })
     };
     arb_feed::spawn_dex_tasks(&engine.shared.live_dex, dex_jupiter, dex_evm);
+    // Perp funding prints in (Binance/Bybit/OKX). Indodax has no perps.
+    // A stalled stream degrades to no entries, never to stale ones.
+    let perp_venues: Vec<Venue> = engine
+        .cfg
+        .venues
+        .iter()
+        .copied()
+        .filter(|v| matches!(v, Venue::Binance | Venue::Bybit | Venue::Okx))
+        .collect();
+    arb_feed::spawn_funding_tasks(
+        &engine.shared.live_funding,
+        perp_venues,
+        engine.symbols.clone(),
+    );
     tracing::info!("live WS feeds starting (paper execution)");
 
     if let Some(addr) = api_addr {

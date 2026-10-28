@@ -172,9 +172,10 @@ collecting funding each interval. Legs carry explicit `MarketKind::Spot` /
   prints vs `min_funding_annualized_bps`): the strategy records annualized
   prints per pair; when the window mean drops below the exit threshold
   (funding flipped cold), the pair is marked closed and may re-enter later.
-- Caveat: the engine provides no funding data until real perp feeds
-  land, so this strategy cannot fire instead of accumulating invented
-  entries against real books.
+- Feeds are live: Binance (`markPrice@1s`), Bybit linear `tickers`, and
+  OKX `funding-rate` stream into the tick view (`crates/feed/src/funding.rs`).
+  Prints older than `max_book_age_ms` never reach the strategy, so a stalled
+  stream reads as quiet, not stale.
 
 ### 4. `cex_dex` — CEX book vs DEX quote (includes S5)
 
