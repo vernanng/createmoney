@@ -1110,7 +1110,7 @@ async fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arb_core::{Intent, MarketKind, Side, TradeLeg};
+    use arb_core::{BookLevel, Intent, MarketKind, OrderBook, Side, TradeLeg};
 
     #[test]
     fn dotenv_line_parses_env_format() {
@@ -1287,6 +1287,99 @@ max_book_age_ms = 2000
             &paper,
             Decimal::ZERO
         ));
+    }
+
+    fn xrp_book(venue: Venue, bid: Decimal, ask: Decimal, ts_ms: i64) -> OrderBook {
+        let s = Symbol::new("XRP", "USDT");
+        let mut b = OrderBook::new(venue, s);
+        // Thin books (40 each side ≈ $40 notional): S2 sizes inside the
+        // 25%-of-$200 venue share, so the fill path — not the risk gate —
+        // is what this drill exercises.
+        b.apply_snapshot(
+            vec![BookLevel {
+                price: bid,
+                qty: Decimal::new(40, 0),
+            }],
+            vec![BookLevel {
+                price: ask,
+                qty: Decimal::new(40, 0),
+            }],
+            1,
+            ts_ms,
+        );
+        b
+    }
+
+    /// Hedge-failure drill (Q7): stale books and a mid-run venue outage must
+    /// never partially fill. Every emitted intent ends filled, failed, or
+    /// risk-rejected, and every ledger balance stays non-negative.
+    #[test]
+    fn outage_and_stale_books_never_partially_fill() {
+        let cfg: config::Config = toml::from_str(
+            r#"
+venues = ["binance", "bybit"]
+symbols = ["XRP/USDT"]
+
+[engine]
+mode = "paper"
+
+[params]
+min_edge_bps = 15
+slip_buffer_bps = 5
+target_notional_quote = 50
+max_book_age_ms = 2000
+"#,
+        )
+        .unwrap();
+        let mut engine = Engine::new(cfg).unwrap();
+        let now = now_ms();
+        // Stale rich book: a huge spread on an ancient book must not fire.
+        engine.shared.live_books.lock().unwrap().insert(
+            (Venue::Binance, "XRP/USDT".into()),
+            xrp_book(Venue::Binance, Decimal::ONE, Decimal::new(101, 2), now),
+        );
+        engine.shared.live_books.lock().unwrap().insert(
+            (Venue::Bybit, "XRP/USDT".into()),
+            xrp_book(Venue::Bybit, Decimal::new(110, 2), Decimal::new(111, 2), 0),
+        );
+        engine.tick();
+        assert_eq!(engine.paper.trades, 0, "stale books must never fire");
+        // Both fresh with a real spread: fills exactly once.
+        engine.shared.live_books.lock().unwrap().insert(
+            (Venue::Bybit, "XRP/USDT".into()),
+            xrp_book(
+                Venue::Bybit,
+                Decimal::new(105, 2),
+                Decimal::new(106, 2),
+                now_ms(),
+            ),
+        );
+        engine.tick();
+        assert_eq!(engine.paper.trades, 1);
+        // Venue outage mid-run: the tick completes, nothing partially fills.
+        engine
+            .shared
+            .live_books
+            .lock()
+            .unwrap()
+            .remove(&(Venue::Bybit, "XRP/USDT".into()));
+        engine.tick();
+        assert_eq!(engine.paper.trades, 1, "outage must not fill");
+        for (venue, assets) in engine.paper.balances_snapshot() {
+            for (asset, amt) in assets {
+                assert!(
+                    amt >= Decimal::ZERO,
+                    "negative ledger {venue} {asset}: {amt}"
+                );
+            }
+        }
+        // Every emitted intent is accounted for: filled, failed, or rejected.
+        let m = &engine.per_strategy["cross_exchange"];
+        assert_eq!(
+            m.emitted,
+            m.filled + m.fill_failed + m.risk_rejected,
+            "every intent accounted: {m:?}"
+        );
     }
 
     /// Stub strategy that reports one closed funding pair, so the engine

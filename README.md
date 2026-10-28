@@ -415,18 +415,22 @@ manifest to auto-update on Apple Silicon.
 
 ## Going live (read before flipping anything)
 
-1. Paper soak first — fills always walk real books.
-   Confirm zero stale-book trades and sane PnL in the JSONL, and run
-   `cargo xtask ablate` so you trust the cost models behind that PnL.
+1. Paper soak first — fills always walk real books. Green gate: 7 days,
+   net positive after fees, zero stale-book fills, plus a clean kill-switch
+   and pause drill. Confirm it in the JSONL (`transfer` events show each
+   rebalance), and run `cargo xtask ablate` so you trust the cost models
+   behind that PnL.
 2. Live WS books are already wired (`arb_feed::spawn_venue_tasks`);
    Binance spot and Bybit V5 spot testnet senders sit behind
    `LiveExecutor::guard`. Remaining venues still need per-venue HTTP
    senders. Start on testnet/demo where offered.
-3. Replace paper quote sources: live funding prints for `funding_rate`
-   (it gets none today and cannot fire), and
-   for DEX an alloy provider +
-   signer in `dex-evm` (V3 via Quoter `eth_call`) plus Jupiter `/swap`
-   build + Solana send in `dex-sol`. Chain reads/sends will use HTTP RPC endpoints (`EVM_RPC_URL`/`SOLANA_RPC_URL`); the WSS keys are reserved for future subscription feeds.
+3. Live quote sources: funding prints stream for `funding_rate`
+   (Binance/Bybit/OKX), Jupiter HTTP quotes cover SOL pairs, and one
+   Uniswap V2 pool (ETH/USDT) polls via `eth_call getReserves` once
+   `[dex] evm_rpc_url` and `evm_pool` are set. Still to go: V3 quoter,
+   Jupiter `/swap` build + Solana send, and the remaining venue senders.
+   Chain reads/sends use HTTP RPC endpoints
+   (`EVM_RPC_URL`/`SOLANA_RPC_URL`).
 4. Set keys in env, set `mode = "live"`, keep caps tiny. The executor
    refuses to arm without keys; the kill-switch (`POST /kill`) blocks all
    intents. Verify Indodax fees, and confirm `/status` shows
