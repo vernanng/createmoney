@@ -19,7 +19,8 @@ cex_dex = true
 [params]
 min_edge_bps = 15
 slip_buffer_bps = 5
-target_notional_quote = 10
+target_notional_quote = 500
+max_venue_quote_share_bps = 2500
 max_book_age_ms = 2000
 ttl_ms = 1500
 min_funding_annualized_bps = 500

@@ -98,7 +98,8 @@ All strategies share `StrategyParams` (from `[params]` in config):
 |---|---|---|
 | `min_edge_bps` | 15 | Minimum **net** edge (after fees + slippage buffer) to emit |
 | `slip_buffer_bps` | 5 | Extra bps subtracted from every edge before comparing |
-| `target_notional_quote` | 10 | Base order size in quote (USD/USDT) terms |
+| `target_notional_quote` | 500 | Base order size in quote (USD/USDT) terms |
+| `max_venue_quote_share_bps` | 2500 | One intent may spend at most this share (bps) of a venue's USDT+USDC ledger; 0 = off |
 | `max_book_age_ms` | 2000 | Books older than this, or crossed, never trade (`fresh()`) |
 | `ttl_ms` | 1500 | Intent lifetime |
 

@@ -119,6 +119,14 @@ pub struct ParamsCfg {
     /// imbalance agreement at threshold t before `cross_exchange` emits.
     #[serde(default)]
     pub imbalance_threshold: Option<Decimal>,
+    /// Max quote one intent may spend on a single venue, in bps of that
+    /// venue's USDT+USDC ledger. 0 = off. Default 2500 (25%): normal
+    /// prints pass, S2-grown monsters that would eat a venue get skipped.
+    #[serde(default = "default_max_venue_share")]
+    pub max_venue_quote_share_bps: Decimal,
+}
+fn default_max_venue_share() -> Decimal {
+    Decimal::new(2500, 0)
 }
 fn default_ttl() -> i64 {
     1_500

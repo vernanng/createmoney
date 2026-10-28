@@ -5,6 +5,7 @@ use arb_api::{
     EngineStatus, OpenPosition, PortfolioStatus, StrategyMetrics, UsdtIdrHealth, VenueBalance,
 };
 use arb_core::Intent;
+use arb_core::Side;
 use arb_core::{now_ms, Symbol, Venue};
 use arb_exec::{keys_from_env, ExecMode, LiveExecutor};
 use arb_feed::{
@@ -130,6 +131,26 @@ fn anchors() -> BTreeMap<String, Decimal> {
         ("XRP/USDT".to_string(), Decimal::new(13, 1)),
         ("DOGE/USDT".to_string(), Decimal::new(78, 3)),
     ])
+}
+
+/// True when one intent spends more quote on a single venue than
+/// `share_bps` of that venue's USDT+USDC ledger. Only Buy legs spend quote;
+/// sells don't. `share_bps <= 0` disables the check. Caps ruin-per-print
+/// while letting large prints through wherever the venue funds them.
+fn venue_quote_exceeded(intent: &Intent, paper: &PaperExecutor, share_bps: Decimal) -> bool {
+    if share_bps <= Decimal::ZERO {
+        return false;
+    }
+    let mut spend: BTreeMap<Venue, Decimal> = BTreeMap::new();
+    for leg in &intent.legs {
+        if leg.side == Side::Buy {
+            *spend.entry(leg.venue).or_default() += leg.price * leg.qty_base;
+        }
+    }
+    spend.into_iter().any(|(v, s)| {
+        let ledger = paper.balance(v, "USDT") + paper.balance(v, "USDC");
+        ledger <= Decimal::ZERO || s > ledger * share_bps / Decimal::new(10_000, 0)
+    })
 }
 
 struct Engine {
@@ -515,6 +536,21 @@ impl Engine {
                 if let Err(e) = self.live.guard(&intent) {
                     tracing::warn!(%e, "live send blocked; falling back to paper fill for accounting");
                 }
+            }
+            // Venue exposure: skip prints that would spend more quote on
+            // one venue than the configured share of its ledger. No hard
+            // notional cap — large prints pass while the venue funds them.
+            if venue_quote_exceeded(
+                &intent,
+                &self.paper,
+                self.cfg.params.max_venue_quote_share_bps,
+            ) {
+                self.per_strategy
+                    .entry(intent.strategy.clone())
+                    .or_default()
+                    .risk_rejected += 1;
+                tracing::debug!(strategy = %intent.strategy, "intent exceeds venue quote share; skipped");
+                continue;
             }
             match self.paper.execute(&intent, &view.books, now) {
                 Ok(result) => self.on_paper_fill(intent, result, now),
@@ -1126,6 +1162,61 @@ max_book_age_ms = 2000
                 (Venue::Binance, Symbol::new("ETH", "USDT")),
             ]
         );
+    }
+
+    fn buy_intent(notional: Decimal) -> Intent {
+        let s = Symbol::new("BTC", "USDT");
+        Intent {
+            strategy: "t".into(),
+            expected_edge_bps: Decimal::new(20, 0),
+            ttl_ms: 1000,
+            created_ms: 0,
+            roundtrip: true,
+            legs: vec![
+                TradeLeg {
+                    venue: Venue::Binance,
+                    symbol: s.clone(),
+                    side: Side::Buy,
+                    price: Decimal::new(100, 0),
+                    qty_base: notional / Decimal::new(100, 0),
+                    market: MarketKind::Spot,
+                },
+                TradeLeg {
+                    venue: Venue::Bybit,
+                    symbol: s,
+                    side: Side::Sell,
+                    price: Decimal::new(102, 0),
+                    qty_base: notional / Decimal::new(100, 0),
+                    market: MarketKind::Spot,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn venue_quote_share_skips_only_ruinous_prints() {
+        let mut paper = PaperExecutor::new(PaperConfig::default());
+        paper.seed(Venue::Binance, "USDT", Decimal::new(10_000, 0));
+        paper.seed(Venue::Bybit, "USDT", Decimal::new(200, 0));
+        let share = Decimal::new(2500, 0); // 25%
+                                           // $500 buy on $10k (5%) passes; the Bybit sell spends no quote.
+        assert!(!venue_quote_exceeded(
+            &buy_intent(Decimal::new(500, 0)),
+            &paper,
+            share
+        ));
+        // $3000 on $10k (30%) trips the 25% share.
+        assert!(venue_quote_exceeded(
+            &buy_intent(Decimal::new(3000, 0)),
+            &paper,
+            share
+        ));
+        // Zero share disables the check entirely.
+        assert!(!venue_quote_exceeded(
+            &buy_intent(Decimal::new(3000, 0)),
+            &paper,
+            Decimal::ZERO
+        ));
     }
 
     /// Stub strategy that reports one closed funding pair, so the engine
