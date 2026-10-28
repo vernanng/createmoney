@@ -520,6 +520,18 @@ mod tests {
         assert_eq!(code, 200);
         assert_eq!(ctype, "text/html");
         assert!(page.contains("strategy-flow"), "viewer page");
+        // All six engine strategies must have a viewer series; otherwise
+        // their flows fetch but never draw.
+        for s in [
+            "cross_exchange",
+            "triangular",
+            "funding_rate",
+            "cex_dex",
+            "lag_chase",
+            "fx_triangle",
+        ] {
+            assert!(page.contains(s), "viewer page hides {s}");
+        }
         assert!(route_viewer("GET", "/nope", &body).is_none());
         assert!(route_viewer("POST", "/flows", &body).is_none());
     }

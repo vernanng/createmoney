@@ -28,6 +28,16 @@
 - Never work directly on `main`. Use one branch per change: `feat/<name>` (feature), `fix/<name>` (bug fix), `chore/<name>` (tooling/deps/CI), `docs/<name>` (docs only), `refactor/<name>` (no behavior change), `hotfix/<name>` (urgent fix toward `main`).
 - Merge to `main` only after review and green CI (`cargo test --locked --workspace`, `cargo fmt --check`, `cargo clippy --locked --workspace --all-targets -- -D warnings`).
 
+## Verification
+
+- Verify through the interface the user touches (tests for engine logic, Ego browser for the viewer).
+- If a request admits two structures, ask one question with the two options before building.
+
+## Viewer
+
+- `crates/api/src/viewer.html` is baked into the binary via `include_str!`. A viewer change is done only after rebuild + engine restart + Ego reload.
+- After every viewer edit, verify in Ego and quote three numbers: sideways overflow (`#money` scrollWidth − clientWidth, must be 0), panel height vs viewport (must fit or scroll), all blocks reachable.
+
 ## Docs
 
 - After every commit, review and update the affected `.md` docs (`README.md`, `docs/plan.md`) so commands, layout, and behavior stay accurate.
