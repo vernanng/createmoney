@@ -24,6 +24,7 @@ max_venue_quote_share_bps = 2500
 max_book_age_ms = 2000
 ttl_ms = 1500
 min_funding_annualized_bps = 500
+dex_max_quote_age_ms = 30000  # polled DEX quotes older than this never reach cex_dex
 #imbalance_threshold = 0.2  # S6 gate on cross_exchange; off unless set
 
 [indodax]
@@ -45,3 +46,15 @@ start_quote_per_venue = 200
 # transfer_fee_bps = 0    # burned from the sender on each virtual rebalance
 # transfer_delay_ms = 0   # settlement delay before the receiver can spend it
 # Base per asset is dynamic: ~5x target notional at the reference price.
+
+# [dex]
+# jupiter_enabled = true   # public HTTP quotes for SOL/USDT, SOL/USDC
+# jupiter_poll_secs = 10
+# jupiter_gas_quote = 0.01
+# evm_rpc_url = ""         # empty = EVM polling off (fail-closed)
+# evm_pool = ""            # Uniswap V2 ETH/USDT pool address; empty = off
+# evm_token0_is_base = true
+# evm_base_decimals = 18
+# evm_quote_decimals = 6
+# evm_gas_quote = 0.5
+# evm_poll_secs = 12

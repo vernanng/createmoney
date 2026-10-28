@@ -100,6 +100,7 @@ All strategies share `StrategyParams` (from `[params]` in config):
 | `slip_buffer_bps` | 5 | Extra bps subtracted from every edge before comparing |
 | `target_notional_quote` | 500 | Base order size in quote (USD/USDT) terms |
 | `max_venue_quote_share_bps` | 2500 | One intent may spend at most this share (bps) of a venue's USDT+USDC ledger; 0 = off |
+| `dex_max_quote_age_ms` | 30000 | Polled DEX quotes older than this never reach `cex_dex` (pollers run every ~10 s) |
 | `max_book_age_ms` | 2000 | Books older than this, or crossed, never trade (`fresh()`) |
 | `ttl_ms` | 1500 | Intent lifetime |
 
@@ -194,11 +195,12 @@ it fire.
   skipped per venue — a missing book on one venue never hides the others.
 - TTL is 4× the shared `ttl_ms` (DEX settlement is slower than a CEX fill).
   `roundtrip = true`.
-- Quote sources wired in the engine today: exact Uniswap/PancakeSwap V2
-  constant-product math over paper pools tracking the reference anchors
-  (`crates/dex-evm`), and a paper Jupiter quote (anchor ± ~15 bps, only for
-  symbols whose mints are known — SOL/USDC/USDT). Live quoting swaps these
-  for on-chain reserves / V3 quoter `eth_call` and Jupiter HTTP quotes.
+- Quote sources polled live: Jupiter HTTP for SOL/USDT and SOL/USDC
+  (both directions, `crates/dex-sol`), and one Uniswap V2 pool (ETH/USDT)
+  via `eth_call getReserves` (`crates/dex-evm`) — off until `[dex]
+  evm_rpc_url` and `evm_pool` are set. V2 quotes price the full
+  `target_notional_quote` so smaller sweeps see a conservative price.
+  Quotes older than `dex_max_quote_age_ms` never reach the strategy.
 
 ### 5. `lag_chase` — S1 lead-lag stale-book take (Binance → Indodax)
 

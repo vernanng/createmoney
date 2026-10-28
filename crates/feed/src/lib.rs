@@ -7,9 +7,11 @@ use rust_decimal::Decimal;
 use serde_json::Value;
 use std::str::FromStr;
 
+pub mod dex;
 pub mod fx;
 pub mod live;
 pub mod synthetic;
+pub use dex::{spawn_dex_tasks, EvmCfg, JupiterCfg, LiveDexQuotes};
 pub use fx::{
     implied_usdt_idr, resolve_usdt_idr, FxCrossCheck, FxSample, RateDecision, RateState,
     UsdtIdrRate,

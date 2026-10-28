@@ -37,7 +37,7 @@ impl CexDex {
     /// S5 multi-size sweep: try 0.1/0.5/1.0x of target, keep the best net
     /// edge including per-size gas. Small sizes win where V2 impact < spread.
     fn try_pair(&self, view: &MarketView, sym: &Symbol, dq: &DexQuote) -> Option<Intent> {
-        if view.now_ms - dq.ts_ms > self.params.max_book_age_ms {
+        if view.now_ms - dq.ts_ms > self.params.dex_max_quote_age_ms {
             return None;
         }
         let mut best: Option<(Decimal, Intent)> = None; // (edge, intent)

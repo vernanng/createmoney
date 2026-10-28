@@ -12,6 +12,7 @@ arb-strategy.workspace = true
 arb-paper.workspace = true
 arb-store.workspace = true
 arb-api.workspace = true
+arb-dex-sol.workspace = true
 
 anyhow.workspace = true
 serde.workspace = true

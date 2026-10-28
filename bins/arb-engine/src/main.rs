@@ -10,7 +10,7 @@ use arb_core::{now_ms, Symbol, Venue};
 use arb_exec::{keys_from_env, ExecMode, LiveExecutor};
 use arb_feed::{
     implied_usdt_idr, pick_fresh, resolve_usdt_idr, FxCrossCheck, LiveBooks, LiveConnectors,
-    RateDecision, UsdtIdrRate,
+    LiveDexQuotes, RateDecision, UsdtIdrRate,
 };
 use arb_paper::{PaperConfig, PaperExecutor, PaperFill};
 use arb_store::{MemoryStore, SessionStart, Store, StoredTrade, StoredTransfer};
@@ -50,6 +50,9 @@ struct Shared {
     live_connectors: LiveConnectors,
     /// Latest independent USDT/IDR sample (Upbit Indonesia cross-check).
     fx_cross: FxCrossCheck,
+    /// Latest polled DEX quotes, written by the DEX tasks. `cex_dex` drops
+    /// any quote older than `dex_max_quote_age_ms` itself.
+    live_dex: LiveDexQuotes,
 }
 
 const ENGINE_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -267,6 +270,7 @@ impl Engine {
             live_books: LiveBooks::default(),
             live_connectors: LiveConnectors::default(),
             fx_cross: FxCrossCheck::default(),
+            live_dex: LiveDexQuotes::default(),
         });
         let mode = ExecMode::parse(&cfg.engine.mode).unwrap_or(ExecMode::Paper);
         let keys = keys_from_env();
@@ -488,9 +492,12 @@ impl Engine {
                 }
             }
         }
-        // No DEX quotes until real quote feeds land, and no funding data
-        // until real perp feeds land: the engine cannot invent entries, so
-        // `cex_dex` and `funding_rate` simply have nothing to fire on.
+        // Real polled DEX quotes (Jupiter + EVM V2). Staleness is gated by
+        // `cex_dex` itself via `dex_max_quote_age_ms`; a stalled poller
+        // degrades to no quotes, never to stale fills.
+        if let Ok(dex) = self.shared.live_dex.lock() {
+            view.dex_quotes.extend(dex.values().cloned());
+        }
         // Publish the divisor for provenance (FxTriangle records it).
         view.usdt_idr_mid = fx.rate.map(|r| r.mid);
         view.usdt_idr_ts_ms = fx.rate.map(|r| r.ts_ms);
@@ -1003,6 +1010,41 @@ async fn main() -> anyhow::Result<()> {
         // Independent USDT/IDR cross-check for the live divisor.
         arb_feed::spawn_upbit_usdt_idr_task(&engine.shared.fx_cross);
     }
+    // Real DEX quotes in (Jupiter HTTP + one EVM V2 pool), paper execution
+    // unchanged. Each source is fail-closed: unset means no quotes, never
+    // invented ones.
+    let dex_jupiter = engine.cfg.dex.jupiter_enabled.then(|| {
+        let symbols = engine
+            .symbols
+            .iter()
+            .filter(|s| arb_dex_sol::mint_for(&s.base).is_some())
+            .cloned()
+            .collect::<Vec<_>>();
+        arb_feed::JupiterCfg {
+            symbols,
+            target_notional_quote: engine.cfg.params.target_notional_quote,
+            gas_quote: engine.cfg.dex.jupiter_gas_quote,
+            poll_secs: engine.cfg.dex.jupiter_poll_secs,
+        }
+    });
+    let dex_evm = if engine.cfg.dex.evm_rpc_url.trim().is_empty()
+        || engine.cfg.dex.evm_pool.trim().is_empty()
+    {
+        None
+    } else {
+        Some(arb_feed::EvmCfg {
+            symbol: Symbol::new("ETH", "USDT"),
+            rpc_url: engine.cfg.dex.evm_rpc_url.clone(),
+            pool: engine.cfg.dex.evm_pool.clone(),
+            token0_is_base: engine.cfg.dex.evm_token0_is_base,
+            base_decimals: engine.cfg.dex.evm_base_decimals,
+            quote_decimals: engine.cfg.dex.evm_quote_decimals,
+            gas_quote: engine.cfg.dex.evm_gas_quote,
+            target_notional_quote: engine.cfg.params.target_notional_quote,
+            poll_secs: engine.cfg.dex.evm_poll_secs,
+        })
+    };
+    arb_feed::spawn_dex_tasks(&engine.shared.live_dex, dex_jupiter, dex_evm);
     tracing::info!("live WS feeds starting (paper execution)");
 
     if let Some(addr) = api_addr {

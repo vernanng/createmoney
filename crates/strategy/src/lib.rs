@@ -55,6 +55,9 @@ pub struct StrategyParams {
     pub target_notional_quote: Decimal,
     pub max_book_age_ms: i64,
     pub ttl_ms: i64,
+    /// Max age of a polled DEX quote. Pollers run every ~10 s, far slower
+    /// than CEX books, so DEX quotes get their own (longer) gate.
+    pub dex_max_quote_age_ms: i64,
 }
 
 impl Default for StrategyParams {
@@ -65,6 +68,7 @@ impl Default for StrategyParams {
             target_notional_quote: Decimal::new(10, 0),
             max_book_age_ms: 2_000,
             ttl_ms: 1_500,
+            dex_max_quote_age_ms: 30_000,
         }
     }
 }

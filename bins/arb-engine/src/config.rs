@@ -18,6 +18,8 @@ pub struct Config {
     pub indodax: IndodaxCfg,
     #[serde(default)]
     pub paper: PaperCfg,
+    #[serde(default)]
+    pub dex: DexCfg,
 }
 
 /// Starting simulated balances. Paper fills now enforce inventory: a sell of
@@ -124,6 +126,13 @@ pub struct ParamsCfg {
     /// prints pass, S2-grown monsters that would eat a venue get skipped.
     #[serde(default = "default_max_venue_share")]
     pub max_venue_quote_share_bps: Decimal,
+    /// Max age of a polled DEX quote (pollers run every ~10 s, far slower
+    /// than CEX books). Older quotes are dropped before strategies see them.
+    #[serde(default = "default_dex_max_quote_age")]
+    pub dex_max_quote_age_ms: i64,
+}
+fn default_dex_max_quote_age() -> i64 {
+    30_000
 }
 fn default_max_venue_share() -> Decimal {
     Decimal::new(2500, 0)
@@ -143,8 +152,80 @@ impl ParamsCfg {
             target_notional_quote: self.target_notional_quote,
             max_book_age_ms: self.max_book_age_ms,
             ttl_ms: self.ttl_ms,
+            dex_max_quote_age_ms: self.dex_max_quote_age_ms,
         }
     }
+}
+
+/// DEX polling knobs. Both sources are fail-closed: Jupiter runs on the
+/// public API with no key, while the EVM poller stays off until an RPC URL
+/// and pool address are configured.
+#[derive(Debug, Deserialize)]
+pub struct DexCfg {
+    #[serde(default = "default_jupiter_on")]
+    pub jupiter_enabled: bool,
+    #[serde(default = "default_jupiter_poll_secs")]
+    pub jupiter_poll_secs: u64,
+    #[serde(default = "default_jupiter_gas")]
+    pub jupiter_gas_quote: Decimal,
+    #[serde(default)]
+    pub evm_rpc_url: String,
+    #[serde(default)]
+    pub evm_pool: String,
+    /// True when the pair's token0 is the base asset. Wrong here inverts
+    /// every EVM quote (fail-loud in paper edges, not fail-silent).
+    #[serde(default = "default_true")]
+    pub evm_token0_is_base: bool,
+    #[serde(default = "default_eth_decimals")]
+    pub evm_base_decimals: u32,
+    #[serde(default = "default_usdt_decimals")]
+    pub evm_quote_decimals: u32,
+    #[serde(default = "default_evm_gas")]
+    pub evm_gas_quote: Decimal,
+    #[serde(default = "default_evm_poll_secs")]
+    pub evm_poll_secs: u64,
+}
+
+impl Default for DexCfg {
+    fn default() -> Self {
+        Self {
+            jupiter_enabled: default_jupiter_on(),
+            jupiter_poll_secs: default_jupiter_poll_secs(),
+            jupiter_gas_quote: default_jupiter_gas(),
+            evm_rpc_url: String::new(),
+            evm_pool: String::new(),
+            evm_token0_is_base: true,
+            evm_base_decimals: default_eth_decimals(),
+            evm_quote_decimals: default_usdt_decimals(),
+            evm_gas_quote: default_evm_gas(),
+            evm_poll_secs: default_evm_poll_secs(),
+        }
+    }
+}
+
+fn default_jupiter_on() -> bool {
+    true
+}
+fn default_jupiter_poll_secs() -> u64 {
+    10
+}
+fn default_jupiter_gas() -> Decimal {
+    Decimal::new(1, 2)
+}
+fn default_evm_gas() -> Decimal {
+    Decimal::new(5, 1)
+}
+fn default_evm_poll_secs() -> u64 {
+    12
+}
+fn default_eth_decimals() -> u32 {
+    18
+}
+fn default_usdt_decimals() -> u32 {
+    6
+}
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Deserialize)]

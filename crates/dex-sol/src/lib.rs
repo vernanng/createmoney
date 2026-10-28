@@ -93,6 +93,17 @@ pub fn sell_price(q: &JupQuote, symbol: &Symbol) -> Option<Decimal> {
     Some(out_ui / in_ui)
 }
 
+/// Effective quote-per-base buy price from a buy-base quote (spend quote,
+/// receive base). Mirrors `sell_price` for the opposite direction.
+pub fn buy_price(q: &JupQuote, symbol: &Symbol) -> Option<Decimal> {
+    if q.out_amount_raw <= Decimal::ZERO {
+        return None;
+    }
+    let in_ui = q.in_amount_raw / Decimal::from(10u64.pow(decimals_for(&symbol.quote)));
+    let out_ui = q.out_amount_raw / Decimal::from(10u64.pow(decimals_for(&symbol.base)));
+    Some(in_ui / out_ui)
+}
+
 pub fn to_dex_quote(
     symbol: &Symbol,
     sell: &JupQuote,
@@ -128,6 +139,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(sell_price(&q, &s), Some(dec!(150)));
+        // Spent 150 USDC (150e6) -> got 1 SOL (1e9): buy price 150.
+        let b = parse_quote(
+            r#"{"inAmount":"150000000","outAmount":"1000000000","priceImpactPct":"0.01"}"#,
+        )
+        .unwrap();
+        assert_eq!(buy_price(&b, &s), Some(dec!(150)));
         assert!(quote_url(&Symbol::new("DOGE", "USDC"), dec!(1), true, 50).is_none());
     }
 }

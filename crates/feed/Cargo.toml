@@ -6,6 +6,9 @@ license.workspace = true
 
 [dependencies]
 arb-core.workspace = true
+arb-strategy.workspace = true
+arb-dex-evm.workspace = true
+arb-dex-sol.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 rust_decimal.workspace = true
@@ -14,6 +17,8 @@ thiserror.workspace = true
 anyhow.workspace = true
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
 rustls = { version = "0.23", features = ["ring"] }
+# reqwest mirrors arb-exec's transport setup (already in Cargo.lock).
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
 futures-util = "0.3"
 tokio.workspace = true
 tracing.workspace = true
