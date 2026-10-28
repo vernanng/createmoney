@@ -4,7 +4,7 @@
 //! (HMAC-SHA256 query signing used by Binance/Bybit/Indodax-style APIs) are
 //! pure and unit-tested; HTTP transport is wired per-venue at go-live.
 
-use arb_core::{Intent, Venue};
+use arb_core::{Intent, Side, TradeLeg, Venue};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -74,6 +74,12 @@ pub enum ExecError {
     NotArmed { mode: ExecMode, venues: usize },
     #[error("no keys for venue {0}")]
     NoKeys(Venue),
+    #[error("refusing Binance send: '{0}' not on the testnet allowlist")]
+    RejectedHost(String),
+    #[error("Binance order rejected (HTTP {status}): {body}")]
+    BinanceRejected { status: u16, body: String },
+    #[error("Binance transport error: {0}")]
+    Transport(String),
 }
 
 pub struct LiveExecutor {
@@ -104,6 +110,93 @@ impl LiveExecutor {
             }
         }
         Ok(())
+    }
+
+    pub fn keys_for(&self, venue: Venue) -> Option<VenueKeys> {
+        self.keys.get(&venue).cloned()
+    }
+}
+
+// --- Binance spot testnet sender. Best-effort: the engine keeps its paper
+// fill no matter what this returns. ---
+
+/// Default REST base for Binance spot testnet; override with `BINANCE_API_BASE`.
+pub const BINANCE_TESTNET_BASE: &str = "https://testnet.binance.vision";
+/// Fail-closed allowlist: signed order requests go only to this host over HTTPS.
+const BINANCE_HOSTS: &[&str] = &["testnet.binance.vision"];
+
+/// REST base for Binance order sends (`BINANCE_API_BASE`, else the testnet default).
+pub fn binance_api_base() -> String {
+    std::env::var("BINANCE_API_BASE")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| BINANCE_TESTNET_BASE.to_string())
+}
+
+/// Full `POST {base}/api/v3/order?...` URL with the query signed by [`sign_query`].
+/// Tiny GTC LIMIT order mirroring the paper-filled leg. Pure: no network.
+/// Fails closed on any base outside the testnet allowlist.
+pub fn binance_order_url(
+    leg: &TradeLeg,
+    api_secret: &str,
+    base: &str,
+    now_ms: i64,
+) -> Result<String, ExecError> {
+    let url = reqwest::Url::parse(base).map_err(|_| ExecError::RejectedHost(base.to_string()))?;
+    let host = url.host_str().unwrap_or_default().to_string();
+    if url.scheme() != "https" || !BINANCE_HOSTS.contains(&host.as_str()) {
+        return Err(ExecError::RejectedHost(
+            url.host_str().unwrap_or(base).to_string(),
+        ));
+    }
+    let side = match leg.side {
+        Side::Buy => "BUY",
+        Side::Sell => "SELL",
+    };
+    let query = format!(
+        "symbol={}{}&side={side}&type=LIMIT&timeInForce=GTC&quantity={}&price={}&timestamp={now_ms}",
+        leg.symbol.base, leg.symbol.quote, leg.qty_base, leg.price
+    );
+    Ok(format!(
+        "{}/api/v3/order?{}",
+        base.trim_end_matches('/'),
+        sign_query(api_secret, &query)
+    ))
+}
+
+/// Send one paper-filled Binance leg as a LIMIT order. Returns the raw body on
+/// 2xx. Call only after [`LiveExecutor::guard`] passes; tests cover URL shape
+/// instead (no network in tests).
+pub async fn send_binance_limit(
+    leg: &TradeLeg,
+    keys: &VenueKeys,
+    base: &str,
+    now_ms: i64,
+) -> Result<String, ExecError> {
+    let url = binance_order_url(leg, &keys.api_secret, base, now_ms)?;
+    // Same explicit ring provider as arb-feed's live WS tasks.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let client = reqwest::Client::builder()
+        .build()
+        .map_err(|e| ExecError::Transport(e.to_string()))?;
+    let resp = client
+        .post(url)
+        .header("X-MBX-APIKEY", &keys.api_key)
+        .send()
+        .await
+        .map_err(|e| ExecError::Transport(e.to_string()))?;
+    let status = resp.status();
+    let body = resp
+        .text()
+        .await
+        .map_err(|e| ExecError::Transport(e.to_string()))?;
+    if status.is_success() {
+        Ok(body)
+    } else {
+        Err(ExecError::BinanceRejected {
+            status: status.as_u16(),
+            body,
+        })
     }
 }
 
@@ -167,5 +260,68 @@ mod tests {
         };
         assert!(matches!(ex.guard(&intent), Err(ExecError::NotArmed { .. })));
         assert!(sign_query("s", "a=1").starts_with("a=1&signature="));
+    }
+
+    fn buy_leg() -> TradeLeg {
+        TradeLeg {
+            venue: Venue::Binance,
+            symbol: Symbol::new("BTC", "USDT"),
+            side: Side::Buy,
+            price: dec!(80000),
+            qty_base: dec!(0.001),
+            market: MarketKind::Spot,
+        }
+    }
+
+    #[test]
+    fn binance_order_url_shapes_signed_limit() {
+        let url = binance_order_url(
+            &buy_leg(),
+            "secret",
+            BINANCE_TESTNET_BASE,
+            1_700_000_000_000,
+        )
+        .unwrap();
+        assert!(
+            url.starts_with("https://testnet.binance.vision/api/v3/order?"),
+            "{url}"
+        );
+        for part in [
+            "symbol=BTCUSDT",
+            "side=BUY",
+            "type=LIMIT",
+            "timeInForce=GTC",
+            "quantity=0.001",
+            "price=80000",
+            "timestamp=1700000000000",
+        ] {
+            assert!(url.contains(part), "{url}");
+        }
+        // Signature reuses sign_query over the same unsigned query.
+        let qs = url.split('?').nth(1).unwrap();
+        let unsigned = qs.rsplit_once("&signature=").unwrap().0;
+        assert_eq!(qs, sign_query("secret", unsigned));
+        let sig = qs.rsplit_once("&signature=").unwrap().1;
+        assert_eq!(sig.len(), 64);
+        assert!(sig.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn binance_allowlist_refuses_non_testnet() {
+        let leg = buy_leg();
+        for base in [
+            "https://api.binance.com",       // mainnet
+            "http://testnet.binance.vision", // plain HTTP to the right host
+            "https://evil-testnet.binance.vision.evil.com",
+            "not a url",
+        ] {
+            assert!(
+                matches!(
+                    binance_order_url(&leg, "s", base, 1),
+                    Err(ExecError::RejectedHost(_))
+                ),
+                "{base}"
+            );
+        }
     }
 }

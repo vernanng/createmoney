@@ -419,7 +419,7 @@ manifest to auto-update on Apple Silicon.
    (it gets none today and cannot fire), and
    for DEX an alloy provider +
    signer in `dex-evm` (V3 via Quoter `eth_call`) plus Jupiter `/swap`
-   build + Solana send in `dex-sol`.
+   build + Solana send in `dex-sol`. Chain reads/sends will use HTTP RPC endpoints (`EVM_RPC_URL`/`SOLANA_RPC_URL`); the WSS keys are reserved for future subscription feeds.
 4. Set keys in env, set `mode = "live"`, keep caps tiny. The executor
    refuses to arm without keys; the kill-switch (`POST /kill`) blocks all
    intents. Verify Indodax fees, and confirm `/status` shows

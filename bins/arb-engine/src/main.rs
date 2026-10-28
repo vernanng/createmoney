@@ -506,6 +506,22 @@ impl Engine {
             }
             match self.paper.execute(&intent, &view.books, now) {
                 Ok(result) => {
+                    // Live Binance legs (testnet): collect while `intent` is still
+                    // borrowed; sends spawn after the paper accounting below, so a
+                    // send failure can only log — never lose the paper fill.
+                    let live_legs =
+                        if self.live.mode == ExecMode::Live && self.live.guard(&intent).is_ok() {
+                            intent
+                                .legs
+                                .iter()
+                                .filter(|l| l.venue == Venue::Binance)
+                                .filter_map(|leg| {
+                                    self.live.keys_for(leg.venue).map(|k| (leg.clone(), k))
+                                })
+                                .collect::<Vec<_>>()
+                        } else {
+                            Vec::new()
+                        };
                     {
                         let m = self
                             .per_strategy
@@ -528,6 +544,17 @@ impl Engine {
                     };
                     if let Err(e) = self.store.record_trade(stored) {
                         tracing::error!(%e, "store write failed");
+                    }
+                    for (leg, keys) in live_legs {
+                        tokio::spawn(async move {
+                            let base = arb_exec::binance_api_base();
+                            if let Err(e) =
+                                arb_exec::send_binance_limit(&leg, &keys, &base, arb_core::now_ms())
+                                    .await
+                            {
+                                tracing::error!(%e, "live Binance send failed; paper fill kept");
+                            }
+                        });
                     }
                 }
                 Err(e) => {
