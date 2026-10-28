@@ -7,7 +7,7 @@ symbols = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "DOGE/USDT", "BNB/USD
 [engine]
 mode = "paper"        # paper | live (live still requires *_API_KEY env vars)
 tick_ms = 250
-api_addr = "127.0.0.1:8787"
+api_addr = "0.0.0.0:8787"
 jsonl_path = "paper-trades.jsonl"
 
 [strategies]
@@ -28,7 +28,7 @@ dex_max_quote_age_ms = 30000  # polled DEX quotes older than this never reach ce
 imbalance_threshold = 0.1  # S6 gate on cross_exchange; off unless set
 
 [indodax]
-usd_idr = 19000        # fallback reference for the FX-triangle strategy; book conversion always uses the streamed live rate
+usd_idr = 18000        # fallback reference for the FX-triangle strategy; book conversion always uses the streamed live rate
 rate_max_age_ms = 30000        # live USDT/IDR book older than this stops being the divisor
 rate_max_spread_bps = 50       # live USDT/IDR top-of-book spread cap (bps of mid)
 rate_max_deviation_bps = 300   # vs independent consensus (Upbit ID + implied crosses); beyond it Indodax is withheld
