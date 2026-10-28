@@ -164,11 +164,12 @@ impl Engine {
 
         let mut strategies: Vec<Box<dyn Strategy>> = Vec::new();
         if cfg.strategies.cross_exchange {
-            strategies.push(Box::new(CrossExchange::new(
-                params.clone(),
-                cex.clone(),
-                symbols.clone(),
-            )));
+            let mut cross = CrossExchange::new(params.clone(), cex.clone(), symbols.clone());
+            // S6: off unless configured; a set threshold gates every pair.
+            if let Some(t) = cfg.params.imbalance_threshold {
+                cross = cross.with_imbalance(t);
+            }
+            strategies.push(Box::new(cross));
         }
         if cfg.strategies.triangular {
             strategies.push(Box::new(Triangular::new(

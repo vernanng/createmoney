@@ -126,10 +126,10 @@ Assumes pre-funded inventory on every venue — no transfers inside the loop.
   for this strategy.
 - Buy and sell venues must differ. Edge is net of both venues' taker fees
   plus `slip_buffer_bps`.
-- Optional **S6 imbalance gate** (`with_imbalance(t)`): also require the
+- Optional **S6 imbalance gate**: also require the
   buy-side book to be bid-heavy and the sell-side book ask-heavy (see
-  [S6](#s6-imbalance--a-gate-on-cross_exchange-not-a-strategy)). Off by
-  default in the engine binary.
+  [S6](#s6-imbalance--a-gate-on-cross_exchange-not-a-strategy)). Off unless
+  `[params] imbalance_threshold` is set.
 - Emits at most one intent per symbol per tick. `roundtrip = true`.
 
 ### 2. `triangular` — one-venue cycles
@@ -252,9 +252,9 @@ intents of its own): `imbalance = (bid_qty − ask_qty) / (bid_qty +
 ask_qty)` in [−1, 1]. `both_sided_agrees(buy, sell, t)` requires the cheap
 side to be bid-heavy (`> t`, about to rise) **and** the rich side ask-heavy
 (`< −t`, about to fall) — only take spreads both books agree will converge.
-Enable via `CrossExchange::with_imbalance(threshold)` (e.g. 0.2); the
-engine binary currently constructs `CrossExchange::new`, so the gate is
-**off in the shipped wiring** and covered by unit tests instead.
+Set `[params] imbalance_threshold` (e.g. 0.2) to enable it in the
+engine; unset means off (legacy behavior). The strategy-level switch stays
+`CrossExchange::with_imbalance(threshold)`.
 
 ### S7 `fee_table` — per-route thresholds (library, not engine-wired)
 
@@ -337,6 +337,7 @@ Top-level `venues` / `symbols` must stay above the first `[table]` header.
 | `[strategies]` | all `true` | toggles for `cross_exchange`, `triangular`, `funding_rate`, `cex_dex` (`lag_chase`/`fx_triangle` ride on `cross_exchange`) |
 | `[params]` | see [Shared contract](#shared-contract) | `min_edge_bps`, `slip_buffer_bps`, `target_notional_quote`, `max_book_age_ms`, `ttl_ms` |
 | `[params] min_funding_annualized_bps` | 500 | funding-rate entry bar |
+| `[params] imbalance_threshold` | unset (off) | S6 gate: both-sided imbalance bar, e.g. 0.2 |
 | `[indodax] usd_idr` | 19000 | fallback reference for the strategy's own math; book conversion always uses the streamed live rate |
 | `[indodax] rate_max_age_ms` | 30000 | max age of the live USDT/IDR book used as divisor |
 | `[indodax] rate_max_spread_bps` | 50 | max USDT/IDR top-of-book spread (bps of mid) |
@@ -446,8 +447,8 @@ manifest to auto-update on Apple Silicon.
   funding prints and cannot fire.
 - `cex_dex` has no live quote source yet: the engine carries no DEX
   quotes, so it cannot fire either.
-- S6 imbalance gate is implemented and tested but off in the engine
-  binary's wiring; S7 fee table is a test-only harness, not engine-wired.
+- S6 imbalance gate is wired behind `[params] imbalance_threshold`
+  (off unless set); S7 fee table is a test-only harness, not engine-wired.
 - Cross-exchange assumes pre-funded balances on both venues; rebalancing
   and transfer costs are out of loop and unmodeled.
 

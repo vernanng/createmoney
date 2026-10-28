@@ -23,6 +23,7 @@ target_notional_quote = 10
 max_book_age_ms = 2000
 ttl_ms = 1500
 min_funding_annualized_bps = 500
+#imbalance_threshold = 0.2  # S6 gate on cross_exchange; off unless set
 
 [indodax]
 usd_idr = 19000        # fallback reference for the FX-triangle strategy; book conversion always uses the streamed live rate

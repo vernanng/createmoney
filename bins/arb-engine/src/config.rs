@@ -93,6 +93,10 @@ pub struct ParamsCfg {
     pub ttl_ms: i64,
     #[serde(default = "default_min_funding")]
     pub min_funding_annualized_bps: Decimal,
+    /// S6 gate: None = off (legacy behavior). Some(t) requires both-sided
+    /// imbalance agreement at threshold t before `cross_exchange` emits.
+    #[serde(default)]
+    pub imbalance_threshold: Option<Decimal>,
 }
 fn default_ttl() -> i64 {
     1_500
@@ -204,5 +208,34 @@ max_book_age_ms = 2000
         assert_eq!(cfg.indodax.rate_max_spread_bps, Decimal::new(50, 0));
         assert_eq!(cfg.indodax.rate_max_deviation_bps, Decimal::new(300, 0));
         assert_eq!(cfg.indodax.usd_idr, Decimal::new(16_000, 0));
+    }
+
+    #[test]
+    fn imbalance_threshold_defaults_off_and_parses_when_set() {
+        let bare = r#"
+[engine]
+mode = "paper"
+
+[params]
+min_edge_bps = 15
+slip_buffer_bps = 5
+target_notional_quote = 1000
+max_book_age_ms = 2000
+"#;
+        let cfg: Config = toml::from_str(bare).unwrap();
+        assert_eq!(cfg.params.imbalance_threshold, None);
+        let gated = r#"
+[engine]
+mode = "paper"
+
+[params]
+min_edge_bps = 15
+slip_buffer_bps = 5
+target_notional_quote = 1000
+max_book_age_ms = 2000
+imbalance_threshold = 0.2
+"#;
+        let cfg: Config = toml::from_str(gated).unwrap();
+        assert_eq!(cfg.params.imbalance_threshold, Some(Decimal::new(2, 1)));
     }
 }
