@@ -39,10 +39,10 @@ impl PaperConfig {
     /// Documented per-venue flat withdrawal proxy (USDT per transfer).
     /// Binance, Bybit and OKX publish 1 USDT (TRC20 schedules as of
     /// 2026-10-29); Indodax publishes no static figure (fees shown in-app),
-    /// so it is set to the same 1 USDT by operator decision. Kraken varies
-    /// its USDT fee by network and changes it without notice, so it is also
-    /// operator-set to 1 USDT until verified. Re-verify on the withdrawal
-    /// screen — exchanges change these without notice.
+    /// so it is set to the same 1 USDT by operator decision. Kraken TRC20
+    /// is 1 USDT (min 6; official schedule, checked 2026-10-29) — other
+    /// networks differ, so TRC20 is the modeled rail. Re-verify on the
+    /// withdrawal screen — exchanges change these without notice.
     pub fn documented_flat_fee(venue: Venue) -> Decimal {
         match venue {
             Venue::Binance | Venue::Bybit | Venue::Okx | Venue::Indodax | Venue::Kraken => {
@@ -1027,7 +1027,7 @@ mod tests {
         assert_eq!(PaperConfig::documented_flat_fee(Venue::Okx), dec!(1));
         // Indodax publishes no static figure: operator-set to 1 like the rest.
         assert_eq!(PaperConfig::documented_flat_fee(Venue::Indodax), dec!(1));
-        // Kraken varies its USDT fee by network: operator-set to 1 until verified.
+        // Kraken TRC20 is 1 USDT per the official schedule (other networks differ).
         assert_eq!(PaperConfig::documented_flat_fee(Venue::Kraken), dec!(1));
         let cfg = PaperConfig::default();
         // Stablecoin move: flat applies 1:1 on top of the bps leg.

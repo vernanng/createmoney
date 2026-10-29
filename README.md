@@ -472,7 +472,7 @@ manifest to auto-update on Apple Silicon.
 - OKX v5: https://www.okx.com/docs-v5/en/
 - Indodax: https://raw.githubusercontent.com/btcid/indodax-official-api-docs/master/Marketdata-websocket.md
 - Kraken WS v2: https://docs.kraken.com/api/docs/websocket-v2 · book channel: https://docs.kraken.com/api/docs/websocket-v2/book
-- Withdrawal fees (transfer schedule, checked 2026-10-29): Binance/Bybit/OKX 1 USDT on TRC20 per their official fee schedules; Indodax publishes no static figure (https://help.indodax.com/hc/en-us/articles/4416646599705-Indodax-Detailed-Fees shows fees in-app only), operator-set to 1 USDT; Kraken varies its USDT fee by network, operator-set to 1 USDT until verified. Re-verify on the withdrawal screen.
+- Withdrawal fees (transfer schedule, checked 2026-10-29): Binance/Bybit/OKX 1 USDT on TRC20 per their official fee schedules; Indodax publishes no static figure (https://help.indodax.com/hc/en-us/articles/4416646599705-Indodax-Detailed-Fees shows fees in-app only), operator-set to 1 USDT; Kraken TRC20 is 1 USDT (min 6) per its official schedule, other networks differ. Re-verify on the withdrawal screen.
 - Jupiter: https://developers.jup.ag/docs/swap-api
 - Rust crates: https://docs.rs/tokio/latest/tokio/ · https://docs.rs/rust_decimal/latest/rust_decimal/ · https://alloy.rs/
 
