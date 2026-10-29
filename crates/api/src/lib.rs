@@ -27,7 +27,7 @@ pub struct ConnectorHealth {
 /// Engine-boundary funnel counters for one strategy: how many intents it
 /// emitted, and where they stopped. Decisions inside a strategy (for
 /// example stale-book skips before emitting) are not counted here.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct StrategyMetrics {
     pub scans: u64,
     pub emitted: u64,
@@ -96,11 +96,18 @@ pub struct PortfolioStatus {
 }
 
 /// One open position held by a strategy, shown as a pending order.
+/// `qty_base` + `entry_price_quote` come from the opening trade in history;
+/// `mark_price_quote` + `market_value_quote` use the same live marks as
+/// equity (None when no fresh mark exists — shown as stale, never guessed).
 #[derive(Debug, Clone, Serialize)]
 pub struct OpenPosition {
     pub strategy: String,
     pub venue: Venue,
     pub symbol: String,
+    pub qty_base: Decimal,
+    pub entry_price_quote: Option<Decimal>,
+    pub mark_price_quote: Option<Decimal>,
+    pub market_value_quote: Option<Decimal>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -277,6 +284,13 @@ pub fn render_flows_envelope(items: &[serde_json::Value], total: usize) -> Strin
 
 /// The viewer page, served as `GET /viewer` by the engine binary.
 pub const VIEWER_HTML: &str = include_str!("viewer.html");
+/// The ops dashboard, served as `GET /dashboard` (viewer stays as-is).
+pub const DASHBOARD_HTML: &str = include_str!("dashboard.html");
+
+/// Per-strategy funnel counters as JSON (read-open, like `/status`).
+pub fn render_strategies(per_strategy: &BTreeMap<String, StrategyMetrics>) -> String {
+    serde_json::to_string(per_strategy).unwrap_or_else(|_| "{}".into())
+}
 
 /// Viewer routes. Returns (status_code, body, content_type) when matched.
 /// `flows_body` is the snapshot rendered by [`render_flows_envelope`].
@@ -288,6 +302,20 @@ pub fn route_viewer(
     match (method, path) {
         ("GET", "/flows") => Some((200, flows_body.to_string(), "application/json")),
         ("GET", "/viewer") => Some((200, VIEWER_HTML.to_string(), "text/html")),
+        _ => None,
+    }
+}
+
+/// Dashboard routes. Returns (status_code, body, content_type) when matched.
+/// `strategies_body` is the snapshot rendered by [`render_strategies`].
+pub fn route_dashboard(
+    method: &str,
+    path: &str,
+    strategies_body: &str,
+) -> Option<(u16, String, &'static str)> {
+    match (method, path) {
+        ("GET", "/dashboard") => Some((200, DASHBOARD_HTML.to_string(), "text/html")),
+        ("GET", "/strategies") => Some((200, strategies_body.to_string(), "application/json")),
         _ => None,
     }
 }
@@ -388,6 +416,10 @@ mod tests {
                 strategy: "funding_rate".into(),
                 venue: Venue::Bybit,
                 symbol: "BTC/USDT".into(),
+                qty_base: dec!(0.5),
+                entry_price_quote: Some(dec!(100)),
+                mark_price_quote: Some(dec!(101)),
+                market_value_quote: Some(dec!(50.5)),
             }],
             usdt_idr: UsdtIdrHealth {
                 mid: Some(dec!(18111.5)),
@@ -465,7 +497,7 @@ mod tests {
             "status body: {body}"
         );
         assert!(
-            body.contains("\"open_positions\":[{\"strategy\":\"funding_rate\",\"venue\":\"bybit\",\"symbol\":\"BTC/USDT\"}]"),
+            body.contains("\"open_positions\":[{\"strategy\":\"funding_rate\",\"venue\":\"bybit\",\"symbol\":\"BTC/USDT\",\"qty_base\":\"0.5\""),
             "status body: {body}"
         );
         assert_eq!(route("GET", "/nope", &mut c, &st, &m, None).0, 404);
@@ -548,5 +580,37 @@ mod tests {
         }
         assert!(route_viewer("GET", "/nope", &body).is_none());
         assert!(route_viewer("POST", "/flows", &body).is_none());
+    }
+
+    #[test]
+    fn dashboard_and_strategies() {
+        let per = BTreeMap::from([(
+            "cross_exchange".to_string(),
+            StrategyMetrics {
+                scans: 10,
+                emitted: 5,
+                risk_rejected: 1,
+                fill_failed: 1,
+                filled: 3,
+                dup_skipped: 2,
+                realized_pnl_quote: dec!(1.5),
+            },
+        )]);
+        let body = render_strategies(&per);
+        assert!(body.contains("cross_exchange"), "strategies body: {body}");
+        assert!(body.contains("\"filled\":3"), "strategies body: {body}");
+        let (code, page, ctype) = route_dashboard("GET", "/dashboard", &body).unwrap();
+        assert_eq!(code, 200);
+        assert_eq!(ctype, "text/html");
+        assert!(page.contains("dashboard"), "dashboard page");
+        // Viewer stays intact alongside the dashboard.
+        let (_, viewer, _) = route_viewer("GET", "/viewer", "").unwrap();
+        assert!(viewer.contains("strategy-flow"), "viewer page");
+        let (code, out, ctype) = route_dashboard("GET", "/strategies", &body).unwrap();
+        assert_eq!(code, 200);
+        assert_eq!(ctype, "application/json");
+        assert!(out.contains("cross_exchange"), "strategies out: {out}");
+        assert!(route_dashboard("GET", "/nope", &body).is_none());
+        assert!(route_dashboard("POST", "/strategies", &body).is_none());
     }
 }

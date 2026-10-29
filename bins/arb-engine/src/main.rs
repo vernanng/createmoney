@@ -1,8 +1,9 @@
 mod config;
 
 use arb_api::{
-    render_flows_envelope, render_metrics, route, route_viewer, ConnectorHealth, Control,
-    EngineStatus, OpenPosition, PortfolioStatus, StrategyMetrics, UsdtIdrHealth, VenueBalance,
+    render_flows_envelope, render_metrics, render_strategies, route, route_dashboard, route_viewer,
+    ConnectorHealth, Control, EngineStatus, OpenPosition, PortfolioStatus, StrategyMetrics,
+    UsdtIdrHealth, VenueBalance,
 };
 use arb_core::Intent;
 use arb_core::MarketKind;
@@ -898,6 +899,61 @@ impl Engine {
             realized_pnl_quote: self.paper.realized_pnl,
             unrealized_pnl_quote: self.paper.unrealized_pnl_quote(&marks),
         };
+        // Entry size from the latest matching stored trade; live mark from
+        // the same marks used for equity (None = stale, shown as stale).
+        // shortcut: missing history means unknown size, not zero-size.
+        let open_positions: Vec<OpenPosition> = self
+            .strategies
+            .iter()
+            .flat_map(|st| {
+                let name = st.name().to_string();
+                st.open_positions()
+                    .into_iter()
+                    .map(|(venue, symbol)| (name.clone(), venue, symbol))
+                    .collect::<Vec<_>>()
+            })
+            .map(|(name, venue, symbol)| {
+                let sym = symbol.to_string();
+                let base = sym.split('/').next().unwrap_or("").to_string();
+                let found: Option<(Decimal, Decimal)> = self
+                    .store
+                    .trades()
+                    .iter()
+                    .rev()
+                    .find(|t| {
+                        t.intent.strategy == name
+                            && t.intent
+                                .legs
+                                .iter()
+                                .any(|l| l.venue == venue && l.symbol.to_string() == sym)
+                    })
+                    .and_then(|t| {
+                        t.intent
+                            .legs
+                            .iter()
+                            .find(|l| l.venue == venue && l.symbol.to_string() == sym)
+                            .map(|l| (l.qty_base, l.price))
+                    });
+                let (qty_base, entry_price_quote) = match found {
+                    Some((q, p)) if q > Decimal::ZERO => (q, Some(p)),
+                    _ => (Decimal::ZERO, None),
+                };
+                let (mark_price_quote, market_value_quote) =
+                    match (marks.get(&base), qty_base > Decimal::ZERO) {
+                        (Some(m), true) => (Some(*m), Some(qty_base * *m)),
+                        _ => (None, None),
+                    };
+                OpenPosition {
+                    strategy: name,
+                    venue,
+                    symbol: sym,
+                    qty_base,
+                    entry_price_quote,
+                    mark_price_quote,
+                    market_value_quote,
+                }
+            })
+            .collect();
         EngineStatus {
             mode: self.cfg.engine.mode.clone(),
             killed,
@@ -939,20 +995,7 @@ impl Engine {
                 .collect(),
             paused_strategies,
             imbalance_threshold: self.cfg.params.imbalance_threshold,
-            open_positions: self
-                .strategies
-                .iter()
-                .flat_map(|st| {
-                    let name = st.name().to_string();
-                    st.open_positions()
-                        .into_iter()
-                        .map(move |(venue, symbol)| OpenPosition {
-                            strategy: name.clone(),
-                            venue,
-                            symbol: symbol.to_string(),
-                        })
-                })
-                .collect(),
+            open_positions,
             usdt_idr: {
                 let d = &self.last_fx;
                 UsdtIdrHealth {
@@ -987,7 +1030,7 @@ async fn serve_api(addr: String, token: Option<String>, shared: Arc<Shared>) {
         // set API_TOKEN. Reads stay open either way.
         tracing::warn!(addr, "control API on a non-loopback bind without API_TOKEN; POST /kill /revive /pause /resume need ?token=");
     }
-    tracing::info!(addr, "control API listening (GET /health /status /metrics /flows /viewer, POST /kill /revive /pause/<s> /resume/<s>)");
+    tracing::info!(addr, "control API listening (GET /health /status /metrics /flows /viewer /dashboard /strategies, POST /kill /revive /pause/<s> /resume/<s>)");
     loop {
         let Ok((mut sock, _)) = listener.accept().await else {
             continue;
@@ -1052,7 +1095,10 @@ async fn serve_api(addr: String, token: Option<String>, shared: Arc<Shared>) {
                     .lock()
                     .map(|f| f.clone())
                     .unwrap_or_else(|_| render_flows_envelope(&[], 0));
+                let strategies = render_strategies(&per);
                 if let Some(hit) = route_viewer(method, path, &flows) {
+                    hit
+                } else if let Some(hit) = route_dashboard(method, path, &strategies) {
                     hit
                 } else {
                     match shared.control.lock() {
@@ -1491,6 +1537,68 @@ max_book_age_ms = 2000
                 (Venue::Binance, Symbol::new("ETH", "USDT")),
             ]
         );
+    }
+
+    #[test]
+    fn status_enriches_open_positions_with_entry_and_live_mark() {
+        // A restored funding entry must surface qty + entry $ from history
+        // and a live mark + market value from the anchor marks (no books).
+        let path = std::env::temp_dir().join(format!("dash-open-pos-{}.jsonl", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let trade = StoredTrade {
+            intent: Intent {
+                strategy: "funding_rate".into(),
+                expected_edge_bps: Decimal::new(20, 0),
+                ttl_ms: 100,
+                created_ms: 0,
+                roundtrip: false,
+                legs: vec![TradeLeg {
+                    venue: Venue::Binance,
+                    symbol: Symbol::new("BTC", "USDT"),
+                    side: Side::Buy,
+                    price: Decimal::new(80_000, 0),
+                    qty_base: Decimal::new(5, 1),
+                    market: MarketKind::Spot,
+                }],
+            },
+            fills: vec![],
+            realized_pnl_quote: None,
+            ts_ms: 1,
+            session_id: "old".into(),
+            engine_version: "0.1.0".into(),
+        };
+        MemoryStore::with_jsonl(&path)
+            .unwrap()
+            .record_trade(trade)
+            .unwrap();
+        let cfg: config::Config = toml::from_str(&format!(
+            r#"
+venues = ["binance"]
+symbols = ["BTC/USDT"]
+
+[engine]
+mode = "paper"
+jsonl_path = "{}"
+
+[params]
+min_edge_bps = 15
+slip_buffer_bps = 5
+target_notional_quote = 1000
+max_book_age_ms = 2000
+"#,
+            path.display()
+        ))
+        .unwrap();
+        let engine = Engine::new(cfg).unwrap();
+        let st = engine.status();
+        assert_eq!(st.open_positions.len(), 1);
+        let o = &st.open_positions[0];
+        assert_eq!(o.qty_base, Decimal::new(5, 1));
+        assert_eq!(o.entry_price_quote, Some(Decimal::new(80_000, 0)));
+        // Anchor mark (no live books): BTC/USDT 80000, value 0.5 * 80000.
+        assert_eq!(o.mark_price_quote, Some(Decimal::new(80_000, 0)));
+        assert_eq!(o.market_value_quote, Some(Decimal::new(40_000, 0)));
+        let _ = std::fs::remove_file(&path);
     }
 
     fn buy_intent(notional: Decimal) -> Intent {
