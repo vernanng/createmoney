@@ -460,7 +460,9 @@ manifest to auto-update on Apple Silicon.
 - S6 imbalance gate is wired behind `[params] imbalance_threshold`
   (off unless set); S7 fee table is a test-only harness, not engine-wired.
 - Cross-exchange assumes pre-funded balances on both venues; rebalancing
-  and transfer costs are out of loop and unmodeled.
+  stays out of the strategy loop by design (no pre-trade gate), but every
+  virtual transfer burns its sender's per-venue fee and debits strategy +
+  engine realized PnL, so friction shows up in the numbers.
 
 ## Sources (official docs used for connector facts)
 
@@ -468,6 +470,7 @@ manifest to auto-update on Apple Silicon.
 - Bybit V5: https://bybit-exchange.github.io/docs/v5/ws/connect
 - OKX v5: https://www.okx.com/docs-v5/en/
 - Indodax: https://raw.githubusercontent.com/btcid/indodax-official-api-docs/master/Marketdata-websocket.md
+- Withdrawal fees (transfer schedule, checked 2026-10-29): Binance/Bybit/OKX 1 USDT on TRC20 per their official fee schedules; Indodax publishes no static figure (https://help.indodax.com/hc/en-us/articles/4416646599705-Indodax-Detailed-Fees shows fees in-app only), operator-set to 1 USDT. Re-verify on the withdrawal screen.
 - Jupiter: https://developers.jup.ag/docs/swap-api
 - Rust crates: https://docs.rs/tokio/latest/tokio/ · https://docs.rs/rust_decimal/latest/rust_decimal/ · https://alloy.rs/
 

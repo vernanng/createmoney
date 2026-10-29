@@ -16,6 +16,10 @@ pub struct PaperConfig {
     /// from the sender, and the receiver cannot spend the funds until
     /// `transfer_delay_ms` has passed.
     pub transfer_fee_bps: Decimal,
+    /// Flat per-transfer fee in quote terms (USDT), keyed by SENDING venue.
+    /// Overrides the documented schedule below; venues absent here fall back
+    /// to it, so an empty map means the official figures apply.
+    pub transfer_fees: BTreeMap<Venue, Decimal>,
     pub transfer_delay_ms: i64,
 }
 
@@ -25,8 +29,49 @@ impl Default for PaperConfig {
             fee_bps_override: None,
             extra_slip_bps: Decimal::new(2, 0),
             transfer_fee_bps: Decimal::ZERO,
+            transfer_fees: BTreeMap::new(),
             transfer_delay_ms: 0,
         }
+    }
+}
+
+impl PaperConfig {
+    /// Documented per-venue flat withdrawal proxy (USDT per transfer).
+    /// Binance, Bybit and OKX publish 1 USDT (TRC20 schedules as of
+    /// 2026-10-29); Indodax publishes no static figure (fees shown in-app),
+    /// so it is set to the same 1 USDT by operator decision. Re-verify on
+    /// the withdrawal screen — exchanges change these without notice.
+    pub fn documented_flat_fee(venue: Venue) -> Decimal {
+        match venue {
+            Venue::Binance | Venue::Bybit | Venue::Okx | Venue::Indodax => Decimal::new(1, 0),
+            _ => Decimal::ZERO,
+        }
+    }
+
+    /// Friction for moving `short` units of `asset` off `venue`, denominated
+    /// in `asset`: the flat USDT proxy converted at `px` (quote per base
+    /// unit) for non-stable moves, 1:1 for stablecoin moves, plus the
+    /// proportional haircut. `px` is the leg's executable price; a
+    /// non-positive price degrades to the bps leg only, never a divide-by-zero.
+    fn transfer_cost(&self, venue: Venue, asset: &str, short: Decimal, px: Decimal) -> Decimal {
+        let flat_quote = self
+            .transfer_fees
+            .get(&venue)
+            .copied()
+            .unwrap_or_else(|| Self::documented_flat_fee(venue));
+        let flat = if flat_quote == Decimal::ZERO {
+            Decimal::ZERO
+        } else {
+            let a = asset.to_uppercase();
+            if a == "USDT" || a == "USDC" {
+                flat_quote
+            } else if px > Decimal::ZERO {
+                flat_quote / px
+            } else {
+                Decimal::ZERO
+            }
+        };
+        flat + fee_amount(short, self.transfer_fee_bps)
     }
 }
 
@@ -35,6 +80,19 @@ pub struct PaperFill {
     pub fills: Vec<Fill>,
     /// Realized PnL in quote terms for closed round-trip intents, else None.
     pub realized_pnl_quote: Option<Decimal>,
+}
+
+/// Restate an asset-denominated transfer fee in quote terms (USDT).
+/// Stablecoin moves are 1:1; base moves convert at the leg price `px`.
+/// A non-positive price degrades to the unconverted fee, never a multiply
+/// by zero that would silently erase the cost.
+fn fee_quote_for(asset: &str, fee_asset: Decimal, px: Decimal) -> Decimal {
+    let a = asset.to_uppercase();
+    if a == "USDT" || a == "USDC" || px <= Decimal::ZERO {
+        fee_asset
+    } else {
+        fee_asset * px
+    }
 }
 
 /// One virtual rebalance between venue ledgers. Paper-only: live mode never
@@ -47,6 +105,10 @@ pub struct Transfer {
     pub asset: String,
     pub amount: Decimal,
     pub fee: Decimal,
+    /// Same friction in quote terms (USDT), for realized-PnL accounting.
+    /// Stablecoin moves are 1:1; base moves convert at the leg price.
+    #[serde(default)]
+    pub fee_quote: Decimal,
     pub ts_ms: i64,
     pub available_at_ms: i64,
 }
@@ -315,8 +377,9 @@ impl PaperExecutor {
 
     /// Cover an intent's inventory shortfalls with virtual venue-to-venue
     /// transfers (paper-only). Loops until every leg is fundable or no donor
-    /// covers the next shortfall. Each transfer burns `transfer_fee_bps`
-    /// from the sender and honors `transfer_delay_ms` before crediting.
+    /// covers the next shortfall. Each transfer burns the sending venue's
+    /// own friction (flat withdrawal proxy + `transfer_fee_bps`) from the
+    /// sender and honors `transfer_delay_ms` before crediting.
     pub fn rebalance_for(
         &mut self,
         intent: &Intent,
@@ -338,31 +401,35 @@ impl PaperExecutor {
             ));
         }
         loop {
-            let mut next: Option<(Venue, String, Decimal)> = None; // (venue, asset, short)
+            // (venue, asset, short, leg price for fee conversion)
+            let mut next: Option<(Venue, String, Decimal, Decimal)> = None;
             for (leg, px, fee) in &priced {
                 if let Some((asset, short)) = self.shortfall(&self.balances, leg, *px, *fee) {
-                    next = Some((leg.venue, asset, short));
+                    next = Some((leg.venue, asset, short, *px));
                     break;
                 }
             }
-            let Some((venue, asset, short)) = next else {
+            let Some((venue, asset, short, px)) = next else {
                 break;
             };
-            let tfee = fee_amount(short, self.cfg.transfer_fee_bps);
-            // Richest other venue that covers shortfall + fee wins.
-            let mut donor: Option<Venue> = None;
+            // Richest other venue that covers shortfall + ITS OWN fee wins:
+            // withdrawal friction differs per sender.
+            let mut donor: Option<(Venue, Decimal, Decimal)> = None;
             let mut best = Decimal::ZERO;
             for (v, m) in &self.balances {
                 if *v == venue {
                     continue;
                 }
                 let have = m.get(&asset).copied().unwrap_or_default();
+                let tfee = self.cfg.transfer_cost(*v, &asset, short, px);
                 if have >= short + tfee && have > best {
                     best = have;
-                    donor = Some(*v);
+                    donor = Some((*v, tfee, fee_quote_for(&asset, tfee, px)));
                 }
             }
-            let Some(from) = donor else { break };
+            let Some((from, tfee, tfee_quote)) = donor else {
+                break;
+            };
             adjust(&mut self.balances, from, &asset, -(short + tfee));
             let available_at_ms = ts_ms + self.cfg.transfer_delay_ms.max(0);
             if available_at_ms <= ts_ms {
@@ -382,6 +449,7 @@ impl PaperExecutor {
                 asset,
                 amount: short,
                 fee: tfee,
+                fee_quote: tfee_quote,
                 ts_ms,
                 available_at_ms,
             });
@@ -891,6 +959,8 @@ mod tests {
         let mut ex = PaperExecutor::new(PaperConfig {
             fee_bps_override: Some(dec!(10)),
             extra_slip_bps: dec!(0),
+            // No flat schedule here: this test covers coverage, not fees.
+            transfer_fees: BTreeMap::from([(Venue::Binance, Decimal::ZERO)]),
             ..Default::default()
         });
         ex.seed(Venue::Binance, "USDT", dec!(10000));
@@ -916,6 +986,8 @@ mod tests {
             fee_bps_override: Some(dec!(10)),
             extra_slip_bps: dec!(0),
             transfer_fee_bps: dec!(100), // 1% burned from the sender
+            // No flat schedule here: this test covers the bps leg + delay.
+            transfer_fees: BTreeMap::from([(Venue::Binance, Decimal::ZERO)]),
             transfer_delay_ms: 1000,
         });
         ex.seed(Venue::Binance, "USDT", dec!(10000));
@@ -941,5 +1013,86 @@ mod tests {
         let moved = ex.rebalance_for(&intent, &books(), 10);
         assert!(moved.is_empty());
         assert_eq!(ex.transfers, 0);
+    }
+
+    #[test]
+    fn documented_schedule_mirrors_official_withdrawal_fees() {
+        // Empty map = official USDT figures (TRC20, checked 2026-10-29).
+        assert_eq!(PaperConfig::documented_flat_fee(Venue::Binance), dec!(1));
+        assert_eq!(PaperConfig::documented_flat_fee(Venue::Bybit), dec!(1));
+        assert_eq!(PaperConfig::documented_flat_fee(Venue::Okx), dec!(1));
+        // Indodax publishes no static figure: operator-set to 1 like the rest.
+        assert_eq!(PaperConfig::documented_flat_fee(Venue::Indodax), dec!(1));
+        let cfg = PaperConfig::default();
+        // Stablecoin move: flat applies 1:1 on top of the bps leg.
+        assert_eq!(
+            cfg.transfer_cost(Venue::Binance, "USDT", dec!(100), dec!(50)),
+            dec!(1)
+        );
+        // Base move: flat USDT converts at the leg price (1/100 = 0.01 BTC).
+        assert_eq!(
+            cfg.transfer_cost(Venue::Binance, "BTC", dec!(1), dec!(100)),
+            dec!(1) / dec!(100)
+        );
+        // Explicit zero opts a venue out of the schedule.
+        let zero = PaperConfig {
+            transfer_fees: BTreeMap::from([(Venue::Binance, Decimal::ZERO)]),
+            ..Default::default()
+        };
+        assert_eq!(
+            zero.transfer_cost(Venue::Binance, "USDT", dec!(100), dec!(50)),
+            dec!(0)
+        );
+    }
+
+    #[test]
+    fn rebalance_burns_per_venue_flat_fee_in_quote_terms() {
+        // Binance buy leg needs 100.1 USDT; Binance holds 50. Okx is richer
+        // but prices itself out with a 500 USDT flat fee, so Bybit — on the
+        // documented 1 USDT schedule — covers.
+        let intent = cross_intent();
+        let mut ex = PaperExecutor::new(PaperConfig {
+            fee_bps_override: Some(dec!(10)),
+            extra_slip_bps: dec!(0),
+            transfer_fees: BTreeMap::from([(Venue::Okx, dec!(500))]),
+            ..Default::default()
+        });
+        ex.seed(Venue::Binance, "USDT", dec!(50));
+        ex.seed(Venue::Okx, "USDT", dec!(500));
+        ex.seed(Venue::Bybit, "USDT", dec!(200));
+        ex.seed(Venue::Bybit, "BTC", dec!(5));
+        let moved = ex.rebalance_for(&intent, &books(), 10);
+        assert_eq!(moved.len(), 1);
+        assert_eq!((moved[0].from, moved[0].to), (Venue::Bybit, Venue::Binance));
+        assert_eq!(moved[0].asset, "USDT");
+        assert_eq!(moved[0].amount, dec!(50.1));
+        assert_eq!(moved[0].fee, dec!(1));
+        assert_eq!(moved[0].fee_quote, dec!(1));
+        // Donor debited shortfall + its own flat fee.
+        assert_eq!(ex.balance(Venue::Bybit, "USDT"), dec!(200) - dec!(51.1));
+    }
+
+    #[test]
+    fn rebalance_converts_flat_fee_to_base_at_leg_price() {
+        // Bybit must sell 1 BTC it lacks; Binance covers. The 1 USDT flat
+        // converts at the sell leg's fill price: 1/102 BTC, quoted back.
+        let intent = cross_intent();
+        let mut ex = PaperExecutor::new(PaperConfig {
+            fee_bps_override: Some(dec!(10)),
+            extra_slip_bps: dec!(0),
+            ..Default::default() // documented schedule: Binance flat 1 USDT
+        });
+        ex.seed(Venue::Binance, "USDT", dec!(10000));
+        ex.seed(Venue::Binance, "BTC", dec!(5));
+        let moved = ex.rebalance_for(&intent, &books(), 10);
+        assert_eq!(moved.len(), 1);
+        assert_eq!(moved[0].asset, "BTC");
+        // Same operations, same order: identical rounding to production.
+        assert_eq!(moved[0].fee, dec!(1) / dec!(102));
+        assert_eq!(moved[0].fee_quote, dec!(1) / dec!(102) * dec!(102));
+        assert_eq!(
+            ex.balance(Venue::Binance, "BTC"),
+            dec!(5) - dec!(1) - dec!(1) / dec!(102)
+        );
     }
 }

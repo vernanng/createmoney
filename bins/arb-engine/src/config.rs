@@ -36,6 +36,12 @@ pub struct PaperCfg {
     /// from the sender plus settlement delay in ms before crediting.
     #[serde(default)]
     pub transfer_fee_bps: Decimal,
+    /// Flat per-transfer fee in USDT, keyed by SENDING venue
+    /// (`[paper.transfer_fees]`). Overrides the paper crate's documented
+    /// schedule (1 USDT everywhere; Indodax by operator decision); venues
+    /// absent here fall back to it, so an empty table means 1 USDT.
+    #[serde(default)]
+    pub transfer_fees: BTreeMap<Venue, Decimal>,
     #[serde(default)]
     pub transfer_delay_ms: i64,
 }
@@ -53,6 +59,7 @@ impl Default for PaperCfg {
             start_quote_per_venue: default_start_quote(),
             capital: BTreeMap::new(),
             transfer_fee_bps: Decimal::ZERO,
+            transfer_fees: BTreeMap::new(),
             transfer_delay_ms: 0,
         }
     }
@@ -384,5 +391,47 @@ max_book_age_ms = 2000
 "#;
         let cfg: Config = toml::from_str(bare).unwrap();
         assert_eq!(cfg.paper.quote_for(Venue::Binance), Decimal::new(200, 0));
+    }
+
+    #[test]
+    fn per_venue_transfer_fees_parse_and_default_empty() {
+        let text = r#"
+[engine]
+mode = "paper"
+
+[params]
+min_edge_bps = 15
+slip_buffer_bps = 5
+target_notional_quote = 1000
+max_book_age_ms = 2000
+
+[paper.transfer_fees]
+binance = 2
+indodax = 0
+"#;
+        let cfg: Config = toml::from_str(text).unwrap();
+        assert_eq!(
+            cfg.paper.transfer_fees.get(&Venue::Binance),
+            Some(&Decimal::new(2, 0))
+        );
+        assert_eq!(
+            cfg.paper.transfer_fees.get(&Venue::Indodax),
+            Some(&Decimal::ZERO)
+        );
+        assert!(!cfg.paper.transfer_fees.contains_key(&Venue::Bybit));
+        // Absent table: empty map, so the paper crate's documented
+        // schedule applies downstream.
+        let bare = r#"
+[engine]
+mode = "paper"
+
+[params]
+min_edge_bps = 15
+slip_buffer_bps = 5
+target_notional_quote = 1000
+max_book_age_ms = 2000
+"#;
+        let cfg: Config = toml::from_str(bare).unwrap();
+        assert!(cfg.paper.transfer_fees.is_empty());
     }
 }

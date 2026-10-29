@@ -323,6 +323,7 @@ impl Engine {
         // and unfunded buys abort in the paper executor.
         let mut paper = PaperExecutor::new(PaperConfig {
             transfer_fee_bps: cfg.paper.transfer_fee_bps,
+            transfer_fees: cfg.paper.transfer_fees.clone(),
             transfer_delay_ms: cfg.paper.transfer_delay_ms,
             ..Default::default()
         });
@@ -665,6 +666,12 @@ impl Engine {
                         tracing::debug!(%e, "paper fill failed");
                         continue;
                     }
+                    // Transfer friction is a realized trading cost, not free
+                    // agility: debit it from the strategy's and the engine's
+                    // realized PnL so the edge math stays honest. (The ledger
+                    // burn already happened inside the paper executor.)
+                    let transfer_cost: Decimal = moved.iter().map(|t| t.fee_quote).sum();
+                    self.debit_transfer_fees(&intent.strategy, transfer_cost);
                     for t in moved {
                         tracing::info!(from = %t.from, to = %t.to, asset = %t.asset,
                             amount = %t.amount, fee = %t.fee, "paper rebalance");
@@ -704,6 +711,20 @@ impl Engine {
         self.settle_funding(now, &view);
         self.release_closed();
         self.publish();
+    }
+
+    /// Debit realized transfer friction to one strategy and the engine total.
+    /// `total_fee_quote` is the quote-denominated sum the paper executor
+    /// stamped on the transfers that enabled this intent.
+    fn debit_transfer_fees(&mut self, strategy: &str, total_fee_quote: Decimal) {
+        if total_fee_quote == Decimal::ZERO {
+            return;
+        }
+        self.paper.realized_pnl -= total_fee_quote;
+        self.per_strategy
+            .entry(strategy.to_string())
+            .or_default()
+            .realized_pnl_quote -= total_fee_quote;
     }
 
     /// Paper accounting for one filled intent: metrics, JSONL, and (live
@@ -1599,6 +1620,37 @@ max_book_age_ms = 2000
         assert_eq!(o.mark_price_quote, Some(Decimal::new(80_000, 0)));
         assert_eq!(o.market_value_quote, Some(Decimal::new(40_000, 0)));
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn transfer_friction_debits_strategy_and_engine_realized() {
+        let cfg: config::Config = toml::from_str(
+            r#"
+venues = ["binance"]
+symbols = ["BTC/USDT"]
+
+[engine]
+mode = "paper"
+
+[params]
+min_edge_bps = 15
+slip_buffer_bps = 5
+target_notional_quote = 1000
+max_book_age_ms = 2000
+"#,
+        )
+        .unwrap();
+        let mut engine = Engine::new(cfg).unwrap();
+        engine.debit_transfer_fees("cross_exchange", Decimal::new(250, 2));
+        assert_eq!(engine.paper.realized_pnl, Decimal::new(-250, 2));
+        assert_eq!(
+            engine.per_strategy["cross_exchange"].realized_pnl_quote,
+            Decimal::new(-250, 2)
+        );
+        // Zero is a no-op (and creates no per-strategy entry).
+        engine.debit_transfer_fees("triangular", Decimal::ZERO);
+        assert!(!engine.per_strategy.contains_key("triangular"));
+        assert_eq!(engine.paper.realized_pnl, Decimal::new(-250, 2));
     }
 
     fn buy_intent(notional: Decimal) -> Intent {

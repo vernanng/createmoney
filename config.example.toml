@@ -44,6 +44,14 @@ start_quote_per_venue = 200
 # [paper.capital]
 # binance = 10000
 # transfer_fee_bps = 0    # burned from the sender on each virtual rebalance
+# Flat per-transfer fee in USDT, keyed by SENDING venue. Empty table means
+# 1 USDT everywhere (Binance/Bybit/OKX per official TRC20 schedules checked
+# 2026-10-29; Indodax by operator decision — it publishes no static figure).
+# [paper.transfer_fees]
+# binance = 1
+# bybit = 1
+# okx = 1
+# indodax = 1
 # transfer_delay_ms = 0   # settlement delay before the receiver can spend it
 # Base per asset is dynamic: ~5x target notional at the reference price.
 
