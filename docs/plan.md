@@ -87,7 +87,7 @@ Shipped: per-venue `[paper.capital]` ($10k Binance); paper self-rebalance with f
 
 ## Draft: ponytail codebase audit — what to remove (one-shot report, no code changed)
 
-Status: Draft — findings 1–6 executed on branch `refactor/prune-dead-code` (uncommitted, all gates green: test + fmt + clippy; viewer verified in Ego). Load assumed: one engine process, 250 ms ticks, paper-first, multi-day soaks.
+Status: Draft — findings 1–6 executed; code merged to `main` in #16, except the four file deletions (bundled here) which missed the first PR for unstaged removals. Load assumed: one engine process, 250 ms ticks, paper-first, multi-day soaks.
 Verdict: mostly lean; money paths are tested and no framework bloat. Fix finding 1 first (pure deletion).
 1. Delete `crates/dex-evm/src/testnet.rs` + `crates/dex-sol/src/testnet.rs` (~980 lines, zero callers, compiled into every build). Later devnet sends get rewritten at go-live.
 2. Move `Engine` out of `bins/arb-engine/src/main.rs:215-1039` into `bins/arb-engine/src/engine.rs` (824-line impl mixes startup, tick, serving). No behavior change.
