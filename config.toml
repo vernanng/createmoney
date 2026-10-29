@@ -46,10 +46,15 @@ binance = 10000  # concentrated start; missing venues use start_quote_per_venue
 jupiter_enabled = true   # public HTTP quotes for SOL/USDT, SOL/USDC; no key needed
 jupiter_poll_secs = 10
 jupiter_gas_quote = 0.01 # priority fee per swap, in quote terms
-evm_rpc_url = ""         # empty = EVM polling off (fail-closed)
-evm_pool = ""            # Uniswap V2 ETH/USDT pool address; empty = off
+evm_rpc_url = "https://ethereum.publicnode.com"  # keyless public mainnet RPC; empty = EVM polling off (fail-closed)
+evm_pool = "0x0d4a11d5EEaaC28EC3F61d100daF4d40471f1852"  # Uniswap V2 WETH/USDT pair (verified on-chain: token0=WETH, factory=V2); empty = off
 evm_token0_is_base = true # true when token0 is the base asset; wrong inverts every quote
 evm_base_decimals = 18
 evm_quote_decimals = 6
 evm_gas_quote = 0.5
 evm_poll_secs = 12
+bsc_rpc_url = "https://bsc.publicnode.com"  # keyless public BSC mainnet; empty = BSC leg off (fail-closed)
+bsc_pool = "0x16b9a82891338f9ba80e2d6970fdda79d1eb0dae"  # PancakeSwap V2 WBNB/USDT (verified on-chain: token0=USDT, token1=WBNB, factory=PancakeV2); empty = off
+bsc_token0_is_base = false # token0 is USDT quote; true would invert every BSC quote
+bsc_base_decimals = 18
+bsc_quote_decimals = 18 # BSC USDT is 18 decimals (not 6)

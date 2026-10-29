@@ -409,9 +409,9 @@ async fn main() -> anyhow::Result<()> {
         // Independent USDT/IDR cross-check for the live divisor.
         arb_feed::spawn_upbit_usdt_idr_task(&engine.shared.fx_cross);
     }
-    // Real DEX quotes in (Jupiter HTTP + one EVM V2 pool), paper execution
-    // unchanged. Each source is fail-closed: unset means no quotes, never
-    // invented ones.
+    // Real DEX quotes in (Jupiter HTTP + Uniswap V2 + PancakeSwap V2),
+    // paper execution unchanged. Each source is fail-closed: unset means
+    // no quotes, never invented ones.
     let dex_jupiter = engine.cfg.dex.jupiter_enabled.then(|| {
         let symbols = engine
             .symbols
@@ -426,12 +426,10 @@ async fn main() -> anyhow::Result<()> {
             poll_secs: engine.cfg.dex.jupiter_poll_secs,
         }
     });
-    let dex_evm = if engine.cfg.dex.evm_rpc_url.trim().is_empty()
-        || engine.cfg.dex.evm_pool.trim().is_empty()
-    {
-        None
-    } else {
-        Some(arb_feed::EvmCfg {
+    let mut dex_evm = Vec::new();
+    if !engine.cfg.dex.evm_rpc_url.trim().is_empty() && !engine.cfg.dex.evm_pool.trim().is_empty() {
+        dex_evm.push(arb_feed::EvmCfg {
+            kind: arb_feed::DexKind::UniswapV2,
             symbol: Symbol::new("ETH", "USDT"),
             rpc_url: engine.cfg.dex.evm_rpc_url.clone(),
             pool: engine.cfg.dex.evm_pool.clone(),
@@ -441,8 +439,24 @@ async fn main() -> anyhow::Result<()> {
             gas_quote: engine.cfg.dex.evm_gas_quote,
             target_notional_quote: engine.cfg.params.target_notional_quote,
             poll_secs: engine.cfg.dex.evm_poll_secs,
-        })
-    };
+        });
+    }
+    if !engine.cfg.dex.bsc_rpc_url.trim().is_empty() && !engine.cfg.dex.bsc_pool.trim().is_empty() {
+        dex_evm.push(arb_feed::EvmCfg {
+            kind: arb_feed::DexKind::PancakeV2,
+            symbol: Symbol::new("BNB", "USDT"),
+            rpc_url: engine.cfg.dex.bsc_rpc_url.clone(),
+            pool: engine.cfg.dex.bsc_pool.clone(),
+            token0_is_base: engine.cfg.dex.bsc_token0_is_base,
+            base_decimals: engine.cfg.dex.bsc_base_decimals,
+            quote_decimals: engine.cfg.dex.bsc_quote_decimals,
+            // BSC gas is cheaper; the shared EVM figure overestimates cost,
+            // which only suppresses marginal edges (fail-safe direction).
+            gas_quote: engine.cfg.dex.evm_gas_quote,
+            target_notional_quote: engine.cfg.params.target_notional_quote,
+            poll_secs: engine.cfg.dex.evm_poll_secs,
+        });
+    }
     arb_feed::spawn_dex_tasks(&engine.shared.live_dex, dex_jupiter, dex_evm);
     // Perp funding prints in (Binance/Bybit/OKX). Indodax has no perps.
     // A stalled stream degrades to no entries, never to stale ones.

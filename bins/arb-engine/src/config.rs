@@ -198,6 +198,19 @@ pub struct DexCfg {
     pub evm_gas_quote: Decimal,
     #[serde(default = "default_evm_poll_secs")]
     pub evm_poll_secs: u64,
+    /// PancakeSwap V2 on BNB Chain. Same shape as the Ethereum leg; empty
+    /// URL or pool keeps this leg off. BSC USDT is 18 decimals (not 6),
+    /// and this pool's token0 is the quote (USDT), so the default is false.
+    #[serde(default)]
+    pub bsc_rpc_url: String,
+    #[serde(default)]
+    pub bsc_pool: String,
+    #[serde(default)]
+    pub bsc_token0_is_base: bool,
+    #[serde(default = "default_eth_decimals")]
+    pub bsc_base_decimals: u32,
+    #[serde(default = "default_eth_decimals")]
+    pub bsc_quote_decimals: u32,
 }
 
 impl Default for DexCfg {
@@ -213,6 +226,11 @@ impl Default for DexCfg {
             evm_quote_decimals: default_usdt_decimals(),
             evm_gas_quote: default_evm_gas(),
             evm_poll_secs: default_evm_poll_secs(),
+            bsc_rpc_url: String::new(),
+            bsc_pool: String::new(),
+            bsc_token0_is_base: false,
+            bsc_base_decimals: default_eth_decimals(),
+            bsc_quote_decimals: default_eth_decimals(),
         }
     }
 }
