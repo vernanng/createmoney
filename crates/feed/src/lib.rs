@@ -11,7 +11,7 @@ pub mod dex;
 pub mod funding;
 pub mod fx;
 pub mod live;
-pub use dex::{spawn_dex_tasks, EvmCfg, JupiterCfg, LiveDexQuotes};
+pub use dex::{spawn_dex_tasks, DexKind, EvmCfg, JupiterCfg, LiveDexQuotes};
 pub use funding::{spawn_funding_tasks, LiveFunding};
 pub use fx::{
     implied_usdt_idr, resolve_usdt_idr, FxCrossCheck, FxSample, RateDecision, RateState,

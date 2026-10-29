@@ -66,3 +66,8 @@ start_quote_per_venue = 200
 # evm_quote_decimals = 6
 # evm_gas_quote = 0.5
 # evm_poll_secs = 12
+# bsc_rpc_url = ""         # empty = BSC leg off (fail-closed)
+# bsc_pool = ""            # PancakeSwap V2 WBNB/USDT pool address; empty = off
+# bsc_token0_is_base = false
+# bsc_base_decimals = 18
+# bsc_quote_decimals = 18  # BSC USDT is 18 decimals (not 6)

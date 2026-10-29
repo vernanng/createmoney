@@ -8,7 +8,8 @@
 //! to stale fills.
 
 use arb_core::{now_ms, Symbol, Venue};
-use arb_dex_evm::{to_dex_quote as evm_to_dex_quote, DexKind, V2Pool};
+pub use arb_dex_evm::DexKind;
+use arb_dex_evm::{to_dex_quote as evm_to_dex_quote, V2Pool};
 use arb_dex_sol::{
     buy_price as jup_buy, parse_quote as jup_parse, quote_url as jup_url, sell_price as jup_sell,
 };
@@ -103,6 +104,7 @@ pub struct JupiterCfg {
 
 #[derive(Debug, Clone)]
 pub struct EvmCfg {
+    pub kind: DexKind,
     pub symbol: Symbol,
     pub rpc_url: String,
     pub pool: String,
@@ -206,11 +208,11 @@ pub fn spawn_evm_task(shared: LiveDexQuotes, cfg: EvmCfg) {
                         )
                     };
                     let pool = V2Pool {
-                        kind: DexKind::UniswapV2,
+                        kind: cfg.kind,
                         symbol: cfg.symbol.clone(),
                         reserve_base: rb,
                         reserve_quote: rq,
-                        fee_bps: DexKind::UniswapV2.default_fee_bps(),
+                        fee_bps: cfg.kind.default_fee_bps(),
                     };
                     let spot = pool.spot_price();
                     if spot > Decimal::ZERO {
@@ -227,12 +229,14 @@ pub fn spawn_evm_task(shared: LiveDexQuotes, cfg: EvmCfg) {
     });
 }
 
-/// Start both DEX pollers. `None` skips that source (fail-closed).
-pub fn spawn_dex_tasks(shared: &LiveDexQuotes, jupiter: Option<JupiterCfg>, evm: Option<EvmCfg>) {
+/// Start both DEX pollers. `None` skips Jupiter (fail-closed); each EVM
+/// entry with an empty RPC URL or pool is skipped, so one chain configured
+/// does not require the other.
+pub fn spawn_dex_tasks(shared: &LiveDexQuotes, jupiter: Option<JupiterCfg>, evm: Vec<EvmCfg>) {
     if let Some(c) = jupiter {
         spawn_jupiter_task(shared.clone(), c);
     }
-    if let Some(c) = evm {
+    for c in evm {
         if c.rpc_url.trim().is_empty() || c.pool.trim().is_empty() {
             tracing::info!("evm dex polling off (no rpc url or pool)");
         } else {
