@@ -83,7 +83,13 @@ fn default_tick() -> u64 {
     250
 }
 fn default_venues() -> Vec<Venue> {
-    vec![Venue::Binance, Venue::Bybit, Venue::Okx, Venue::Indodax]
+    vec![
+        Venue::Binance,
+        Venue::Bybit,
+        Venue::Okx,
+        Venue::Indodax,
+        Venue::Kraken,
+    ]
 }
 fn default_symbols() -> Vec<String> {
     vec!["BTC/USDT".into(), "ETH/USDT".into()]

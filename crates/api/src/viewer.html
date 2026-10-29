@@ -117,7 +117,7 @@ const STRATS = {
   lag_chase: 0xfb923c,
   fx_triangle: 0xe2e8f0,
 };
-const CEX = ['binance', 'bybit', 'okx', 'indodax'];
+const CEX = ['binance', 'bybit', 'okx', 'indodax', 'kraken'];
 const DEX = ['uniswap', 'pancakeswap', 'jupiter'];
 const RENDER_CAP = 80; // newest trades drawn when replay is at head
 const POLL_MS = 2500;
@@ -130,7 +130,7 @@ window.addEventListener('error', (ev) => showErr('viewer error: ' + (ev.message 
 window.addEventListener('unhandledrejection', (ev) => showErr('viewer error: ' + (ev.reason || 'unknown')));
 function venuePos(name, out) {
   const ci = CEX.indexOf(name), di = DEX.indexOf(name);
-  if (ci >= 0) { const a = ci * Math.PI / 2; return out.set(Math.cos(a) * 9, 0, Math.sin(a) * 9); }
+  if (ci >= 0) { const a = ci * Math.PI * 2 / CEX.length; return out.set(Math.cos(a) * 9, 0, Math.sin(a) * 9); }
   if (di >= 0) { const a = di * Math.PI * 2 / 3 + Math.PI / 6; return out.set(Math.cos(a) * 4.5, 2.5, Math.sin(a) * 4.5); }
   return out.set(0, 5, 0);
 }

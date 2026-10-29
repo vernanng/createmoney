@@ -25,6 +25,8 @@ decision record. Beyond the original four strategies, the S-series shipped:
   harnesses (`cargo xtask ablate` runs them).
 - Live WS venue tasks, control API (`/flows`, `/viewer`, pause/resume), and
   the GHCR + Watchtower paper CD. Venue order senders remain go-live work.
+- Kraken books-only venue (spot `book` over WS v2, no sender yet): 80 bps
+  tier-1 taker, `KRAKEN_WS_URL` blank = mainnet. Verified live 2026-10-29.
 
 ## Final: local Docker build speedup (accepted `2026-10-28`)
 

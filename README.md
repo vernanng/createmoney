@@ -53,6 +53,7 @@ cargo xtask ablate    # S8 ablation matrix, then the full suite
 | Bybit | CEX | spot books, perp funding | 10 bps |
 | OKX | CEX | spot books, perp funding | 10 bps |
 | Indodax | CEX (IDR) | IDR books normalized via live USDT/IDR rate (own book, cross-checked; `[indodax] usd_idr` is only a fallback reference for the strategy's own math) | 51 bps (~0.51% incl. tax) |
+| Kraken | CEX | spot books (no sender yet) | 80 bps (0.80% tier-1) |
 | Uniswap | DEX (EVM) | V2 pools quoted locally; V3 quoter types/addresses | 30 bps V2 (0.30%) |
 | PancakeSwap | DEX (EVM) | V2 pools quoted locally; V3 quoter types/addresses | 25 bps V2 (0.25%) |
 | Jupiter | DEX (Solana) | Swap API quote URL building + parsing | 0 bps (inside the route) |
@@ -66,7 +67,7 @@ Default symbols (`config.toml`): `BTC/USDT`, `ETH/USDT`, `SOL/USDT`,
 the triangular cycles can price.
 
 **Feeds** (`crates/feed`): parsers for Binance depth/partial/bookTicker,
-Bybit orderbook, OKX books, and Indodax depth, plus `ws_url` /
+Bybit orderbook, OKX books, Indodax depth, and Kraken v2 book, plus `ws_url` /
 `subscribe_frame` helpers. The binary spawns one
 reconnecting WebSocket task per CEX venue (`spawn_venue_tasks`, 1 s → 30 s
 backoff); fresh live books win and stale venues are skipped — never
@@ -334,7 +335,7 @@ Top-level `venues` / `symbols` must stay above the first `[table]` header.
 
 | Key | Default (committed config) | Meaning |
 |---|---|---|
-| `venues` | binance, bybit, okx, indodax | CEX venues to run |
+| `venues` | binance, bybit, okx, indodax, kraken | CEX venues to run |
 | `symbols` | BTC, ETH, SOL, XRP, DOGE, BNB, ADA, LINK, TRX, LTC, DOT, AVAX, UNI, ATOM, NEAR, XLM, ETC, ALGO, FIL, SUI `/USDT` | traded pairs |
 | `[engine] mode` | `paper` | `paper` \| `live` (live still needs env keys + armed check) |
 | `[engine] tick_ms` | 250 | tick-loop period |
@@ -357,7 +358,7 @@ venue so the paper soak behaves like the live book.
 
 ```
 crates/core      types (Venue/Symbol/Intent), L2 book (snapshot/diff/VWAP/depth), decimal money math
-crates/feed      Binance/Bybit/OKX/Indodax parsers, WS URLs/frames, live WS tasks, IDR->USD books (+ deterministic SyntheticFeed kept for the S8 harness)
+crates/feed      Binance/Bybit/OKX/Indodax/Kraken parsers, WS URLs/frames, live WS tasks, IDR->USD books (+ deterministic SyntheticFeed kept for the S8 harness)
 crates/strategy  Strategy trait + MarketView; all six strategies + imbalance filter (S6); fee_table (S7) / ablate (S8) test harnesses
 crates/paper     book-walking fill simulator (fees + slippage haircut, inventory-enforced)
 crates/exec      live send gate (armed check), env key loading, HMAC-SHA256 signing, Binance + Bybit testnet senders
@@ -470,7 +471,8 @@ manifest to auto-update on Apple Silicon.
 - Bybit V5: https://bybit-exchange.github.io/docs/v5/ws/connect
 - OKX v5: https://www.okx.com/docs-v5/en/
 - Indodax: https://raw.githubusercontent.com/btcid/indodax-official-api-docs/master/Marketdata-websocket.md
-- Withdrawal fees (transfer schedule, checked 2026-10-29): Binance/Bybit/OKX 1 USDT on TRC20 per their official fee schedules; Indodax publishes no static figure (https://help.indodax.com/hc/en-us/articles/4416646599705-Indodax-Detailed-Fees shows fees in-app only), operator-set to 1 USDT. Re-verify on the withdrawal screen.
+- Kraken WS v2: https://docs.kraken.com/api/docs/websocket-v2 · book channel: https://docs.kraken.com/api/docs/websocket-v2/book
+- Withdrawal fees (transfer schedule, checked 2026-10-29): Binance/Bybit/OKX 1 USDT on TRC20 per their official fee schedules; Indodax publishes no static figure (https://help.indodax.com/hc/en-us/articles/4416646599705-Indodax-Detailed-Fees shows fees in-app only), operator-set to 1 USDT; Kraken TRC20 is 1 USDT (min 6) per its official schedule, other networks differ. Re-verify on the withdrawal screen.
 - Jupiter: https://developers.jup.ag/docs/swap-api
 - Rust crates: https://docs.rs/tokio/latest/tokio/ · https://docs.rs/rust_decimal/latest/rust_decimal/ · https://alloy.rs/
 
