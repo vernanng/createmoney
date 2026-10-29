@@ -289,12 +289,17 @@ function renderTrades() {
 function renderConns() {
   const s = state.status; if (!s) return;
   const tb = $("connTbl").querySelector("tbody");
-  const venues = new Set([...(s.connectors || []).map((c) => c.venue)]);
-  for (const t of state.flows) for (const l of (t.intent?.legs || [])) venues.add(String(l.venue).toLowerCase());
+  const seen = (s.connectors || []).map((c) => c.venue);
+  for (const t of state.flows) for (const l of (t.intent?.legs || [])) seen.push(String(l.venue).toLowerCase());
+  const venues = [...new Set(seen)].sort();
   const sel = $("fVenue");
-  const cur = state.fVenue;
-  sel.innerHTML = `<option value="">all</option>` + [...venues].sort().map((v) => `<option value="${v}">${v}</option>`).join("");
-  sel.value = cur;
+  // Rebuild the options only when the venue set changes; rebuilding every
+  // poll would dismiss the open picker on touch screens.
+  const cur = [...sel.options].map((o) => o.value);
+  if (JSON.stringify(cur) !== JSON.stringify([""].concat(venues))) {
+    sel.innerHTML = `<option value="">all</option>` + venues.map((v) => `<option value="${v}">${v}</option>`).join("");
+    sel.value = state.fVenue;
+  }
   tb.innerHTML = (s.connectors || []).map((c) => `<tr><td>${c.venue}</td>` +
     `<td class="${c.connected ? "pos" : "neg"}">${c.connected}</td><td class="num">${c.books}</td>` +
     `<td class="num">${c.fresh_books}</td><td class="dim">${c.last_book_ms ?? "—"}</td>` +
