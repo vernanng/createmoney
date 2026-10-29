@@ -208,12 +208,19 @@ pub fn parse_okx_books(book: &mut OrderBook, raw: &str) -> Result<bool, FeedErro
     let d = &v["data"][0];
     let ts: i64 = d["ts"].as_str().and_then(|s| s.parse().ok()).unwrap_or(0);
     let seq = d["seqId"].as_u64().unwrap_or(0);
+    // OKX checkpoints with prevSeqId; map it onto the Binance-style
+    // (first, final) contract. Passing seqId as both ends freezes the
+    // book forever after a single missed update.
+    let first = d["prevSeqId"]
+        .as_u64()
+        .map(|p| p.saturating_add(1))
+        .unwrap_or(seq);
     let (bids, asks) = (levels(&d["bids"])?, levels(&d["asks"])?);
     if v["action"].as_str() == Some("snapshot") || book.last_update_id == 0 {
         book.apply_snapshot(bids, asks, seq, ts);
         Ok(true)
     } else {
-        Ok(book.apply_diff(bids, asks, seq, seq, ts))
+        Ok(book.apply_diff(bids, asks, first, seq, ts))
     }
 }
 
@@ -326,6 +333,21 @@ mod tests {
         parse_okx_books(&mut b,
             r#"{"arg":{"channel":"books","instId":"BTC-USDT"},"action":"snapshot","data":[{"bids":[["99","1","0","1"]],"asks":[["100","1","0","1"]],"ts":"42","seqId":3}]}"#).unwrap();
         assert_eq!(b.best_bid().unwrap().price, dec!(99));
+    }
+
+    #[test]
+    fn okx_chained_update_accepts_and_gap_rejects() {
+        // Regression: mapping seqId onto both ends of the diff contract
+        // froze every OKX book after one missed update (0/20 fresh).
+        let snap = r#"{"arg":{"channel":"books","instId":"BTC-USDT"},"action":"snapshot","data":[{"bids":[["99","1","0","1"]],"asks":[["100","1","0","1"]],"ts":"42","seqId":10,"prevSeqId":9}]}"#;
+        let next = r#"{"arg":{"channel":"books","instId":"BTC-USDT"},"action":"update","data":[{"bids":[["98","1","0","1"]],"asks":[["100","1","0","1"]],"ts":"43","seqId":11,"prevSeqId":10}]}"#;
+        let gapped = r#"{"arg":{"channel":"books","instId":"BTC-USDT"},"action":"update","data":[{"bids":[["97","1","0","1"]],"asks":[["100","1","0","1"]],"ts":"44","seqId":14,"prevSeqId":12}]}"#;
+        let mut b = OrderBook::new(Venue::Okx, Symbol::new("BTC", "USDT"));
+        assert!(parse_okx_books(&mut b, snap).unwrap());
+        assert!(parse_okx_books(&mut b, next).unwrap());
+        assert_eq!(b.last_update_id, 11);
+        assert!(!parse_okx_books(&mut b, gapped).unwrap());
+        assert_eq!(b.last_update_id, 11);
     }
 
     #[test]

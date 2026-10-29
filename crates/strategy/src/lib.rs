@@ -37,6 +37,9 @@ pub struct MarketView {
     pub usdt_idr_mid: Option<Decimal>,
     /// Timestamp of the book that divisor came from, when live.
     pub usdt_idr_ts_ms: Option<i64>,
+    /// Per-venue USDT+USDC ledger totals this tick, backing the venue-share
+    /// cap. Empty in unit tests, where sizing falls back to full notional.
+    pub venue_quote: BTreeMap<Venue, Decimal>,
 }
 
 impl MarketView {
@@ -58,6 +61,10 @@ pub struct StrategyParams {
     /// Max age of a polled DEX quote. Pollers run every ~10 s, far slower
     /// than CEX books, so DEX quotes get their own (longer) gate.
     pub dex_max_quote_age_ms: i64,
+    /// Venue-share cap, in bps of that venue's USDT+USDC ledger. Strategies
+    /// that size single-venue entries shrink to fit it instead of emitting
+    /// intents the engine's risk gate would only reject. 0 = off.
+    pub max_venue_quote_share_bps: Decimal,
 }
 
 impl Default for StrategyParams {
@@ -69,6 +76,7 @@ impl Default for StrategyParams {
             max_book_age_ms: 2_000,
             ttl_ms: 1_500,
             dex_max_quote_age_ms: 30_000,
+            max_venue_quote_share_bps: Decimal::ZERO,
         }
     }
 }
@@ -86,6 +94,11 @@ pub trait Strategy: Send {
     fn open_positions(&self) -> Vec<(Venue, Symbol)> {
         Vec::new()
     }
+    /// A fill the engine executed for one of this strategy's intents.
+    /// Strategies that track open pairs record them here — never on
+    /// intent creation, where a later fill failure would leave phantoms.
+    /// Default: nothing to track.
+    fn note_filled(&mut self, _venue: Venue, _symbol: &Symbol) {}
 }
 
 /// Size (base qty) for a target quote notional at a reference price.

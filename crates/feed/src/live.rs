@@ -332,14 +332,21 @@ fn apply_msg(
             }
             let inst = v.get("arg")?.get("instId")?.as_str()?;
             let sym = raw.iter().find(|s| s.okx() == inst)?;
-            parse_okx_books(
+            let key = sym.to_string();
+            let accepted = parse_okx_books(
                 books
-                    .entry(sym.to_string())
+                    .entry(key.clone())
                     .or_insert_with(|| OrderBook::new(venue, sym.clone())),
                 msg,
             )
             .ok()?;
-            sym.to_string()
+            if !accepted {
+                // Sequence gap: drop the book so the next message
+                // snapshots fresh instead of freezing on dead state.
+                books.remove(&key);
+                return None;
+            }
+            key
         }
         Venue::Indodax => {
             let channel = v.get("result")?.get("channel")?.as_str()?;
@@ -445,6 +452,28 @@ mod tests {
             6,
         );
         assert!(miss.is_none());
+    }
+
+    #[test]
+    fn router_drops_okx_book_on_sequence_gap() {
+        // A gapped OKX book must resnapshot on the next message instead
+        // of freezing at a stale top (production showed 0/20 fresh).
+        let syms = vec![Symbol::new("BTC", "USDT")];
+        let mut books = BTreeMap::new();
+        let snap = r#"{"arg":{"channel":"books","instId":"BTC-USDT"},"action":"snapshot","data":[{"bids":[["99","1","0","1"]],"asks":[["100","1","0","1"]],"ts":"42","seqId":10,"prevSeqId":9}]}"#;
+        assert_eq!(
+            apply_msg(Venue::Okx, &syms, &mut books, snap, 42).as_deref(),
+            Some("BTC/USDT")
+        );
+        let gapped = r#"{"arg":{"channel":"books","instId":"BTC-USDT"},"action":"update","data":[{"bids":[["97","1","0","1"]],"asks":[["100","1","0","1"]],"ts":"44","seqId":14,"prevSeqId":12}]}"#;
+        assert!(apply_msg(Venue::Okx, &syms, &mut books, gapped, 44).is_none());
+        assert!(!books.contains_key("BTC/USDT"));
+        let resnap = r#"{"arg":{"channel":"books","instId":"BTC-USDT"},"action":"snapshot","data":[{"bids":[["97","1","0","1"]],"asks":[["100","1","0","1"]],"ts":"45","seqId":15,"prevSeqId":14}]}"#;
+        assert_eq!(
+            apply_msg(Venue::Okx, &syms, &mut books, resnap, 45).as_deref(),
+            Some("BTC/USDT")
+        );
+        assert_eq!(books["BTC/USDT"].best_bid().unwrap().price, dec!(97));
     }
 
     #[test]

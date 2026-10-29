@@ -73,6 +73,9 @@ pub struct PaperExecutor {
     /// Mark-to-market equity right after seeding. Unrealized P/L is measured
     /// against this: equity now minus baseline minus realized.
     pub starting_equity: Decimal,
+    /// Quote notional held per open funding pair, keyed (venue, "BASE/QUOTE")
+    /// with its quote asset. Recorded on fills; credited per interval.
+    pub funding_open: BTreeMap<(Venue, String), (Decimal, String)>,
 }
 
 impl Default for PaperExecutor {
@@ -91,7 +94,44 @@ impl PaperExecutor {
             balances: Balances::new(),
             pending: Vec::new(),
             starting_equity: Decimal::ZERO,
+            funding_open: BTreeMap::new(),
         }
+    }
+
+    /// Record a filled funding entry's quote notional for interval credits.
+    /// Notionals accumulate: re-entries on one pair top the position up.
+    pub fn note_funding_fill(
+        &mut self,
+        venue: Venue,
+        symbol: &str,
+        quote: &str,
+        notional_quote: Decimal,
+    ) {
+        let e = self
+            .funding_open
+            .entry((venue, symbol.to_string()))
+            .or_insert((Decimal::ZERO, quote.to_string()));
+        e.0 += notional_quote;
+    }
+
+    /// Credit one funding interval on an open pair. Positive rates pay our
+    /// short perp; negative rates charge it. Unknown pairs credit nothing.
+    /// The payout lands straight in the quote balance (and realized P/L),
+    /// like a venue credit: no ledger leg exists to move it from.
+    pub fn credit_funding(
+        &mut self,
+        venue: Venue,
+        symbol: &str,
+        rate_per_interval: Decimal,
+    ) -> Decimal {
+        let Some((notional, quote)) = self.funding_open.get(&(venue, symbol.to_string())).cloned()
+        else {
+            return Decimal::ZERO;
+        };
+        let amount = notional * rate_per_interval;
+        adjust(&mut self.balances, venue, &quote, amount);
+        self.realized_pnl += amount;
+        amount
     }
 
     /// Whole ledger, for the portfolio view. Clone is fine: called once a tick.
@@ -694,6 +734,30 @@ mod tests {
         // Fee = 0.1% of 200 = 0.2 debited from margin; no BTC created or owed.
         assert_eq!(ex.balance(Venue::Bybit, "USDT"), dec!(999.8));
         assert_eq!(ex.balance(Venue::Bybit, "BTC"), dec!(0));
+    }
+
+    #[test]
+    fn funding_credit_pays_open_pairs_only() {
+        let mut ex = PaperExecutor::default();
+        ex.seed(Venue::Bybit, "USDT", dec!(1000));
+        // Unknown pair credits nothing and mutates nothing.
+        assert_eq!(
+            ex.credit_funding(Venue::Bybit, "BTC/USDT", dec!(0.0001)),
+            dec!(0)
+        );
+        assert_eq!(ex.realized_pnl, dec!(0));
+        ex.note_funding_fill(Venue::Bybit, "BTC/USDT", "USDT", dec!(10000));
+        // One 1bp interval on 10k pays 1; negative rates charge the short.
+        assert_eq!(
+            ex.credit_funding(Venue::Bybit, "BTC/USDT", dec!(0.0001)),
+            dec!(1)
+        );
+        assert_eq!(
+            ex.credit_funding(Venue::Bybit, "BTC/USDT", dec!(-0.0001)),
+            dec!(-1)
+        );
+        assert_eq!(ex.realized_pnl, dec!(0));
+        assert_eq!(ex.balance(Venue::Bybit, "USDT"), dec!(1000));
     }
 
     #[test]

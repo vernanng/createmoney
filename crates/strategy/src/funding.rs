@@ -96,6 +96,16 @@ impl FundingStrategy {
         &self.open
     }
 
+    /// Record a filled entry. Unknown or duplicate pairs are ignored so
+    /// restarts and retries cannot double-open.
+    pub fn note_opened(&mut self, venue: Venue, symbol: &Symbol) {
+        if self.pairs.contains(&(venue, symbol.clone()))
+            && !self.open.contains(&(venue, symbol.clone()))
+        {
+            self.open.push((venue, symbol.clone()));
+        }
+    }
+
     /// S4: record one annualized print, keeping the last `exit_window`.
     pub fn record(&mut self, venue: Venue, symbol: &Symbol, ann_bps: Decimal) {
         let h = self.history.entry((venue, symbol.to_string())).or_default();
@@ -134,6 +144,10 @@ impl Strategy for FundingStrategy {
 
     fn open_positions(&self) -> Vec<(Venue, Symbol)> {
         self.open.clone()
+    }
+
+    fn note_filled(&mut self, venue: Venue, symbol: &Symbol) {
+        self.note_opened(venue, symbol);
     }
 
     fn on_tick(&mut self, view: &MarketView) -> Vec<Intent> {
@@ -176,7 +190,21 @@ impl Strategy for FundingStrategy {
                 continue;
             }
             let Some(ask) = book.best_ask() else { continue };
-            let qty = size_for_notional(self.params.target_notional_quote, ask.price);
+            // Single-venue entry: shrink to the venue-share cap instead of
+            // emitting an intent the engine's risk gate would only reject.
+            // A 500-quote print never fit a 400-quote venue at 25%.
+            let mut notional = self.params.target_notional_quote;
+            if self.params.max_venue_quote_share_bps > Decimal::ZERO {
+                if let Some(funds) = view.venue_quote.get(venue) {
+                    let cap =
+                        *funds * self.params.max_venue_quote_share_bps / Decimal::new(10_000, 0);
+                    if cap <= Decimal::ZERO {
+                        continue;
+                    }
+                    notional = notional.min(cap);
+                }
+            }
+            let qty = size_for_notional(notional, ask.price);
             if qty <= Decimal::ZERO {
                 continue;
             }
@@ -207,7 +235,8 @@ impl Strategy for FundingStrategy {
                     },
                 ],
             });
-            self.open.push((*venue, sym.clone()));
+            // Opens are recorded by `note_filled` after the engine fills
+            // the intent. Pushing here would strand phantoms on fill failure.
         }
         out
     }
@@ -284,11 +313,71 @@ mod tests {
         assert_eq!(hits[0].legs[0].side, Side::Buy);
         assert_eq!(hits[0].legs[1].market, MarketKind::Perp);
         assert_eq!(hits[0].legs[1].side, Side::Sell);
+        // Regression: the intent alone must not open the pair — only a
+        // fill may, or failed fills strand phantoms that never close.
+        assert!(st.open_pairs().is_empty());
+        st.note_opened(Venue::Bybit, &s);
+        assert_eq!(st.open_pairs().len(), 1);
+        st.note_opened(Venue::Bybit, &s);
+        assert_eq!(st.open_pairs().len(), 1, "retries must not double-open");
         // Regression: must not re-fire every tick while the position is open.
         assert!(st.on_tick(&v).is_empty(), "open pair must not churn");
         assert_eq!(st.open_pairs().len(), 1);
         st.mark_closed(Venue::Bybit, &s);
         assert_eq!(st.on_tick(&v).len(), 1, "closed pair may re-enter");
+    }
+
+    #[test]
+    fn sizes_to_venue_share_cap() {
+        let s = Symbol::new("BTC", "USDT");
+        let params = StrategyParams {
+            target_notional_quote: dec!(500),
+            max_venue_quote_share_bps: dec!(2500),
+            ..Default::default()
+        };
+        let mut st = FundingStrategy::new(params, dec!(500), vec![(Venue::Bybit, s.clone())]);
+        let mut v = MarketView {
+            now_ms: 1_000,
+            ..Default::default()
+        };
+        let mut b = OrderBook::new(Venue::Bybit, s.clone());
+        b.apply_snapshot(
+            vec![BookLevel {
+                price: dec!(100),
+                qty: dec!(10),
+            }],
+            vec![BookLevel {
+                price: dec!(100.1),
+                qty: dec!(10),
+            }],
+            1,
+            1_000,
+        );
+        v.put(b);
+        v.funding.push(FundingRate {
+            venue: Venue::Bybit,
+            symbol: s.clone(),
+            rate_per_interval: dec!(0.0005),
+            interval_hours: dec!(8),
+            next_funding_ms: 0,
+        });
+        v.venue_quote.insert(Venue::Bybit, dec!(400));
+        let hits = st.on_tick(&v);
+        assert_eq!(hits.len(), 1);
+        // 25% of a 400-quote venue is 100, not the 500 target.
+        assert_eq!(
+            hits[0].legs[0].qty_base,
+            size_for_notional(dec!(100), dec!(100.1))
+        );
+        // Unknown venue falls back to the full notional.
+        v.venue_quote.clear();
+        st.mark_closed(Venue::Bybit, &s);
+        let hits = st.on_tick(&v);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(
+            hits[0].legs[0].qty_base,
+            size_for_notional(dec!(500), dec!(100.1))
+        );
     }
 
     #[test]

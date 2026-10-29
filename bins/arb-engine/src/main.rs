@@ -5,6 +5,7 @@ use arb_api::{
     EngineStatus, OpenPosition, PortfolioStatus, StrategyMetrics, UsdtIdrHealth, VenueBalance,
 };
 use arb_core::Intent;
+use arb_core::MarketKind;
 use arb_core::Side;
 use arb_core::{now_ms, Symbol, Venue};
 use arb_exec::{keys_from_env, ExecMode, LiveExecutor};
@@ -205,6 +206,9 @@ struct Engine {
     started_ms: i64,
     /// Last tick's USDT/IDR rate decision, surfaced via status/metrics.
     last_fx: RateDecision,
+    /// Funding interval already credited per open pair. A print's
+    /// `next_funding_ms` pays once, when it passes; stale prints pay never.
+    funding_credited_through: BTreeMap<(Venue, String), i64>,
 }
 
 impl Engine {
@@ -390,6 +394,7 @@ impl Engine {
             session_id: new_session_id(),
             started_ms,
             last_fx: RateDecision::default(),
+            funding_credited_through: BTreeMap::new(),
         })
     }
 
@@ -552,6 +557,18 @@ impl Engine {
         // Publish the divisor for provenance (FxTriangle records it).
         view.usdt_idr_mid = fx.rate.map(|r| r.mid);
         view.usdt_idr_ts_ms = fx.rate.map(|r| r.ts_ms);
+        // Venue ledgers backing the share cap, so single-venue strategies
+        // size to what the engine's risk gate would accept anyway.
+        view.venue_quote = self
+            .cfg
+            .venues
+            .iter()
+            .copied()
+            .map(|v| {
+                let q = self.paper.balance(v, "USDT") + self.paper.balance(v, "USDC");
+                (v, q)
+            })
+            .collect();
         view
     }
 
@@ -683,6 +700,7 @@ impl Engine {
                 }
             }
         }
+        self.settle_funding(now, &view);
         self.release_closed();
         self.publish();
     }
@@ -713,6 +731,31 @@ impl Engine {
                 m.realized_pnl_quote += p;
             }
         }
+        // Opens belong to fills, not intents: a strategy tracks a pair
+        // only once the executor actually filled it, so failed fills
+        // cannot strand phantoms that never close.
+        if let Some(leg) = intent.legs.first() {
+            for st in self.strategies.iter_mut() {
+                if st.name() == intent.strategy {
+                    st.note_filled(leg.venue, &leg.symbol);
+                }
+            }
+        }
+        // Funding entries earn per-interval credits on their spot notional.
+        if intent.strategy == "funding_rate" {
+            if let Some(f) = result
+                .fills
+                .iter()
+                .find(|f| f.market == MarketKind::Spot && f.side == Side::Buy)
+            {
+                self.paper.note_funding_fill(
+                    f.venue,
+                    &f.symbol.to_string(),
+                    &f.symbol.quote,
+                    f.price * f.qty_base,
+                );
+            }
+        }
         tracing::info!(strategy = %intent.strategy, edge_bps = %intent.expected_edge_bps,
             pnl = ?result.realized_pnl_quote, legs = intent.legs.len(), "paper trade");
         let stored = StoredTrade {
@@ -740,6 +783,36 @@ impl Engine {
                     tracing::error!(%e, "live send failed; paper fill kept");
                 }
             });
+        }
+    }
+
+    /// Credit elapsed funding intervals on open pairs. A print's
+    /// `next_funding_ms` pays exactly once, when it passes; a stale or
+    /// missing print pays nothing, and unknown pairs are ignored.
+    fn settle_funding(&mut self, now: i64, view: &MarketView) {
+        let open: Vec<(Venue, String)> = self.paper.funding_open.keys().cloned().collect();
+        for (venue, sym_str) in open {
+            let Some(fr) = view
+                .funding
+                .iter()
+                .find(|f| f.venue == venue && f.symbol.to_string() == sym_str)
+            else {
+                continue;
+            };
+            if fr.next_funding_ms > now {
+                continue;
+            }
+            if self.funding_credited_through.get(&(venue, sym_str.clone()))
+                == Some(&fr.next_funding_ms)
+            {
+                continue;
+            }
+            let got = self
+                .paper
+                .credit_funding(venue, &sym_str, fr.rate_per_interval);
+            self.funding_credited_through
+                .insert((venue, sym_str.clone()), fr.next_funding_ms);
+            tracing::info!(venue = %venue, symbol = %sym_str, amount = %got, "funding credited");
         }
     }
 
@@ -1055,6 +1128,21 @@ fn load_dotenv() {
 /// Address for the control API. Railway (and similar hosts) assigns the
 /// port at runtime via `$PORT`: when set, listen on all interfaces there.
 /// Otherwise use the configured address (local runs are unchanged).
+/// Feed subscriptions: configured symbols plus the ETH/BTC cross while
+/// the triangular strategy needs it. The view already expects the cross;
+/// without the subscription its books never arrive and the strategy
+/// fires nothing. Strategy symbol lists are untouched.
+fn feed_symbols(symbols: &[Symbol], triangular: bool) -> Vec<Symbol> {
+    let mut out = symbols.to_vec();
+    if triangular {
+        let cross = Symbol::new("ETH", "BTC");
+        if !out.contains(&cross) {
+            out.push(cross);
+        }
+    }
+    out
+}
+
 fn resolve_api_addr(configured: Option<String>) -> Option<String> {
     std::env::var("PORT")
         .ok()
@@ -1093,7 +1181,7 @@ async fn main() -> anyhow::Result<()> {
         &engine.shared.live_books,
         &engine.shared.live_connectors,
         engine.cfg.venues.clone(),
-        engine.symbols.clone(),
+        feed_symbols(&engine.symbols, engine.cfg.strategies.triangular),
         indodax_token,
     );
     if engine.cfg.venues.contains(&Venue::Indodax) {
@@ -1187,6 +1275,21 @@ async fn main() -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use arb_core::{BookLevel, Intent, MarketKind, OrderBook, Side, TradeLeg};
+
+    #[test]
+    fn feed_symbols_add_cross_for_triangular_only() {
+        // The triangular strategy needs the ETH/BTC cross, but no venue
+        // would ever subscribe to it, so it fired zero intents in 180k scans.
+        let syms = vec![Symbol::new("BTC", "USDT")];
+        let out = feed_symbols(&syms, true);
+        assert!(out.contains(&Symbol::new("ETH", "BTC")));
+        assert_eq!(out.len(), 2);
+        let out = feed_symbols(&syms, false);
+        assert_eq!(out, syms);
+        // Already configured: no duplicate subscription.
+        let both = vec![Symbol::new("BTC", "USDT"), Symbol::new("ETH", "BTC")];
+        assert_eq!(feed_symbols(&both, true).len(), 2);
+    }
 
     #[test]
     fn dotenv_line_parses_env_format() {

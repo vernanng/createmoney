@@ -153,6 +153,7 @@ impl ParamsCfg {
             max_book_age_ms: self.max_book_age_ms,
             ttl_ms: self.ttl_ms,
             dex_max_quote_age_ms: self.dex_max_quote_age_ms,
+            max_venue_quote_share_bps: self.max_venue_quote_share_bps,
         }
     }
 }
