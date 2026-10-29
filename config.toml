@@ -1,7 +1,7 @@
 # arb-engine config. Secrets come from env only — never put keys here.
 # NOTE: top-level keys (venues/symbols) must stay above the first [table]
 # header — bare keys after a header belong to that table and are ignored.
-venues = ["binance", "bybit", "okx", "indodax"]
+venues = ["binance", "bybit", "okx", "indodax", "kraken"]
 symbols = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "DOGE/USDT", "BNB/USDT", "ADA/USDT", "LINK/USDT", "TRX/USDT", "LTC/USDT", "DOT/USDT", "AVAX/USDT", "UNI/USDT", "ATOM/USDT", "NEAR/USDT", "XLM/USDT", "ETC/USDT", "ALGO/USDT", "FIL/USDT", "SUI/USDT"]
 
 [engine]
