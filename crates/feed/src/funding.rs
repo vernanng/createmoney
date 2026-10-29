@@ -6,35 +6,17 @@
 //! never to stale entries. Messages without funding fields (deltas,
 //! heartbeats, subscribe acks) parse to `None` and are routine, not errors.
 
-use crate::{perp_ws_url, FeedError};
+use crate::{dec_val, perp_ws_url, FeedError};
 use arb_core::{now_ms, Symbol, Venue};
 use arb_strategy::FundingRate;
 use rust_decimal::Decimal;
 use serde_json::Value;
 use std::collections::BTreeMap;
-use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// Latest funding prints keyed by (venue, `"BASE/QUOTE"`), with receipt time.
 pub type LiveFunding = Arc<Mutex<BTreeMap<(Venue, String), (FundingRate, i64)>>>;
-
-fn num(v: &Value) -> Result<Decimal, FeedError> {
-    match v {
-        Value::String(s) => Decimal::from_str(s).map_err(|e| FeedError::BadPayload {
-            venue: Venue::Binance,
-            msg: e.to_string(),
-        }),
-        Value::Number(n) => Decimal::from_str(&n.to_string()).map_err(|e| FeedError::BadPayload {
-            venue: Venue::Binance,
-            msg: e.to_string(),
-        }),
-        _ => Err(FeedError::BadPayload {
-            venue: Venue::Binance,
-            msg: format!("not numeric: {v}"),
-        }),
-    }
-}
 
 /// Perp instrument spelling per venue: Binance `btcusdt`, Bybit `BTCUSDT`,
 /// OKX `BTC-USDT-SWAP`.
@@ -101,7 +83,7 @@ pub fn parse_binance_funding(
     else {
         return Ok(None);
     };
-    let rate = num(&d["r"])?;
+    let rate = dec_val(Venue::Binance, &d["r"])?;
     let next = ms(&d["T"]).unwrap_or(0);
     Ok(Some((
         sym.clone(),
@@ -133,8 +115,9 @@ pub fn parse_bybit_funding(
     let Some(sym) = match_symbol(Venue::Bybit, venue_symbols, stream_sym) else {
         return Ok(None);
     };
-    let rate = num(&v["data"]["fundingRate"])?;
-    let hours = num(&v["data"]["fundingIntervalHour"]).unwrap_or(Decimal::new(8, 0));
+    let rate = dec_val(Venue::Bybit, &v["data"]["fundingRate"])?;
+    let hours =
+        dec_val(Venue::Bybit, &v["data"]["fundingIntervalHour"]).unwrap_or(Decimal::new(8, 0));
     let next = ms(&v["data"]["nextFundingTime"]).unwrap_or(0);
     Ok(Some((
         sym.clone(),
@@ -169,7 +152,7 @@ pub fn parse_okx_funding(
     let Some(sym) = match_symbol(Venue::Okx, venue_symbols, inst) else {
         return Ok(None);
     };
-    let rate = num(&data["fundingRate"])?;
+    let rate = dec_val(Venue::Okx, &data["fundingRate"])?;
     let interval = data["fundingInterval"].as_str().unwrap_or("8H");
     let hours: Decimal = interval
         .trim_end_matches(['H', 'h'])

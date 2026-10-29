@@ -2,11 +2,9 @@
 //!
 //! V2-style pools use exact constant-product math locally (no RPC needed once
 //! reserves are known). V3 pools need tick math on-chain, so this crate
-//! exposes the quoter interface types + well-known router/quoter addresses;
-//! live Sepolia sends go through the chain-gated [`testnet`] probe (HTTPS
-//! RPC only, off by default so paper builds stay light).
-
-pub mod testnet;
+//! exposes the quoter interface types + well-known router/quoter addresses.
+//! Live sends are go-live work and live outside this crate; paper builds
+//! stay light.
 
 use arb_core::{Symbol, Venue};
 use rust_decimal::Decimal;
