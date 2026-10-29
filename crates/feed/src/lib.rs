@@ -71,6 +71,7 @@ fn levels(arr: &Value) -> Result<Vec<BookLevel>, FeedError> {
 /// `BINANCE_WS_URL` overrides the Binance base (e.g. the spot testnet
 /// `wss://testnet.binance.vision`); `BYBIT_WS_URL` overrides the Bybit spot
 /// base (e.g. `wss://stream-testnet.bybit.com/v5/public/spot`);
+/// `KRAKEN_WS_URL` overrides the Kraken v2 base (`wss://ws.kraken.com/v2`);
 /// empty/unset keeps mainnet.
 pub fn ws_url(venue: Venue) -> String {
     if venue == Venue::Binance {
@@ -87,11 +88,19 @@ pub fn ws_url(venue: Venue) -> String {
             }
         }
     }
+    if venue == Venue::Kraken {
+        if let Ok(u) = std::env::var("KRAKEN_WS_URL") {
+            if !u.trim().is_empty() {
+                return u;
+            }
+        }
+    }
     match venue {
         Venue::Binance => "wss://stream.binance.com:9443",
         Venue::Bybit => "wss://stream.bybit.com/v5/public/spot",
         Venue::Okx => "wss://ws.okx.com:8443/ws/v5/public",
         Venue::Indodax => "wss://ws3.indodax.com/ws/",
+        Venue::Kraken => "wss://ws.kraken.com/v2",
         Venue::Uniswap | Venue::Pancakeswap | Venue::Jupiter => "",
     }
     .to_string()
@@ -130,6 +139,12 @@ pub fn subscribe_frame(venue: Venue, symbol: &Symbol) -> Value {
             "method": 1,
             "params": {"channel": format!("market:order-book-{}", symbol.indodax())},
             "id": 2
+        }),
+        // Kraken v2: one `book` subscription covers the symbol (depth 10,
+        // snapshot first, then deltas). Verified live 2026-10-29.
+        Venue::Kraken => serde_json::json!({
+            "method": "subscribe",
+            "params": {"channel": "book", "symbol": [symbol.kraken()], "depth": 10, "snapshot": true}
         }),
         _ => Value::Null,
     }
@@ -271,6 +286,49 @@ pub fn parse_indodax_depth(book: &mut OrderBook, raw: &str, ts_ms: i64) -> Resul
     Ok(())
 }
 
+// ---------- Kraken v2 ----------
+// Book: {"channel":"book","type":"snapshot|update","data":[{"symbol":"BTC/USDT",
+// "bids":[{"price":79911.7,"qty":0.01}],"asks":[...],"checksum":n}]}.
+// Updates carry only changed levels; `qty: 0` removes the level (handled by
+// `apply_diff`'s upsert). Levels are numeric objects on WS, strings on REST;
+// both parse via `dec_val`. No per-message sequence id, so updates map onto
+// the diff contract as the next local id. `checksum` is not verified;
+// recovery is reconnect + `snapshot: true` on resubscribe (fresh books map,
+// so a dropped connection never resumes from stale state).
+pub fn parse_kraken_book(book: &mut OrderBook, raw: &str, ts_ms: i64) -> Result<bool, FeedError> {
+    let v: Value = serde_json::from_str(raw)?;
+    let d = &v["data"][0];
+    let (bids, asks) = (kraken_levels(&d["bids"])?, kraken_levels(&d["asks"])?);
+    if bids.is_empty() && asks.is_empty() {
+        return Err(FeedError::BadPayload {
+            venue: Venue::Kraken,
+            msg: "empty book".into(),
+        });
+    }
+    if v["type"].as_str() == Some("snapshot") {
+        let seq = book.last_update_id + 1;
+        book.apply_snapshot(bids, asks, seq, ts_ms);
+        Ok(true)
+    } else if book.last_update_id == 0 {
+        // No snapshot yet: never seed the book from a delta.
+        Ok(false)
+    } else {
+        let seq = book.last_update_id + 1;
+        Ok(book.apply_diff(bids, asks, seq, seq, ts_ms))
+    }
+}
+
+fn kraken_levels(arr: &Value) -> Result<Vec<BookLevel>, FeedError> {
+    let mut out = Vec::new();
+    for row in arr.as_array().cloned().unwrap_or_default() {
+        out.push(BookLevel {
+            price: dec_val(&row["price"])?,
+            qty: dec_val(&row["qty"])?,
+        });
+    }
+    Ok(out)
+}
+
 /// Convert an IDR-quoted book to USD terms with a reference USD/IDR rate.
 /// Returns a new book; quantities (base asset) are unchanged, prices divided by rate.
 pub fn idr_book_to_usd(book: &OrderBook, usd_idr: Decimal) -> OrderBook {
@@ -399,6 +457,13 @@ mod tests {
         assert!(subscribe_frame(Venue::Indodax, &Symbol::new("BTC", "IDR"))
             .to_string()
             .contains("market:order-book-btcidr"));
+        // Kraken v2 subscribes `book` with slash-separated symbols. This
+        // must never be Null: the wildcard would compile and idle the venue.
+        let kraken = subscribe_frame(Venue::Kraken, &s);
+        assert!(
+            kraken.to_string().contains("\"book\"") && kraken.to_string().contains("BTC/USDT"),
+            "{kraken}"
+        );
         let auth = indodax_auth_frame("tok123").to_string();
         assert!(
             auth.contains("tok123") && auth.contains("\"id\":1"),
@@ -417,12 +482,41 @@ mod tests {
         );
         assert_eq!(ws_url(Venue::Okx), "wss://ws.okx.com:8443/ws/v5/public");
         assert_eq!(ws_url(Venue::Indodax), "wss://ws3.indodax.com/ws/");
+        assert_eq!(ws_url(Venue::Kraken), "wss://ws.kraken.com/v2");
         assert_eq!(ws_url(Venue::Uniswap), "");
         assert_eq!(perp_ws_url(Venue::Binance), "wss://fstream.binance.com");
         assert_eq!(
             perp_ws_url(Venue::Bybit),
             "wss://stream.bybit.com/v5/public/linear"
         );
+    }
+
+    #[test]
+    fn kraken_book_snapshot_then_delta() {
+        // Live v2 shapes (verified 2026-10-29): numeric price/qty objects,
+        // `qty: 0` removes the level, deltas never seed an empty book.
+        let mut b = OrderBook::new(Venue::Kraken, Symbol::new("BTC", "USDT"));
+        assert!(!parse_kraken_book(
+            &mut b,
+            r#"{"channel":"book","type":"update","data":[{"symbol":"BTC/USDT","bids":[],"asks":[{"price":80019.6,"qty":0.0126}],"checksum":1}]}"#,
+            5,
+        )
+        .unwrap());
+        assert!(parse_kraken_book(
+            &mut b,
+            r#"{"channel":"book","type":"snapshot","data":[{"symbol":"BTC/USDT","bids":[{"price":79782.2,"qty":0.127}],"asks":[{"price":79782.3,"qty":0.19}],"checksum":2}]}"#,
+            6,
+        )
+        .unwrap());
+        assert_eq!(b.best_bid().unwrap().price, dec!(79782.2));
+        assert!(parse_kraken_book(
+            &mut b,
+            r#"{"channel":"book","type":"update","data":[{"symbol":"BTC/USDT","bids":[{"price":79782.2,"qty":0}],"asks":[],"checksum":3}]}"#,
+            7,
+        )
+        .unwrap());
+        assert!(b.best_bid().is_none());
+        assert_eq!(b.best_ask().unwrap().price, dec!(79782.3));
     }
 
     #[test]

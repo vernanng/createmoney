@@ -5,7 +5,7 @@
 use super::fx::{parse_upbit_orderbook, upbit_subscribe_frame, FxCrossCheck, UPBIT_ID_WS_URL};
 use super::{
     indodax_auth_frame, parse_binance_partial, parse_bybit_orderbook, parse_indodax_depth,
-    parse_okx_books, subscribe_frame, ws_url,
+    parse_kraken_book, parse_okx_books, subscribe_frame, ws_url,
 };
 use arb_core::{now_ms, OrderBook, Symbol, Venue};
 use futures_util::StreamExt;
@@ -138,6 +138,7 @@ fn venue_spelling(venue: Venue, s: &Symbol) -> String {
         Venue::Bybit => s.bybit(),
         Venue::Okx => s.okx(),
         Venue::Indodax => s.indodax(),
+        Venue::Kraken => s.kraken(),
         _ => s.to_string(),
     }
 }
@@ -348,6 +349,29 @@ fn apply_msg(
             }
             key
         }
+        Venue::Kraken => {
+            // v2 book only; status acks and other channels carry no book.
+            if v.get("channel")?.as_str()? != "book" {
+                return None;
+            }
+            let sym = v
+                .get("data")?
+                .as_array()?
+                .first()?
+                .get("symbol")?
+                .as_str()?;
+            let found = raw.iter().find(|s| venue_spelling(venue, s) == sym)?;
+            let key = found.to_string();
+            parse_kraken_book(
+                books
+                    .entry(key.clone())
+                    .or_insert_with(|| OrderBook::new(venue, found.clone())),
+                msg,
+                now,
+            )
+            .ok()?;
+            key
+        }
         Venue::Indodax => {
             let channel = v.get("result")?.get("channel")?.as_str()?;
             let tag = channel
@@ -450,6 +474,30 @@ mod tests {
             &mut books,
             r#"{"topic":"tickers.BTCUSDT","data":{}}"#,
             6,
+        );
+        assert!(miss.is_none());
+    }
+
+    #[test]
+    fn router_feeds_kraken_book_and_ignores_acks() {
+        let syms = vec![Symbol::new("BTC", "USDT")];
+        let mut books = BTreeMap::new();
+        let hit = apply_msg(
+            Venue::Kraken,
+            &syms,
+            &mut books,
+            r#"{"channel":"book","type":"snapshot","data":[{"symbol":"BTC/USDT","bids":[{"price":79782.2,"qty":0.127}],"asks":[{"price":79782.3,"qty":0.19}],"checksum":2}]}"#,
+            6,
+        );
+        assert_eq!(hit.as_deref(), Some("BTC/USDT"));
+        assert_eq!(books["BTC/USDT"].best_ask().unwrap().price, dec!(79782.3));
+        // Subscribe acks and status traffic touch nothing.
+        let miss = apply_msg(
+            Venue::Kraken,
+            &syms,
+            &mut books,
+            r#"{"method":"subscribe","result":{"channel":"book","symbol":"BTC/USDT"},"success":true}"#,
+            7,
         );
         assert!(miss.is_none());
     }

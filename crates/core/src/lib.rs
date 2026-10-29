@@ -17,6 +17,7 @@ pub enum Venue {
     Bybit,
     Okx,
     Indodax,
+    Kraken,
     Uniswap,
     Pancakeswap,
     Jupiter,
@@ -26,7 +27,7 @@ impl Venue {
     pub fn is_cex(&self) -> bool {
         matches!(
             self,
-            Self::Binance | Self::Bybit | Self::Okx | Self::Indodax
+            Self::Binance | Self::Bybit | Self::Okx | Self::Indodax | Self::Kraken
         )
     }
     pub fn is_dex(&self) -> bool {
@@ -35,13 +36,16 @@ impl Venue {
     /// Taker fee in bps (all strategies take liquidity). VIP0 spot
     /// schedules: Binance/Bybit/OKX all 0.10%. Indodax stacks the 0.20%
     /// pair fee (live /api/pairs) with PPh + CFX levies; 51bps holds a
-    /// small conservative margin over that stack.
+    /// small conservative margin over that stack. Kraken tier-1 spot is
+    /// 0.80% taker (fee schedule, verified 2026-10-29; BTC/USDT uses the
+    /// crypto-spot schedule since the stablecoin is the quote, not base).
     pub fn default_taker_bps(&self) -> Decimal {
         match self {
             Self::Binance => Decimal::new(10, 2),
             Self::Bybit => Decimal::new(10, 2),
             Self::Okx => Decimal::new(10, 2),
             Self::Indodax => Decimal::new(51, 2),
+            Self::Kraken => Decimal::new(80, 2),
             Self::Uniswap => Decimal::new(30, 2), // 0.30% pool tier default
             Self::Pancakeswap => Decimal::new(25, 2), // 0.25%
             Self::Jupiter => Decimal::ZERO,       // fee lives inside the quoted route
@@ -59,6 +63,9 @@ impl Venue {
             Self::Bybit => Decimal::new(5, 0),
             Self::Okx => Decimal::ONE,
             Self::Indodax => Decimal::new(15, 1), // Rp25k at ~16.7k/USD
+            // Kraken `costmin` for XBT/USDT is 0.5 quote units (AssetPairs,
+            // verified 2026-10-29). Per-pair values vary; same shortcut as above.
+            Self::Kraken => Decimal::new(5, 1),
             Self::Uniswap | Self::Pancakeswap | Self::Jupiter => Decimal::ZERO,
         }
     }
@@ -71,6 +78,7 @@ impl fmt::Display for Venue {
             Self::Bybit => "bybit",
             Self::Okx => "okx",
             Self::Indodax => "indodax",
+            Self::Kraken => "kraken",
             Self::Uniswap => "uniswap",
             Self::Pancakeswap => "pancakeswap",
             Self::Jupiter => "jupiter",
@@ -114,6 +122,11 @@ impl Symbol {
     }
     pub fn indodax(&self) -> String {
         format!("{}{}", self.base, self.quote).to_lowercase()
+    }
+    /// Kraken WS v2 spelling: slash-separated, `BTC` not `XBT`
+    /// (verified live 2026-10-29: `BTC/USD` and `BTC/USDT` subscribe).
+    pub fn kraken(&self) -> String {
+        format!("{}/{}", self.base, self.quote)
     }
 }
 
@@ -251,6 +264,7 @@ mod tests {
         let s = Symbol::parse("btc/usdt").unwrap();
         assert_eq!(s.binance(), "btcusdt");
         assert_eq!(s.okx(), "BTC-USDT");
+        assert_eq!(s.kraken(), "BTC/USDT");
         assert_eq!(s.to_string(), "BTC/USDT");
         assert!(Symbol::parse("BTCUSDT").is_err());
     }
