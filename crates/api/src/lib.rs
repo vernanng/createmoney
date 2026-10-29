@@ -284,8 +284,9 @@ pub fn render_flows_envelope(items: &[serde_json::Value], total: usize) -> Strin
 
 /// The viewer page, served as `GET /viewer` by the engine binary.
 pub const VIEWER_HTML: &str = include_str!("viewer.html");
-/// The ops dashboard, served as `GET /dashboard` (viewer stays as-is).
-pub const DASHBOARD_HTML: &str = include_str!("dashboard.html");
+/// The ops dashboard, served as `GET /dashboard`. Merged into the viewer
+/// page: both routes serve the same unified HTML (3D scene + ops drawer).
+pub const DASHBOARD_HTML: &str = VIEWER_HTML;
 
 /// Per-strategy funnel counters as JSON (read-open, like `/status`).
 pub fn render_strategies(per_strategy: &BTreeMap<String, StrategyMetrics>) -> String {
@@ -603,9 +604,10 @@ mod tests {
         assert_eq!(code, 200);
         assert_eq!(ctype, "text/html");
         assert!(page.contains("dashboard"), "dashboard page");
-        // Viewer stays intact alongside the dashboard.
+        // Both routes serve the same unified page (scene + ops drawer).
         let (_, viewer, _) = route_viewer("GET", "/viewer", "").unwrap();
         assert!(viewer.contains("strategy-flow"), "viewer page");
+        assert!(viewer.contains("dashboard"), "unified page keeps ops");
         let (code, out, ctype) = route_dashboard("GET", "/strategies", &body).unwrap();
         assert_eq!(code, 200);
         assert_eq!(ctype, "application/json");

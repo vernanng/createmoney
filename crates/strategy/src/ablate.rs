@@ -1,6 +1,6 @@
 //! S8 nano-ablation harness: one-command proof that each cost model matters.
 //! Karpathy-style: minimal, deterministic, fail-fast. The matrix runs
-//! SyntheticFeed (3 seeds) x strategy x {full, no-fee, no-slip, inf-age,
+//! seeded books x strategy x {full, no-fee, no-slip, inf-age,
 //! inf-depth} and asserts full-cost PnL < no-fee PnL and stale-allowed worse.
 
 use crate::StrategyParams;

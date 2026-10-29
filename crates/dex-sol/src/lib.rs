@@ -1,11 +1,7 @@
 //! Solana DEX via Jupiter Swap API: quote -> build -> sign/send with own RPC.
 //!
 //! This crate owns request building and quote parsing (pure, testable).
-//! HTTP transport + transaction signing live in the engine's live wiring,
-//! except the devnet-only [`testnet`] probe (HTTPS RPC only, off by default
-//! so paper builds stay light).
-
-pub mod testnet;
+//! HTTP transport + transaction signing live in the engine's live wiring.
 
 use arb_core::{Symbol, Venue};
 use rust_decimal::Decimal;

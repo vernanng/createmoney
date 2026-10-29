@@ -11,7 +11,6 @@ pub mod dex;
 pub mod funding;
 pub mod fx;
 pub mod live;
-pub mod synthetic;
 pub use dex::{spawn_dex_tasks, EvmCfg, JupiterCfg, LiveDexQuotes};
 pub use funding::{spawn_funding_tasks, LiveFunding};
 pub use fx::{
@@ -22,7 +21,6 @@ pub use live::{
     pick_fresh, spawn_upbit_usdt_idr_task, spawn_venue_tasks, ConnectorState, LiveBooks,
     LiveConnectors,
 };
-pub use synthetic::SyntheticFeed;
 
 #[derive(Debug, thiserror::Error)]
 pub enum FeedError {
@@ -32,35 +30,35 @@ pub enum FeedError {
     Json(#[from] serde_json::Error),
 }
 
-fn dec(s: &str) -> Result<Decimal, FeedError> {
+pub(crate) fn dec(venue: Venue, s: &str) -> Result<Decimal, FeedError> {
     Decimal::from_str(s).map_err(|e| FeedError::BadPayload {
-        venue: Venue::Binance,
+        venue,
         msg: e.to_string(),
     })
 }
 
-fn dec_val(v: &Value) -> Result<Decimal, FeedError> {
+pub(crate) fn dec_val(venue: Venue, v: &Value) -> Result<Decimal, FeedError> {
     match v {
-        Value::String(s) => dec(s),
+        Value::String(s) => dec(venue, s),
         Value::Number(n) => Decimal::from_str(&n.to_string()).map_err(|e| FeedError::BadPayload {
-            venue: Venue::Binance,
+            venue,
             msg: e.to_string(),
         }),
         _ => Err(FeedError::BadPayload {
-            venue: Venue::Binance,
+            venue,
             msg: format!("not numeric: {v}"),
         }),
     }
 }
 
-fn levels(arr: &Value) -> Result<Vec<BookLevel>, FeedError> {
+fn levels(venue: Venue, arr: &Value) -> Result<Vec<BookLevel>, FeedError> {
     let mut out = Vec::new();
     for row in arr.as_array().cloned().unwrap_or_default() {
         let r = row.as_array().cloned().unwrap_or_default();
         if r.len() >= 2 {
             out.push(BookLevel {
-                price: dec_val(&r[0])?,
-                qty: dec_val(&r[1])?,
+                price: dec_val(venue, &r[0])?,
+                qty: dec_val(venue, &r[1])?,
             });
         }
     }
@@ -161,7 +159,13 @@ pub fn parse_binance_depth(book: &mut OrderBook, raw: &str) -> Result<bool, Feed
     let first = v["U"].as_u64().unwrap_or(0);
     let fin = v["u"].as_u64().unwrap_or(0);
     let ts = v["E"].as_i64().unwrap_or(0);
-    Ok(book.apply_diff(levels(&v["b"])?, levels(&v["a"])?, first, fin, ts))
+    Ok(book.apply_diff(
+        levels(Venue::Binance, &v["b"])?,
+        levels(Venue::Binance, &v["a"])?,
+        first,
+        fin,
+        ts,
+    ))
 }
 
 // Partial book (depth20@100ms): {"lastUpdateId":1,"bids":[[px,qty]],"asks":[[..]]}.
@@ -173,7 +177,12 @@ pub fn parse_binance_partial(
 ) -> Result<bool, FeedError> {
     let v: Value = serde_json::from_str(raw)?;
     let seq = v["lastUpdateId"].as_u64().unwrap_or(0);
-    book.apply_snapshot(levels(&v["bids"])?, levels(&v["asks"])?, seq, ts_ms);
+    book.apply_snapshot(
+        levels(Venue::Binance, &v["bids"])?,
+        levels(Venue::Binance, &v["asks"])?,
+        seq,
+        ts_ms,
+    );
     Ok(true)
 }
 
@@ -187,10 +196,10 @@ pub fn parse_binance_book_ticker(
     Ok(Quote {
         venue: Venue::Binance,
         symbol,
-        bid: dec_val(&v["b"])?,
-        ask: dec_val(&v["a"])?,
-        bid_qty: dec_val(&v["B"])?,
-        ask_qty: dec_val(&v["A"])?,
+        bid: dec_val(Venue::Binance, &v["b"])?,
+        ask: dec_val(Venue::Binance, &v["a"])?,
+        bid_qty: dec_val(Venue::Binance, &v["B"])?,
+        ask_qty: dec_val(Venue::Binance, &v["A"])?,
         ts_ms,
     })
 }
@@ -202,7 +211,10 @@ pub fn parse_bybit_orderbook(book: &mut OrderBook, raw: &str) -> Result<bool, Fe
     let d = &v["data"];
     let ts = v["ts"].as_i64().unwrap_or(0);
     let seq = d["u"].as_u64().unwrap_or(0);
-    let (bids, asks) = (levels(&d["b"])?, levels(&d["a"])?);
+    let (bids, asks) = (
+        levels(Venue::Bybit, &d["b"])?,
+        levels(Venue::Bybit, &d["a"])?,
+    );
     if v["type"].as_str() == Some("snapshot") {
         book.apply_snapshot(bids, asks, seq, ts);
         Ok(true)
@@ -230,7 +242,10 @@ pub fn parse_okx_books(book: &mut OrderBook, raw: &str) -> Result<bool, FeedErro
         .as_u64()
         .map(|p| p.saturating_add(1))
         .unwrap_or(seq);
-    let (bids, asks) = (levels(&d["bids"])?, levels(&d["asks"])?);
+    let (bids, asks) = (
+        levels(Venue::Okx, &d["bids"])?,
+        levels(Venue::Okx, &d["asks"])?,
+    );
     if v["action"].as_str() == Some("snapshot") || book.last_update_id == 0 {
         book.apply_snapshot(bids, asks, seq, ts);
         Ok(true)
@@ -249,8 +264,8 @@ fn indodax_object_levels(arr: &Value, base: &str) -> Result<Vec<BookLevel>, Feed
     let mut out = Vec::new();
     for row in arr.as_array().cloned().unwrap_or_default() {
         out.push(BookLevel {
-            price: dec_val(&row["price"])?,
-            qty: dec_val(&row[&vol_key])?,
+            price: dec_val(Venue::Indodax, &row["price"])?,
+            qty: dec_val(Venue::Indodax, &row[&vol_key])?,
         });
     }
     Ok(out)
@@ -273,7 +288,10 @@ pub fn parse_indodax_depth(book: &mut OrderBook, raw: &str, ts_ms: i64) -> Resul
             indodax_object_levels(&root["ask"], &book.symbol.base)?,
         )
     } else {
-        (levels(&root["buy"])?, levels(&root["sell"])?)
+        (
+            levels(Venue::Indodax, &root["buy"])?,
+            levels(Venue::Indodax, &root["sell"])?,
+        )
     };
     if bids.is_empty() && asks.is_empty() {
         return Err(FeedError::BadPayload {
@@ -322,8 +340,8 @@ fn kraken_levels(arr: &Value) -> Result<Vec<BookLevel>, FeedError> {
     let mut out = Vec::new();
     for row in arr.as_array().cloned().unwrap_or_default() {
         out.push(BookLevel {
-            price: dec_val(&row["price"])?,
-            qty: dec_val(&row["qty"])?,
+            price: dec_val(Venue::Kraken, &row["price"])?,
+            qty: dec_val(Venue::Kraken, &row["qty"])?,
         });
     }
     Ok(out)

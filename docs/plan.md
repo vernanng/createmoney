@@ -84,3 +84,16 @@ Settled Q9: green soak is 7 days, net positive after fees, zero stale-book fills
 Unresolved: none — accepted.
 Execution (all stages approved): owner approved all six implementation stages. One branch per stage; no commits without an explicit ask.
 Shipped: per-venue `[paper.capital]` ($10k Binance); paper self-rebalance with fee/delay + JSONL `transfer` events + `/status` transfers; target 500 with 25% venue-share guard; Jupiter + EVM-V2 DEX pollers with `dex_max_quote_age_ms`; Binance/Bybit/OKX funding streams; `outage_and_stale_books_never_partially_fill` drill; soak gate (7d, net positive, zero stale fills, kill+pause drill) in README going-live.
+
+## Draft: ponytail codebase audit — what to remove (one-shot report, no code changed)
+
+Status: Draft — findings 1–6 executed on branch `refactor/prune-dead-code` (uncommitted, all gates green: test + fmt + clippy; viewer verified in Ego). Load assumed: one engine process, 250 ms ticks, paper-first, multi-day soaks.
+Verdict: mostly lean; money paths are tested and no framework bloat. Fix finding 1 first (pure deletion).
+1. Delete `crates/dex-evm/src/testnet.rs` + `crates/dex-sol/src/testnet.rs` (~980 lines, zero callers, compiled into every build). Later devnet sends get rewritten at go-live.
+2. Move `Engine` out of `bins/arb-engine/src/main.rs:215-1039` into `bins/arb-engine/src/engine.rs` (824-line impl mixes startup, tick, serving). No behavior change.
+3. Delete `funding.rs::num()` (`crates/feed/src/funding.rs:22-37`), reuse shared `dec`/`dec_val`; it also mislabels every funding error as Binance.
+4. Gate `crates/feed/src/synthetic.rs` + its re-export behind `#[cfg(test)]` (test-harness-only, ships in prod binary).
+5. Merge `viewer.html` + `dashboard.html` into one page (both poll `/status` + `/flows`). Done: unified `viewer.html` (scene + ops drawer), both routes serve it. Ego: money overflow 0, doc/ops overflow 0, all 13 blocks present, zero console errors, live numbers in drawer.
+6. Cap trade history (`crates/store/src/lib.rs`). Done: `MAX_RETAINED_TRADES = 10_000` closed trades in memory, positions always kept (restart reseed safe), `trade_count()` lifetime counter feeds flows total + shutdown log. JSONL stays append-only (shortcut: full scan on load).
+Lean: about −1,140 lines, −0 dependencies. Kept deliberately: hand-rolled router + dotenv parser (avoid deps, both tested), Upbit cross-check (money-conversion safety).
+Scope contract (draft): artifact boundary = this record only. Done means = flips to Final on explicit acceptance; execution needs a separate `go`.

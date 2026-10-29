@@ -92,10 +92,37 @@ pub trait Store: Send {
     }
 }
 
+/// Most closed round-trips ever kept in memory. Position entries
+/// (`roundtrip == false`) are always kept — they reseed open funding
+/// pairs after a restart — so the vec holds at most this many closed
+/// trades plus the open positions (bounded by venue x symbol pairs).
+/// shortcut: the JSONL file stays append-only and is fully scanned on
+/// load; upgrade to file rotation if startup ever exceeds budget.
+pub const MAX_RETAINED_TRADES: usize = 10_000;
+
+/// Drop oldest closed trades past `max`, keeping every open position and
+/// the newest closed trades. Order is preserved.
+fn retain_capped(trades: &mut Vec<StoredTrade>, max: usize) {
+    if trades.len() <= max {
+        return;
+    }
+    let mut drop = trades.len() - max;
+    trades.retain(|t| {
+        if drop > 0 && t.intent.roundtrip {
+            drop -= 1;
+            false
+        } else {
+            true
+        }
+    });
+}
+
 #[derive(Debug, Default)]
 pub struct MemoryStore {
     trades: Vec<StoredTrade>,
     jsonl_path: Option<PathBuf>,
+    /// Lifetime recorded trades, including ones retired from memory.
+    total_recorded: u64,
 }
 
 impl MemoryStore {
@@ -108,11 +135,19 @@ impl MemoryStore {
     /// funding pairs) survives restarts. A missing file starts empty.
     pub fn with_jsonl(path: impl Into<PathBuf>) -> anyhow::Result<Self> {
         let path = path.into();
-        let trades = load_jsonl(&path)?;
+        let mut trades = load_jsonl(&path)?;
+        let total_recorded = trades.len() as u64;
+        retain_capped(&mut trades, MAX_RETAINED_TRADES);
         Ok(Self {
             trades,
             jsonl_path: Some(path),
+            total_recorded,
         })
+    }
+
+    /// Lifetime recorded trades, including ones retired from memory.
+    pub fn trade_count(&self) -> u64 {
+        self.total_recorded
     }
 
     fn append_line(&self, line: &str) -> anyhow::Result<()> {
@@ -181,6 +216,8 @@ impl Store for MemoryStore {
     fn record_trade(&mut self, t: StoredTrade) -> anyhow::Result<()> {
         self.append_line(&serde_json::to_string(&t)?)?;
         self.trades.push(t);
+        self.total_recorded += 1;
+        retain_capped(&mut self.trades, MAX_RETAINED_TRADES);
         Ok(())
     }
     fn record_session_start(&mut self, s: SessionStart) -> anyhow::Result<()> {
@@ -322,6 +359,42 @@ mod tests {
         assert_eq!(reopened.total_pnl(), dec!(5));
         assert_eq!(reopened.trades()[0].session_id, "s1");
         assert_eq!(reopened.trades()[1].session_id, "");
+        let _ = std::fs::remove_file(&dir);
+    }
+
+    #[test]
+    fn retention_keeps_positions_and_newest_closed_trades() {
+        // An always-on engine must not grow memory forever, but retiring
+        // the wrong trade reopens a funding position after restart.
+        let mut open = mk_trade(dec!(0), "s1");
+        open.intent.roundtrip = false;
+        open.realized_pnl_quote = None;
+        let mut v = vec![open];
+        for _ in 0..5 {
+            v.push(mk_trade(dec!(1), "s1"));
+        }
+        retain_capped(&mut v, 3);
+        assert_eq!(v.len(), 3, "cap counts the position too");
+        assert!(!v[0].intent.roundtrip, "the open position survives");
+        assert!(
+            v.iter().skip(1).all(|t| t.intent.roundtrip),
+            "only closed trades are retired"
+        );
+    }
+
+    #[test]
+    fn trade_count_covers_retired_trades() {
+        let dir = std::env::temp_dir().join("arb-store-test-count.jsonl");
+        let _ = std::fs::remove_file(&dir);
+        {
+            let mut st = MemoryStore::with_jsonl(dir.clone()).unwrap();
+            st.record_trade(mk_trade(dec!(1), "s1")).unwrap();
+            st.record_trade(mk_trade(dec!(2), "s1")).unwrap();
+            assert_eq!(st.trade_count(), 2);
+        }
+        // Reloaded history counts too, so the viewer total never shrinks.
+        let reopened = MemoryStore::with_jsonl(dir.clone()).unwrap();
+        assert_eq!(reopened.trade_count(), 2);
         let _ = std::fs::remove_file(&dir);
     }
 

@@ -61,11 +61,53 @@
   #err { position: fixed; left: 50%; transform: translateX(-50%); top: 12px;
     background: #7f1d1d; color: #fecaca; border-radius: 8px; padding: 8px 14px;
     font-size: 12px; display: none; max-width: 92vw; }
+  /* ---------- ops drawer (merged dashboard; collapsed to one line) ---------- */
+  #ops { position: fixed; left: 12px; bottom: 12px; width: min(880px, 94vw);
+    max-height: min(64vh, 660px); overflow-y: auto; z-index: 6;
+    background: rgba(8, 12, 24, .93); border: 1px solid #1e293b; border-radius: 10px;
+    padding: 8px 12px; font-size: 12px; line-height: 1.5; backdrop-filter: blur(4px); }
+  #ops > summary { cursor: pointer; color: #7dd3fc; font-size: 12px; font-weight: 700; }
+  #ops a { color: #7dd3fc; }
+  #ops header.top { display: flex; flex-wrap: wrap; gap: 12px; align-items: baseline;
+    justify-content: space-between; margin: 8px 0; }
+  #ops header.top h1 { margin: 0; font-size: 13px; color: #7dd3fc; }
+  #ops header.top .sub { color: #94a3b8; font-size: 11px; }
+  #ops .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  #ops .row label { color: #94a3b8; font-size: 12px; }
+  #ops select, #ops input[type="text"], #ops input[type="password"] {
+    background: #0b1120; color: #dbe4f3; border: 1px solid #334155;
+    border-radius: 4px; font: inherit; font-size: 12px; padding: 4px 8px; }
+  #ops button { background: #0f172a; color: #dbe4f3; border: 1px solid #334155;
+    border-radius: 4px; font: inherit; font-size: 12px; padding: 4px 10px; cursor: pointer; }
+  #ops button[aria-pressed="true"] { border-color: #7dd3fc; }
+  #ops button[aria-pressed="false"] { opacity: 0.45; }
+  #ops button.danger { border-color: #f87171; }
+  #ops button:disabled { opacity: 0.35; cursor: default; }
+  #ops .chips { display: flex; flex-wrap: wrap; gap: 6px; }
+  #ops .note { color: #94a3b8; font-size: 11px; }
+  #ops .stale { color: #fbbf24; font-weight: 700; }
+  #ops details { background: #0f1522; border: 1px solid #1e293b; border-radius: 8px;
+    padding: 10px 12px; margin: 8px 0; }
+  #ops details summary { margin: 0 0 6px; font-size: 12px; color: #7dd3fc;
+    font-weight: 700; cursor: pointer; }
+  #ops .wrap { overflow-x: auto; }
+  #ops table { border-collapse: collapse; width: 100%; font-size: 12px; max-width: 100%; }
+  #ops th, #ops td { text-align: right; padding: 4px 8px; border-bottom: 1px solid #1a2333;
+    white-space: nowrap; font-variant-numeric: tabular-nums; }
+  #ops th:first-child, #ops td:first-child { text-align: left; }
+  #ops th { color: #94a3b8; font-weight: 600; }
+  #ops td.num { color: #fff; }
+  #ops #tradeTbl tbody tr { cursor: pointer; }
   @media (max-width: 640px) {
     #detail, #trades { display: none; }
     #detail.open { display: block; top: auto; bottom: 76px; }
     #left { max-width: 70vw; }
     #hud, #money { font-size: 11px; padding: 8px 10px; }
+    #ops { bottom: 76px; }
+    #ops #tradeTbl thead { display: none; }
+    #ops #tradeTbl tbody td { display: block; text-align: left; border-bottom: none; padding: 2px 10px; }
+    #ops #tradeTbl tbody tr { display: block; border-bottom: 1px solid #1a2333; padding: 6px 0; }
+    #ops button, #ops select, #ops input[type="text"], #ops input[type="password"] { min-height: 44px; font-size: 14px; }
   }
 </style>
 <script type="importmap">
@@ -102,6 +144,63 @@
   <input id="replayRange" type="range" min="0" max="0" value="0" aria-label="replay position">
   <button id="stepFwd" aria-label="step forward">▶</button>
 </div>
+<details id="ops">
+  <summary>ops dashboard · controls · strategies · positions · trades · connectors</summary>
+  <div class="row" style="margin:8px 0">
+    <label for="key">api key</label>
+    <input id="key" type="password" autocomplete="off" placeholder="API_TOKEN" size="12">
+    <button id="kill" class="danger">kill</button>
+    <button id="revive">revive</button>
+    <span id="ctlMsg" class="note" role="status"></span>
+  </div>
+  <div class="note" id="opsSummary">waiting for status…</div>
+  <details open>
+    <summary>strategies</summary>
+    <div class="wrap"><table id="stratTbl" aria-label="per strategy metrics">
+      <thead><tr><th>strategy</th><th>scans</th><th>emitted</th><th>filled</th>
+      <th>risk rej</th><th>failed</th><th>dup skip</th><th>realized</th><th>state</th></tr></thead>
+      <tbody><tr><td colspan="9" class="dim">loading…</td></tr></tbody>
+    </table></div>
+    <div class="row" id="stratBtns" style="margin-top:8px"></div>
+  </details>
+  <details open>
+    <summary>open positions (live marked value)</summary>
+    <div class="wrap"><table id="posTbl" aria-label="open positions">
+      <thead><tr><th>strategy</th><th>venue</th><th>symbol</th><th>qty</th>
+      <th>entry $</th><th>mark $</th><th>market value $</th><th>state</th></tr></thead>
+      <tbody><tr><td colspan="8" class="dim">loading…</td></tr></tbody>
+    </table></div>
+    <div class="note">qty + entry from the opening trade; mark + value use the same live marks as equity. Stale = no fresh mark, value withheld.</div>
+  </details>
+  <details open>
+    <summary>trades</summary>
+    <div class="row" style="margin-bottom:8px">
+      <div class="chips" id="fStrats"></div>
+      <label>venue <select id="fVenue"><option value="">all</option></select></label>
+      <label>outcome <select id="fOutcome">
+        <option value="all">all</option><option value="settled">settled (pnl)</option>
+        <option value="openers">position openers</option>
+      </select></label>
+      <label>symbol <input id="fSym" type="text" placeholder="BTC" size="8"></label>
+      <label>limit <select id="fLimit"><option>50</option><option selected>100</option><option>200</option></select></label>
+      <span class="note" id="fCount"></span>
+    </div>
+    <div class="wrap"><table id="tradeTbl" aria-label="trades">
+      <thead><tr><th>time</th><th>strategy</th><th>legs (qty @ px = $)</th>
+      <th>edge bps</th><th>fees $</th><th>pnl $</th></tr></thead>
+      <tbody><tr><td colspan="6" class="dim">loading…</td></tr></tbody>
+    </table></div>
+    <div class="note">newest first, capped at the selected limit. Fees = sum of fill fee_quote. $ size = price × qty per leg. Tap a row to expand its legs.</div>
+  </details>
+  <details open>
+    <summary>connectors · usdt/idr</summary>
+    <div class="wrap"><table id="connTbl" aria-label="connectors">
+      <thead><tr><th>venue</th><th>socket</th><th>books</th><th>fresh</th><th>last book</th><th>error</th></tr></thead>
+      <tbody><tr><td colspan="6" class="dim">loading…</td></tr></tbody>
+    </table></div>
+    <div class="note" id="fxLine" style="margin-top:6px"></div>
+  </details>
+</details>
 <div id="err" role="alert"></div>
 <script type="module">
 import * as THREE from 'three';
@@ -117,6 +216,7 @@ const STRATS = {
   lag_chase: 0xfb923c,
   fx_triangle: 0xe2e8f0,
 };
+const STRAT_NAMES = Object.keys(STRATS);
 const CEX = ['binance', 'bybit', 'okx', 'indodax', 'kraken'];
 const DEX = ['uniswap', 'pancakeswap', 'jupiter'];
 const RENDER_CAP = 80; // newest trades drawn when replay is at head
@@ -126,8 +226,19 @@ const REDUCED = matchMedia('(prefers-reduced-motion: reduce)').matches;
 // ---------- helpers ----------
 const $ = (id) => document.getElementById(id);
 function showErr(msg) { const e = $('err'); e.style.display = 'block'; e.textContent = msg; }
-window.addEventListener('error', (ev) => showErr('viewer error: ' + (ev.message || 'unknown')));
-window.addEventListener('unhandledrejection', (ev) => showErr('viewer error: ' + (ev.reason || 'unknown')));
+window.addEventListener('error', (ev) => showErr('page error: ' + (ev.message || 'unknown')));
+window.addEventListener('unhandledrejection', (ev) => showErr('page error: ' + (ev.reason || 'unknown')));
+const fmt = (n, d = 2) => {
+  const x = Number(n);
+  return Number.isFinite(x) ? x.toLocaleString('en-US', { maximumFractionDigits: d }) : '—';
+};
+const cls = (n) => Number(n) < 0 ? 'neg' : (Number(n) > 0 ? 'pos' : '');
+const symText = (s) => typeof s === 'string' ? s : (s && s.base ? `${s.base}/${s.quote}` : '—');
+const legText = (l) => {
+  const q = Number(l.qty_base), p = Number(l.price);
+  return `${l.venue} ${symText(l.symbol)} ${l.side} ${fmt(q, 6)} @ ${fmt(p)} = $${fmt(q * p)}`;
+};
+const tradeFees = (t) => (t.fills || []).reduce((a, f) => a + Number(f.fee_quote || 0), 0);
 function venuePos(name, out) {
   const ci = CEX.indexOf(name), di = DEX.indexOf(name);
   if (ci >= 0) { const a = ci * Math.PI * 2 / CEX.length; return out.set(Math.cos(a) * 9, 0, Math.sin(a) * 9); }
@@ -328,7 +439,8 @@ renderer.domElement.addEventListener('touchstart', (ev) => {
   if (hit) selectVenue(hit.object.userData.venue);
 }, { passive: true });
 // ---------- state, flows, filters, replay ----------
-const state = { flows: [], total: 0, enabled: new Set(Object.keys(STRATS)), replayHead: -1, live: true };
+const state = { flows: [], total: 0, enabled: new Set(STRAT_NAMES), replayHead: -1, live: true,
+  status: null, strategies: {}, fStrats: new Set(STRAT_NAMES), fVenue: '', fOutcome: 'all', fSym: '', fLimit: 100 };
 const flowGroup = new THREE.Group();
 scene.add(flowGroup);
 const pulses = [];
@@ -390,7 +502,7 @@ function rebuildFlows() {
   $('liveBtn').textContent = state.live ? 'live' : 'paused';
   refreshChips();
 }
-{ // filter chips, labeled with live per-strategy flow counts
+{ // scene filter chips, labeled with live per-strategy flow counts
   const box = $('filters');
   const chipBtns = {};
   for (const [name, hex] of Object.entries(STRATS)) {
@@ -438,16 +550,7 @@ $('liveBtn').addEventListener('click', () => {
   $('liveBtn').setAttribute('aria-pressed', String(state.live));
   rebuildFlows();
 });
-async function loadFlows() {
-  const res = await fetch('/flows', { cache: 'no-store' });
-  if (!res.ok) throw new Error('GET /flows -> ' + res.status);
-  const data = await res.json();
-  state.flows = (data.flows || []).slice().sort((a, b) => (a.ts_ms || 0) - (b.ts_ms || 0));
-  state.total = data.count ?? state.flows.length;
-  if (state.replayHead >= state.flows.length) state.replayHead = -1;
-  rebuildFlows();
-  if (selected) selectVenue(selected);
-}
+// ---------- viewer panels (status, money, current/pending/settled) ----------
 function fmtUp(ms) {
   if (ms == null || ms < 0) return '—';
   const s = Math.floor(ms / 1000);
@@ -464,58 +567,215 @@ function tradeLine(t, showPnl) {
     ? ` pnl=${Number(t.realized_pnl_quote).toFixed(2)}` : '';
   return `${t.intent.strategy} ${legs} edge=${edge}${pnlPart}`;
 }
-async function loadStatus() {
-  try {
-    const res = await fetch('/status', { cache: 'no-store' });
-    if (!res.ok) return;
-    const s = await res.json();
-    const fmt = (n) => (typeof n === 'number' ? n : Number(n)).toLocaleString('en-US', { maximumFractionDigits: 2 });
-    const pnl = (n) => Number(n) < 0 ? 'neg' : 'pos';
-    const up = fmtUp(Date.now() - (s.started_ms || 0));
-    $('uptimeVal').textContent = up;
-    $('status').innerHTML =
-      `mode=<span class="num">${s.mode}</span> ` +
-      `killed=<span class="${s.killed ? 'neg' : 'pos'}">${s.killed}</span><br>` +
-      `trades=<span class="num">${s.trades}</span> ` +
-      `opps=<span class="num">${s.opportunities_seen}</span> ` +
-      `flows=<span class="num">${state.total}</span><br>` +
-      `s6=<span class="num">${s.imbalance_threshold ?? 'off'}</span>`;
-    const p = s.portfolio;
-    if (p) {
-      const byVenue = {};
-      for (const b of (p.per_venue || [])) {
-        if (Number(b.amount) === 0) continue;
-        ((byVenue[b.venue] ??= [])).push(b);
-      }
-      const groups = Object.keys(byVenue).sort().map((v) =>
-        `<div class="vg"><b>${v}</b><span class="dim">` +
-        byVenue[v].map((b) => `${b.asset} ${fmt(b.amount)}`).join(' · ') +
-        `</span></div>`).join('');
-      $('portfolio').innerHTML =
-        `equity=<span class="num">${fmt(p.equity_quote)}</span> ` +
-        `realized=<span class="${pnl(p.realized_pnl_quote)}">${fmt(p.realized_pnl_quote)}</span> ` +
-        `unrealized=<span class="${pnl(p.unrealized_pnl_quote)}">${fmt(p.unrealized_pnl_quote)}</span>` +
-        groups;
+function renderViewerStatus(s) {
+  const pnl = (n) => Number(n) < 0 ? 'neg' : 'pos';
+  const up = fmtUp(Date.now() - (s.started_ms || 0));
+  $('uptimeVal').textContent = up;
+  $('status').innerHTML =
+    `mode=<span class="num">${s.mode}</span> ` +
+    `killed=<span class="${s.killed ? 'neg' : 'pos'}">${s.killed}</span><br>` +
+    `trades=<span class="num">${s.trades}</span> ` +
+    `opps=<span class="num">${s.opportunities_seen}</span> ` +
+    `flows=<span class="num">${state.total}</span><br>` +
+    `s6=<span class="num">${s.imbalance_threshold ?? 'off'}</span>`;
+  const p = s.portfolio;
+  if (p) {
+    const byVenue = {};
+    for (const b of (p.per_venue || [])) {
+      if (Number(b.amount) === 0) continue;
+      ((byVenue[b.venue] ??= [])).push(b);
     }
-    // Right-side trade boxes. This run = flows stamped after the engine
-    // start; older restarts stay in the history but are not this session.
-    const flows = state.flows;
-    const mine = flows.filter((t) => (t.ts_ms || 0) >= (s.started_ms || 0));
-    const last = mine[mine.length - 1];
-    $('curBody').innerHTML = last ? tradeLine(last) : '<span class="dim">no trades yet</span>';
-    const ops = s.open_positions || [];
-    $('pendBody').innerHTML = ops.length
-      ? ops.map((o) => `${o.strategy} ${o.venue} ${o.symbol}`).join('<br>')
-      : '<span class="dim">none open</span>';
-    const settled = mine.filter((t) => t.realized_pnl_quote != null);
-    const tot = settled.reduce((a, t) => a + Number(t.realized_pnl_quote), 0);
-    $('setBody').innerHTML = settled.length
-      ? `total=<span class="${pnl(tot)}">${fmt(tot)}</span> n=<span class="num">${settled.length}</span><br><span class="dim">` +
-        settled.slice(-5).reverse().map((t) => tradeLine(t, true)).join('<br>') + `</span>`
-      : '<span class="dim">none settled</span>';
-  } catch { /* status is best-effort; flows carry the scene */ }
+    const groups = Object.keys(byVenue).sort().map((v) =>
+      `<div class="vg"><b>${v}</b><span class="dim">` +
+      byVenue[v].map((b) => `${b.asset} ${fmt(b.amount)}`).join(' · ') +
+      `</span></div>`).join('');
+    $('portfolio').innerHTML =
+      `equity=<span class="num">${fmt(p.equity_quote)}</span> ` +
+      `realized=<span class="${pnl(p.realized_pnl_quote)}">${fmt(p.realized_pnl_quote)}</span> ` +
+      `unrealized=<span class="${pnl(p.unrealized_pnl_quote)}">${fmt(p.unrealized_pnl_quote)}</span>` +
+      groups;
+  }
+  // Right-side trade boxes. This run = flows stamped after the engine
+  // start; older restarts stay in the history but are not this session.
+  const flows = state.flows;
+  const mine = flows.filter((t) => (t.ts_ms || 0) >= (s.started_ms || 0));
+  const last = mine[mine.length - 1];
+  $('curBody').innerHTML = last ? tradeLine(last) : '<span class="dim">no trades yet</span>';
+  const ops = s.open_positions || [];
+  $('pendBody').innerHTML = ops.length
+    ? ops.map((o) => `${o.strategy} ${o.venue} ${o.symbol}`).join('<br>')
+    : '<span class="dim">none open</span>';
+  const settled = mine.filter((t) => t.realized_pnl_quote != null);
+  const tot = settled.reduce((a, t) => a + Number(t.realized_pnl_quote), 0);
+  $('setBody').innerHTML = settled.length
+    ? `total=<span class="${pnl(tot)}">${fmt(tot)}</span> n=<span class="num">${settled.length}</span><br><span class="dim">` +
+      settled.slice(-5).reverse().map((t) => tradeLine(t, true)).join('<br>') + `</span>`
+    : '<span class="dim">none settled</span>';
 }
-// ---------- main loop and boot ----------
+// ---------- ops drawer (merged dashboard tables + token-gated controls) ----------
+function token() { return $('key').value.trim(); }
+async function post(path) {
+  const t = token();
+  if (!t) { $('ctlMsg').textContent = 'enter api key first'; return; }
+  $('ctlMsg').textContent = '';
+  const sep = path.includes('?') ? '&' : '?';
+  const res = await fetch(path + sep + 'token=' + encodeURIComponent(t), { method: 'POST' });
+  if (res.status === 401) { $('ctlMsg').textContent = 'wrong key (401)'; return; }
+  if (!res.ok) { $('ctlMsg').textContent = 'failed: ' + res.status; return; }
+  await loadStatus();
+}
+// Key lives only in memory/sessionStorage, never in the URL bar or logs.
+$('key').value = sessionStorage.getItem('apiKey') || '';
+$('key').addEventListener('input', (e) => sessionStorage.setItem('apiKey', e.target.value));
+$('kill').addEventListener('click', () => post('/kill'));
+$('revive').addEventListener('click', () => post('/revive'));
+{ // per-strategy pause/resume buttons mirror /status paused list
+  const box = $('stratBtns');
+  for (const s of STRAT_NAMES) {
+    const b = document.createElement('button');
+    b.textContent = s; b.dataset.strat = s; b.setAttribute('aria-pressed', 'false');
+    b.addEventListener('click', async () => {
+      const paused = (state.status?.paused_strategies || []).includes(s);
+      await post(paused ? `/resume/${s}` : `/pause/${s}`);
+    });
+    box.appendChild(b);
+  }
+}
+{ // trades-table strategy filter chips mirror the same six names
+  const box = $('fStrats');
+  for (const s of STRAT_NAMES) {
+    const b = document.createElement('button');
+    b.textContent = s; b.dataset.strat = s; b.setAttribute('aria-pressed', 'true');
+    b.addEventListener('click', () => {
+      if (state.fStrats.has(s)) { state.fStrats.delete(s); b.setAttribute('aria-pressed', 'false'); }
+      else { state.fStrats.add(s); b.setAttribute('aria-pressed', 'true'); }
+      renderTrades();
+    });
+    box.appendChild(b);
+  }
+}
+$('fVenue').addEventListener('change', (e) => { state.fVenue = e.target.value; renderTrades(); });
+$('fOutcome').addEventListener('change', (e) => { state.fOutcome = e.target.value; renderTrades(); });
+$('fSym').addEventListener('input', (e) => { state.fSym = e.target.value.toUpperCase(); renderTrades(); });
+$('fLimit').addEventListener('change', (e) => { state.fLimit = Number(e.target.value) || 100; renderTrades(); });
+// Tap a trade row to expand/collapse its legs (matters on narrow screens).
+$('tradeTbl').querySelector('tbody').addEventListener('click', (e) => {
+  const tr = e.target.closest('tr');
+  if (tr) tr.classList.toggle('open');
+});
+function renderOpsSummary() {
+  const s = state.status; if (!s) return;
+  const fees = state.flows.reduce((a, t) => a + tradeFees(t), 0);
+  const settled = state.flows.filter((t) => t.realized_pnl_quote != null);
+  const tot = settled.reduce((a, t) => a + Number(t.realized_pnl_quote), 0);
+  const p = s.portfolio || {};
+  $('opsSummary').innerHTML =
+    `mode=${s.mode} killed=${s.killed} opps=${s.opportunities_seen} ` +
+    `equity=$${fmt(p.equity_quote)} realized=$${fmt(p.realized_pnl_quote)} ` +
+    `unrealized=$${fmt(p.unrealized_pnl_quote)} fees=$${fmt(fees)} ` +
+    `settled=${settled.length} pnl=$${fmt(tot)} transfers=${s.transfers ?? 0}`;
+}
+function renderStrats() {
+  const tb = $('stratTbl').querySelector('tbody');
+  const rows = STRAT_NAMES.map((name) => {
+    const m = state.strategies[name];
+    const paused = (state.status?.paused_strategies || []).includes(name);
+    if (!m) return `<tr><td>${name}</td><td colspan="7" class="dim">—</td><td>${paused ? 'paused' : 'live'}</td></tr>`;
+    return `<tr><td>${name}</td><td class="num">${m.scans ?? 0}</td><td class="num">${m.emitted ?? 0}</td>` +
+      `<td class="num">${m.filled ?? 0}</td><td class="num">${m.risk_rejected ?? 0}</td>` +
+      `<td class="num">${m.fill_failed ?? 0}</td><td class="num">${m.dup_skipped ?? 0}</td>` +
+      `<td class="${cls(m.realized_pnl_quote)}">${fmt(m.realized_pnl_quote)}</td>` +
+      `<td>${paused ? 'paused' : 'live'}</td></tr>`;
+  });
+  tb.innerHTML = rows.join('');
+  for (const b of $('stratBtns').children) {
+    const paused = (state.status?.paused_strategies || []).includes(b.dataset.strat);
+    b.setAttribute('aria-pressed', String(paused));
+    b.textContent = paused ? `${b.dataset.strat} (paused)` : b.dataset.strat;
+  }
+}
+function renderPositions() {
+  const tb = $('posTbl').querySelector('tbody');
+  const ops = state.status?.open_positions || [];
+  if (!ops.length) { tb.innerHTML = `<tr><td colspan="8" class="dim">none open</td></tr>`; return; }
+  tb.innerHTML = ops.map((o) => {
+    const stale = o.mark_price_quote == null || o.market_value_quote == null;
+    return `<tr><td>${o.strategy}</td><td>${o.venue}</td><td>${o.symbol}</td>` +
+      `<td class="num">${fmt(o.qty_base, 6)}</td><td class="num">${o.entry_price_quote != null ? '$' + fmt(o.entry_price_quote) : '—'}</td>` +
+      `<td class="num">${stale ? '—' : '$' + fmt(o.mark_price_quote)}</td>` +
+      `<td class="num">${stale ? '—' : '$' + fmt(o.market_value_quote)}</td>` +
+      `<td class="${stale ? 'stale' : 'pos'}">${stale ? 'stale' : 'live'}</td></tr>`;
+  }).join('');
+}
+function filteredTrades() {
+  let list = state.flows.filter((t) => state.fStrats.has(t.intent?.strategy));
+  if (state.fVenue) list = list.filter((t) => (t.intent?.legs || []).some((l) => String(l.venue).toLowerCase() === state.fVenue));
+  if (state.fOutcome === 'settled') list = list.filter((t) => t.realized_pnl_quote != null);
+  if (state.fOutcome === 'openers') list = list.filter((t) => t.intent && t.intent.roundtrip === false);
+  if (state.fSym) list = list.filter((t) => (t.intent?.legs || []).some((l) => symText(l.symbol).toUpperCase().includes(state.fSym)));
+  return list.slice().sort((a, b) => (b.ts_ms || 0) - (a.ts_ms || 0));
+}
+function renderTrades() {
+  const tb = $('tradeTbl').querySelector('tbody');
+  const list = filteredTrades();
+  $('fCount').textContent = `${list.length}/${state.flows.length} shown`;
+  const rows = list.slice(0, state.fLimit).map((t) => {
+    const legs = (t.intent?.legs || []).map(legText).join('<br>');
+    const time = t.ts_ms ? new Date(t.ts_ms).toLocaleTimeString('en-GB') : '—';
+    const pnl = t.realized_pnl_quote != null ? `<span class="${cls(t.realized_pnl_quote)}">${fmt(t.realized_pnl_quote)}</span>` : `<span class="dim">—</span>`;
+    return `<tr><td>${time}</td><td>${t.intent?.strategy ?? '—'}</td><td class="legs" style="text-align:left">${legs}</td>` +
+      `<td class="num">${t.intent?.expected_edge_bps ?? '—'}</td><td class="num">${fmt(tradeFees(t))}</td><td>${pnl}</td></tr>`;
+  });
+  tb.innerHTML = rows.length ? rows.join('') : `<tr><td colspan="6" class="dim">no trades match</td></tr>`;
+}
+function renderConns() {
+  const s = state.status; if (!s) return;
+  const tb = $('connTbl').querySelector('tbody');
+  const seen = (s.connectors || []).map((c) => c.venue);
+  for (const t of state.flows) for (const l of (t.intent?.legs || [])) seen.push(String(l.venue).toLowerCase());
+  const venues = [...new Set(seen)].sort();
+  const sel = $('fVenue');
+  // Rebuild the options only when the venue set changes; rebuilding every
+  // poll would dismiss the open picker on touch screens.
+  const cur = [...sel.options].map((o) => o.value);
+  if (JSON.stringify(cur) !== JSON.stringify([''].concat(venues))) {
+    sel.innerHTML = `<option value="">all</option>` + venues.map((v) => `<option value="${v}">${v}</option>`).join('');
+    sel.value = state.fVenue;
+  }
+  tb.innerHTML = (s.connectors || []).map((c) => `<tr><td>${c.venue}</td>` +
+    `<td class="${c.connected ? 'pos' : 'neg'}">${c.connected}</td><td class="num">${c.books}</td>` +
+    `<td class="num">${c.fresh_books}</td><td class="dim">${c.last_book_ms ?? '—'}</td>` +
+    `<td class="dim">${c.last_error ?? ''}</td></tr>`).join('') || `<tr><td colspan="6" class="dim">—</td></tr>`;
+  const fx = s.usdt_idr || {};
+  $('fxLine').textContent = `usdt/idr: ${fx.state ?? '—'} mid=${fx.mid ?? '—'} fresh=${fx.fresh} degraded=${fx.degraded} sources=${fx.independent_sources ?? 0}`;
+}
+function renderOps() {
+  renderOpsSummary(); renderStrats(); renderPositions(); renderTrades(); renderConns();
+}
+// ---------- loaders, main loop, boot ----------
+async function loadFlows() {
+  const res = await fetch('/flows', { cache: 'no-store' });
+  if (!res.ok) throw new Error('GET /flows -> ' + res.status);
+  const data = await res.json();
+  state.flows = (data.flows || []).slice().sort((a, b) => (a.ts_ms || 0) - (b.ts_ms || 0));
+  state.total = data.count ?? state.flows.length;
+  if (state.replayHead >= state.flows.length) state.replayHead = -1;
+  rebuildFlows();
+  renderTrades(); renderConns();
+  if (selected) selectVenue(selected);
+}
+async function loadStatus() {
+  const res = await fetch('/status', { cache: 'no-store' });
+  if (!res.ok) return;
+  const s = await res.json();
+  state.status = s;
+  try {
+    const pr = await fetch('/strategies', { cache: 'no-store' });
+    if (pr.ok) state.strategies = await pr.json();
+  } catch { /* strategies feed the tables; the viewer works without it */ }
+  renderViewerStatus(s);
+  renderOps();
+}
 const clock = new THREE.Clock();
 function animate() {
   requestAnimationFrame(animate);

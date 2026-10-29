@@ -314,8 +314,8 @@ if `API_TOKEN` is set in env, the POST rows below need `?token=<value>`
 | `/status` | GET | mode, killed, engine start (`started_ms`, viewer shows uptime), trades, realized PnL, opportunities, per-venue connector health (socket state reported separately from fresh-book counts), paused strategies, portfolio (per-venue balances, equity, realized/unrealized PnL), open positions with entry qty/`$` plus live mark and market value |
 | `/metrics` | GET | text metrics incl. per-strategy funnel counters (scans, intents, fill failures, `dup_skipped` same-top refills, trades, PnL; `risk_rejected` stays 0 — the pre-trade gate is removed) and per-venue book freshness |
 | `/flows` | GET | JSON snapshot of the last 200 trades (for the viewer and dashboard) |
-| `/viewer` | GET | built-in HTML trade-flow viewer |
-| `/dashboard` | GET | built-in HTML ops dashboard (strategy, metrics, trades, PnL, fees, positions with live marks, token-gated controls) |
+| `/viewer` | GET | unified page: 3D trade-flow viewer + ops drawer (strategy, metrics, trades, PnL, fees, positions with live marks, token-gated controls) |
+| `/dashboard` | GET | same unified page as `/viewer` (kept so old links keep working) |
 | `/strategies` | GET | per-strategy funnel counters as JSON (same data as the Prometheus rows, for the dashboard) |
 | `/kill` | POST | trip the kill-switch |
 | `/revive` | POST | clear the kill-switch |
@@ -358,14 +358,14 @@ venue so the paper soak behaves like the live book.
 
 ```
 crates/core      types (Venue/Symbol/Intent), L2 book (snapshot/diff/VWAP/depth), decimal money math
-crates/feed      Binance/Bybit/OKX/Indodax/Kraken parsers, WS URLs/frames, live WS tasks, IDR->USD books (+ deterministic SyntheticFeed kept for the S8 harness)
+crates/feed      Binance/Bybit/OKX/Indodax/Kraken parsers, WS URLs/frames, live WS tasks, IDR->USD books
 crates/strategy  Strategy trait + MarketView; all six strategies + imbalance filter (S6); fee_table (S7) / ablate (S8) test harnesses
 crates/paper     book-walking fill simulator (fees + slippage haircut, inventory-enforced)
 crates/exec      live send gate (armed check), env key loading, HMAC-SHA256 signing, Binance + Bybit testnet senders
 crates/dex-evm   Uniswap + PancakeSwap quoting (exact V2 math; V3 quoter types + addresses)
 crates/dex-sol   Jupiter quote URL building/parsing (mints, prices, DexQuote conversion)
 crates/store     Store trait + in-memory/JSONL backend + SQL schema for the DB backend
-crates/api       control state, status/metrics/flows rendering, route table, viewer + dashboard HTML
+crates/api       control state, status/metrics/flows rendering, route table, unified viewer HTML (scene + ops drawer)
 bins/arb-engine  wiring, config, tick loop, localhost control API
 xtask            dev tooling: doc-check | install-hooks | ablate (cargo xtask <cmd>); post-commit hook is this binary
 ```
