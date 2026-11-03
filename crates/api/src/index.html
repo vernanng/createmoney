@@ -7,7 +7,7 @@
 <link rel="icon" href="data:,">
 <style>
   /* Material 3 expressive, dark, seeded blue. Mobile-first: the drawer is a
-     modal bottom sheet; ≥900px it becomes a compact side sheet. Roles follow
+     modal bottom sheet; ≥900px it becomes a wide side sheet. Roles follow
      the official dynamic dark scheme (primary80/on-primary20,
      containers at tones 30/90, surfaces neutral6→22, outline
      neutral-variant60; see material-web tokens v0_192 md-sys-color and
@@ -146,7 +146,9 @@
   @media (min-width: 900px) {
     #strip button { min-height: 36px; padding: 6px 16px; }
     #grab { display: none; }
-    #sheet { left: auto; right: 16px; top: 72px; bottom: 16px; width: 340px;
+    /* width fits the widest table (#tradeTbl legs ≈ 880px + padding/scrollbar);
+       shortcut: longer leg lines still fall back to .wrap horizontal scroll */
+    #sheet { left: auto; right: 16px; top: 72px; bottom: 16px; width: min(960px, calc(100vw - 32px));
       max-height: none; border-radius: 16px; padding: 8px 12px calc(12px + env(safe-area-inset-bottom)); }
     #sheet table { font-size: 12px; }
     #sheet th, #sheet td { padding: 8px 10px; }
