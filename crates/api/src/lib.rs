@@ -632,4 +632,23 @@ mod tests {
         assert!(route_pages("POST", "/flows", &flows, &strat).is_none());
         assert!(route_pages("POST", "/", &flows, &strat).is_none());
     }
+
+    #[test]
+    fn viewer_zoom_anchors_at_cursor() {
+        // Zoom keeps the point under the cursor fixed: applyView() maps
+        // screen = (world - center) * s + center + offset, so the offsets
+        // must unwind the canvas-center term, not the raw origin.
+        assert!(
+            INDEX_HTML.contains("mx - w / 2 - (mx - w / 2 - view.ox) * k"),
+            "zoom x offset must anchor at the cursor around canvas center"
+        );
+        assert!(
+            INDEX_HTML.contains("my - h / 2 - (my - h / 2 - view.oy) * k"),
+            "zoom y offset must anchor at the cursor around canvas center"
+        );
+        assert!(
+            !INDEX_HTML.contains("view.ox = mx - (mx - view.ox) * k"),
+            "old origin-anchored zoom math must be gone: it flings the scene on wheel zoom"
+        );
+    }
 }

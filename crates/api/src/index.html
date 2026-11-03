@@ -288,6 +288,7 @@ const legText = (l) => {
   return `${l.venue} ${symText(l.symbol)} ${l.side} ${fmt(q, 6)} @ ${fmt(p)} = $${fmt(q * p)}`;
 };
 const tradeFees = (t) => (t.fills || []).reduce((a, f) => a + Number(f.fee_quote || 0), 0);
+const rowKey = (t) => `${t.ts_ms || 0}|${t.intent?.strategy || ''}|${t.intent?.expected_edge_bps || ''}`;
 // venue base positions in unit space; layout() maps them onto the canvas
 function venueBase(name) {
   const ci = CEX.indexOf(name), di = DEX.indexOf(name);
@@ -331,8 +332,10 @@ function applyView() {
 function zoomAt(mx, my, f) {
   const s1 = Math.min(Math.max(view.s * f, 0.5), 3);
   const k = s1 / view.s;
-  view.ox = mx - (mx - view.ox) * k;
-  view.oy = my - (my - view.oy) * k;
+  // anchor at the cursor: screen = (world - center) * s + center + offset
+  const w = canvas.width / DPR, h = canvas.height / DPR;
+  view.ox = mx - w / 2 - (mx - w / 2 - view.ox) * k;
+  view.oy = my - h / 2 - (my - h / 2 - view.oy) * k;
   view.s = s1;
   applyView();
 }
@@ -503,7 +506,7 @@ canvas.addEventListener('wheel', (ev) => {
 // ---------- flow state, arcs, pulses, replay ----------
 // Flows are plain data (screen-space quadratic segments); the frame loop
 // draws them every frame. No geometry is allocated per trade.
-const state = { flows: [], total: 0, enabled: new Set(STRAT_NAMES), replayHead: -1, live: true,
+const state = { flows: [], total: 0, enabled: new Set(STRAT_NAMES), replayHead: -1, live: true, openRows: new Set(),
   status: null, strategies: {}, fStrats: new Set(STRAT_NAMES), fVenue: '', fOutcome: 'all', fSym: '', fLimit: 100 };
 let arcs = []; // {a, b, color, w} venue names; endpoints resolve per frame
 let pulses = []; // {a, b, color, r, t, speed} venue names + progress
@@ -651,12 +654,16 @@ function renderTrades() {
   const tb = $('tradeTbl').querySelector('tbody');
   const list = filteredTrades();
   $('fCount').textContent = `${list.length}/${state.flows.length} shown`;
-  const rows = list.slice(0, state.fLimit).map((t) => {
+  const shown = list.slice(0, state.fLimit);
+  // drop keys that scrolled out so the set stays bounded over long runs
+  state.openRows = new Set([...state.openRows].filter((k) => shown.some((t) => rowKey(t) === k)));
+  const rows = shown.map((t) => {
     const legs = (t.intent?.legs || []).map(legText).join('<br>');
     const time = t.ts_ms ? new Date(t.ts_ms).toLocaleTimeString('en-GB') : '—';
     const pnl = t.realized_pnl_quote != null ? `<span class="${cls(t.realized_pnl_quote)}">${fmt(t.realized_pnl_quote)}</span>` : `<span class="dim">—</span>`;
-    return `<tr><td>${time}</td><td>${t.intent?.strategy ?? '—'}</td><td class="legs" style="text-align:left">${legs}</td>` +
-      `<td class="num">${t.intent?.expected_edge_bps ?? '—'}</td><td class="num">${fmt(tradeFees(t))}</td><td>${pnl}</td></tr>`;
+    const open = state.openRows.has(rowKey(t)) ? ' class="open"' : '';
+    return `<tr data-k="${rowKey(t)}"${open}><td>${time}</td><td>${t.intent?.strategy ?? '—'}</td><td class="legs" style="text-align:left">${legs}</td>` +
+      `<td class="num">${t.intent?.expected_edge_bps != null ? fmt(t.intent.expected_edge_bps) : '—'}</td><td class="num">${fmt(tradeFees(t))}</td><td>${pnl}</td></tr>`;
   });
   tb.innerHTML = rows.length ? rows.join('') : `<tr><td colspan="6" class="dim">no trades match</td></tr>`;
 }
@@ -706,8 +713,11 @@ for (const s of STRAT_NAMES) {
     const b = document.createElement('button');
     b.textContent = s; b.dataset.strat = s; b.setAttribute('aria-pressed', 'true');
     b.addEventListener('click', () => {
-      if (state[setKey].has(s)) { state[setKey].delete(s); b.setAttribute('aria-pressed', 'false'); }
-      else { state[setKey].add(s); b.setAttribute('aria-pressed', 'true'); }
+      // one strategy, one visibility: the scene and the table follow together
+      const on = !state[setKey].has(s);
+      for (const key of ['enabled', 'fStrats']) {
+        if (on) state[key].add(s); else state[key].delete(s);
+      }
       syncChipPair(s);
       rebuildFlows();
       renderTrades();
@@ -725,7 +735,14 @@ function syncChipPair(s) {
   }
 }
 $('liveBtn').addEventListener('click', () => {
-  if (state.replayHead >= 0) { $('replayRange').value = $('replayRange').max; applyReplay(state.flows.length); }
+  if (state.replayHead >= 0) { $('replayRange').value = $('replayRange').max; applyReplay(state.flows.length); return; }
+  // the switch turns off too: freeze on the newest frame, polling keeps loading behind it
+  if (state.flows.length) {
+    state.replayHead = state.flows.length - 1;
+    state.live = false;
+    $('replayRange').value = state.replayHead;
+    rebuildFlows();
+  }
 });
 $('stepBack').addEventListener('click', () => stepReplay(-1));
 $('stepFwd').addEventListener('click', () => stepReplay(1));
@@ -748,7 +765,9 @@ $('fSym').addEventListener('input', (e) => { state.fSym = e.target.value.toUpper
 $('fLimit').addEventListener('change', (e) => { state.fLimit = Number(e.target.value) || 100; renderTrades(); });
 $('tradeTbl').querySelector('tbody').addEventListener('click', (e) => {
   const tr = e.target.closest('tr');
-  if (tr) tr.classList.toggle('open');
+  if (!tr || !tr.dataset.k) return; // "no trades match" row carries no key
+  if (tr.classList.toggle('open')) state.openRows.add(tr.dataset.k);
+  else state.openRows.delete(tr.dataset.k);
 });
 $('key').value = sessionStorage.getItem('apiKey') || '';
 $('key').addEventListener('input', (e) => sessionStorage.setItem('apiKey', e.target.value));
