@@ -52,7 +52,7 @@ cargo xtask ablate    # S8 ablation matrix, then the full suite
 | Binance | CEX | spot books, perp funding, lag leader | 10 bps (0.10%) |
 | Bybit | CEX | spot books, perp funding | 10 bps |
 | OKX | CEX | spot books, perp funding | 10 bps |
-| Indodax | CEX (IDR) | IDR books normalized via live USDT/IDR rate (own book, cross-checked; `[indodax] usd_idr` is only a fallback reference for the strategy's own math) | 51 bps (~0.51% incl. tax) |
+| Indodax | CEX (IDR) | IDR books normalized with the executable sides of the live, cross-checked USDT/IDR rate | 51 bps (~0.51% incl. tax) |
 | Kraken | CEX | spot books (no sender yet) | 80 bps (0.80% tier-1) |
 | Uniswap | DEX (EVM) | V2 pools quoted locally; V3 quoter types/addresses | 30 bps V2 (0.30%) |
 | PancakeSwap | DEX (EVM) | V2 pools quoted locally; V3 quoter types/addresses | 25 bps V2 (0.25%) |
@@ -88,8 +88,6 @@ intents of their own.
 | 2 | `triangular` | `triangular.rs` | One-venue A→B→C→A cycle ends with more than it started | 3 spot | yes | `[strategies] triangular` |
 | 3 | `funding_rate` | `funding.rs` | Long spot + short perp to collect positive funding (S4 exit) | 1 spot + 1 perp | **no** (opens a position) | `[strategies] funding_rate` |
 | 4 | `cex_dex` | `cex_dex.rs` | CEX book vs DEX quote, net of gas (S5 size sweep) | 1 CEX spot + 1 DEX | yes | `[strategies] cex_dex` |
-| 5 | `lag_chase` (S1) | `lag_chase.rs` | Leader jumps, thin follower hasn't moved yet — take the stale side | 2 spot | yes | auto: needs Binance + Indodax (see below) |
-| 6 | `fx_triangle` (S3) | `fx_triangle.rs` | IDR book mispriced vs USDT book around the USD/IDR reference | 2 spot | yes | auto: needs Binance + Indodax (see below) |
 
 ### Shared contract
 
@@ -100,8 +98,10 @@ All strategies share `StrategyParams` (from `[params]` in config):
 | `min_edge_bps` | 15 | Minimum **net** edge (after fees + slippage buffer) to emit |
 | `slip_buffer_bps` | 5 | Extra bps subtracted from every edge before comparing |
 | `target_notional_quote` | 500 | Base order size in quote (USD/USDT) terms |
+| `min_notional_quote` | 500 | `cross_exchange` hard floor; smaller prints cannot cover fixed transfer friction |
+| `rebalance_cost_bps` | 20 | Eventual inventory-transfer friction amortised into the `cross_exchange` edge gate |
 | `max_venue_quote_share_bps` | 2500 | One intent may spend at most this share (bps) of a venue's USDT+USDC ledger; 0 = off |
-| `dex_max_quote_age_ms` | 30000 | Polled DEX quotes older than this never reach `cex_dex` (pollers run every ~10 s) |
+| `dex_max_quote_age_ms` | 2000 | Polled DEX quotes older than this never reach `cex_dex` |
 | `max_book_age_ms` | 2000 | Books older than this, or crossed, never trade (`fresh()`) |
 | `ttl_ms` | 1500 | Intent lifetime |
 
@@ -122,13 +122,14 @@ sell on the venue with the highest VWAP, same symbol, same quantity.
 Assumes pre-funded inventory on every venue — no transfers inside the loop.
 
 - **S2 dynamic sizing**: no fixed size or grid. For each venue pair it
-  walks both books level by level and keeps the largest quantity whose
-  combined VWAP still clears `min_edge_bps` net of fees — size follows the
-  opportunity. Deep books fill big, thin books fill small; anything the
-  book cannot fill never emits. This replaces `target_notional_quote`
-  for this strategy.
-- Buy and sell venues must differ. Edge is net of both venues' taker fees
-  plus `slip_buffer_bps`.
+  walks both books level by level and stops at the first marginal chunk
+  that does not clear `min_edge_bps` net of fees, slippage, and
+  `rebalance_cost_bps` — a passing average never drags in loss-making
+  tail depth. A candidate below `min_notional_quote` never emits.
+- Buy and sell venues must differ. Per-gate rejection counters
+  (`edge`, `imbalance`, `min_notional`, `stale`, `share`) are exposed on
+  `/strategies` and `/metrics`, and a filled two-leg spread cannot refill
+  until that raw spread has been observed closed and then reopens.
 - Optional **S6 imbalance gate**: also require the
   buy-side book to be bid-heavy and the sell-side book ask-heavy (see
   [S6](#s6-imbalance--a-gate-on-cross_exchange-not-a-strategy)). Off unless
@@ -150,7 +151,9 @@ the signal is the end/start ratio. Fires only when
 `(ratio − 1) × 10_000` bps. Sizes from `target_notional_quote` as the
 starting USDT amount. Any stale/crossed/short book in the chain kills that
 cycle only. `roundtrip = true`. Cycles are data (`Cycle { steps }`), so
-adding a triangle is a config-shaped change, not new logic.
+adding a triangle is a config-shaped change, not new logic. The engine
+does not wire triangular on Indodax or Kraken, where conversion/fee
+stacks make three taker legs structurally unpayable.
 
 ### 3. `funding_rate` — collect perp funding (includes S4)
 
@@ -160,19 +163,21 @@ collecting funding each interval. Legs carry explicit `MarketKind::Spot` /
 `MarketKind::Perp` — executors never guess market type from the symbol.
 
 - Fires when annualized funding (`rate × intervals/year × 10_000` bps)
-  clears `min_funding_annualized_bps` (default 500) **plus** entry cost
-  (2 × taker fee + slippage buffer). Reported edge is annualized funding
-  net of entry cost. Sized from `target_notional_quote` at the spot ask.
+  clears `min_funding_annualized_bps` (default 500) **and** the round-trip
+  taker/slip cost of both entry and exit, amortised over
+  `funding_planned_hold_hours` (default 720 = 30 days). Reported edge is
+  annualized funding net of that reserved round-trip cost. Sized from
+  `target_notional_quote` at the spot ask.
 - `roundtrip = false`: this opens a position. Paper PnL is *not* booked at
   fill; funding accrues over time (`accrued(notional, rate, hours)`).
-- **Fire-once**: an open (venue, symbol) pair never re-fires until closed
-  (`mark_closed`), so the strategy cannot churn every tick. This holds
-  across restarts and redeploys: filled entries reload from the JSONL
-  store at startup and re-seed the open set.
+- **Fire-once**: an open (venue, symbol) pair never re-fires until its
+  closing legs fill. Filled entry quantities reload from the JSONL store
+  at startup (entries minus exits), so restarts cannot reopen duplicates.
 - **S4 exit timing** (`with_exit(window, threshold)`, defaults: last 5
-  prints vs `min_funding_annualized_bps`): the strategy records annualized
-  prints per pair; when the window mean drops below the exit threshold
-  (funding flipped cold), the pair is marked closed and may re-enter later.
+  prints vs `min_funding_annualized_bps`): when the window mean drops
+  below the threshold, the strategy emits real sell-spot + buy-perp legs
+  for the filled quantity on a fresh book. It stays open if no executable
+  book exists; once the exit fills, credits stop and it may re-enter later.
 - Feeds are live: Binance (`markPrice@1s`), Bybit linear `tickers`, and
   OKX `funding-rate` stream into the tick view (`crates/feed/src/funding.rs`).
   Prints older than `max_book_age_ms` never reach the strategy, so a stalled
@@ -195,6 +200,8 @@ it fire.
 - Only the CEX leg pays a taker fee in the edge math (the DEX fee is inside
   the quoted price). Stale DEX quotes and stale/crossed CEX books are
   skipped per venue — a missing book on one venue never hides the others.
+  The engine passes only SOL, ETH, and BNB symbols, the bases with real
+  DEX quote sources.
 - TTL is 4× the shared `ttl_ms` (DEX settlement is slower than a CEX fill).
   `roundtrip = true`.
 - Quote sources polled live: Jupiter HTTP for SOL/USDT and SOL/USDC
@@ -204,51 +211,21 @@ it fire.
   `target_notional_quote` so smaller sweeps see a conservative price.
   Quotes older than `dex_max_quote_age_ms` never reach the strategy.
 
-### 5. `lag_chase` — S1 lead-lag stale-book take (Binance → Indodax)
+### Retired duplicates: `lag_chase` and the former IDR-FX strategy
 
-Hypothesis: thin IDR books lag the global leader by 100–500 ms after jumps.
-When the Binance mid moves more than `jump_bps` in one tick and Indodax has
-not followed, take the stale side on Indodax (buy its cheap asks after an
-up-jump, sell into its rich bids after a down-jump) hedged with the opposite
-leg on Binance.
+The former IDR-FX strategy has been deleted: after IDR books were
+normalized it built the identical Binance↔Indodax two-leg intent as
+`cross_exchange`, so one dislocation could fill under two names.
+`lag_chase` remains in the strategy crate for research/tests but is no
+longer wired into the engine for the same duplication reason.
 
-- First sighting of a symbol only primes the previous-mid tracker; it never
-  trades blind. Size is `target_notional_quote` capped by the follower's
-  near-touch depth (`depth_within_bps(side, 10)`), then VWAP-checked, then
-  net-edge-checked with both venues' real fees — Indodax's 51 bps blocks
-  most marginal chases, by design.
-- Engine wiring: no separate config flag. It is added automatically when
-  `cross_exchange = true` and both Binance and Indodax are in `venues`,
-  with a conservative 30 bps jump threshold so paper stays quiet
-  until a real dislocation prints. `roundtrip = true`.
-- Falsifier (in tests): shuffling timestamps / staleness must kill the
-  edge — stale books never fire.
-
-### 6. `fx_triangle` — S3 IDR-FX triangle (Binance ↔ Indodax)
-
-Exploits mispricing between Indodax's IDR books (normalized to USDT at
-the live USDT/IDR rate) and Binance's USDT books. Checks both directions
-(buy Binance / sell Indodax and the reverse) at VWAP for
-`target_notional_quote`, net of the real 10 bps vs 51 bps fee asymmetry.
-
-- The catch this strategy exists to respect: a stale USD/IDR reference
-  manufactures phantom spreads far larger than any real venue edge (a
-  16000 vs 19000 rate error moves the USD print by >1000 bps; the old
-  static 19000 did exactly this against an ~18100 market). In live mode
-  the divisor is therefore streamed, never configured: Indodax's own
-  USDT/IDR order-book midpoint, validated per tick against independent
-  USDT/IDR sources — the Upbit Indonesia book plus the crosses implied
-  by fresh Binance `X/USDT` vs Indodax `X/IDR` books (`crates/feed/src/fx.rs`).
-  If the primary book is stale/crossed/wide, or deviates from the
-  independent consensus by more than `[indodax] rate_max_deviation_bps`
-  (default 300), Indodax books are withheld entirely — there is no
-  fallback rate. Cash USD/IDR (Google, ECB reference) is never used: it
-  prices bank dollars, not USDT. `[indodax] usd_idr` is only a fallback
-  reference for the strategy's own math. Rate state is visible at `/status` (`usdt_idr`)
-  and as `arb_usdt_idr_*` metrics, and the strategy records the divisor
-  it actually saw (`usd_idr_used`).
-- Engine wiring: same auto-enable rule as `lag_chase` (`cross_exchange`
-  on + Binance and Indodax present). `roundtrip = true`.
+Indodax books still reach `cross_exchange`, but conversion now crosses
+the executable FX spread (IDR bid ÷ USDT/IDR ask; IDR ask ÷ USDT/IDR
+bid), stamps the result with the older of book/divisor, and withholds
+books unless the live primary divisor is fresh, tight, and corroborated
+by independent consensus. A single-source unchecked divisor never
+converts a book. Cash USD/IDR is never used: it prices bank dollars,
+not USDT.
 
 ### S6 `imbalance` — a gate on `cross_exchange`, not a strategy
 
@@ -312,7 +289,7 @@ if `API_TOKEN` is set in env, the POST rows below need `?token=<value>`
 |---|---|---|
 | `/health` | GET | `{"ok":true}` |
 | `/status` | GET | mode, killed, engine start (`started_ms`, page shows uptime), trades, realized PnL, opportunities, per-venue connector health (socket state reported separately from fresh-book counts), paused strategies, portfolio (per-venue balances, equity, realized/unrealized PnL), open positions with entry qty/`$` plus live mark and market value |
-| `/metrics` | GET | text metrics incl. per-strategy funnel counters (scans, intents, fill failures, `dup_skipped` same-top refills, trades, PnL; `risk_rejected` stays 0 — the pre-trade gate is removed) and per-venue book freshness |
+| `/metrics` | GET | text metrics incl. per-strategy funnel counters (scans, gate rejections by `edge`/`imbalance`/`min_notional`/`stale`/`share`, intents, fill failures, `dup_skipped`, trades, PnL) and per-venue book freshness |
 | `/flows` | GET | JSON snapshot of the last 200 trades (for the scene and tables) |
 | `/` | GET | strategy-flow page: 2D venue flow map + ops drawer (strategy, metrics, trades, PnL, fees, positions with live marks, token-gated controls), mobile-first, zero dependencies |
 | `/dashboard` | GET | same bytes as `/` |
@@ -341,12 +318,12 @@ Top-level `venues` / `symbols` must stay above the first `[table]` header.
 | `[engine] tick_ms` | 250 | tick-loop period |
 | `[engine] api_addr` | `127.0.0.1:8787` | control-API bind; omit to disable |
 | `[engine] jsonl_path` | `paper-trades.jsonl` | paper-trade log; each start appends a `session_start` record, trades carry `session_id` + `engine_version`, and history reloads at startup |
-| `[strategies]` | all `true` | toggles for `cross_exchange`, `triangular`, `funding_rate`, `cex_dex` (`lag_chase`/`fx_triangle` ride on `cross_exchange`) |
-| `[params]` | see [Shared contract](#shared-contract) | `min_edge_bps`, `slip_buffer_bps`, `target_notional_quote`, `max_book_age_ms`, `ttl_ms` |
-| `[params] min_funding_annualized_bps` | 500 | funding-rate entry bar |
+| `[strategies]` | all `true` | toggles for the four active strategies: `cross_exchange`, `triangular`, `funding_rate`, `cex_dex` |
+| `[params]` | see [Shared contract](#shared-contract) | `min_edge_bps`, `slip_buffer_bps`, `target_notional_quote`, `min_notional_quote`, `rebalance_cost_bps`, `max_book_age_ms`, `ttl_ms` |
+| `[params] min_funding_annualized_bps` | 500 | funding-rate annualized entry bar |
+| `[params] funding_planned_hold_hours` | 720 | horizon over which funding must repay entry + exit costs |
 | `[params] imbalance_threshold` | unset (off) | S6 gate: both-sided imbalance bar, e.g. 0.2 |
-| `[indodax] usd_idr` | 19000 | fallback reference for the strategy's own math; book conversion always uses the streamed live rate |
-| `[indodax] rate_max_age_ms` | 30000 | max age of the live USDT/IDR book used as divisor |
+| `[indodax] rate_max_age_ms` | 2000 | max age of the live USDT/IDR book used as divisor |
 | `[indodax] rate_max_spread_bps` | 50 | max USDT/IDR top-of-book spread (bps of mid) |
 | `[indodax] rate_max_deviation_bps` | 300 | max deviation vs independent consensus before Indodax is withheld |
 | `[paper] start_quote_per_venue` | 200 | seeded USDT per venue; USDC seeds DEX wallets only (SOL/USDC), so starting capital is not double-counted. Base is seeded only on Binance (BTC/ETH/SOL, one fill each at the reference price) so the portfolio fits the starting capital. `[paper.capital] <venue>` overrides one venue; the shipped config spreads $10k across the five CEX venues so the 25% share guard admits target-size prints |
@@ -359,7 +336,7 @@ venue so the paper soak behaves like the live book.
 ```
 crates/core      types (Venue/Symbol/Intent), L2 book (snapshot/diff/VWAP/depth), decimal money math
 crates/feed      Binance/Bybit/OKX/Indodax/Kraken parsers, WS URLs/frames, live WS tasks, IDR->USD books
-crates/strategy  Strategy trait + MarketView; all six strategies + imbalance filter (S6); fee_table (S7) / ablate (S8) test harnesses
+crates/strategy  Strategy trait + MarketView; four active strategies + imbalance filter (S6); fee_table (S7) / ablate (S8) test harnesses
 crates/paper     book-walking fill simulator (fees + slippage haircut, inventory-enforced)
 crates/exec      live send gate (armed check), env key loading, HMAC-SHA256 signing, Binance + Bybit testnet senders
 crates/dex-evm   Uniswap + PancakeSwap quoting (exact V2 math; V3 quoter types + addresses)
@@ -437,8 +414,7 @@ manifest to auto-update on Apple Silicon.
 4. Set keys in env, set `mode = "live"`, keep caps tiny. The executor
    refuses to arm without keys; the kill-switch (`POST /kill`) blocks all
    intents. Verify Indodax fees, and confirm `/status` shows
-   `usdt_idr.state = "ok"`, before enabling `lag_chase` / `fx_triangle`
-   with real money.
+   `usdt_idr.state = "ok"` before trusting Indodax books with real money.
 
 ## Safety defaults
 
@@ -462,12 +438,13 @@ manifest to auto-update on Apple Silicon.
   (off unless set); S7 fee table is a test-only harness, not engine-wired.
 - Cross-exchange assumes pre-funded balances on both venues; rebalancing
   stays out of the strategy loop by design (no pre-trade gate), but every
-  virtual transfer burns its sender's per-venue fee and debits strategy +
-  engine realized PnL, so friction shows up in the numbers. Transfers
-  overshoot a shortfall to at least 100x the fee, legs debiting the same
-  venue ledger are funded by one aggregated transfer, and an intent
-  whose expected profit cannot cover the transfer fees is left unfunded
-  (the fill is skipped) instead of being funded at a guaranteed loss.
+  virtual transfer burns its sender's per-venue fee and debits strategy,
+  engine, and that trade's stored realized PnL. Transfers overshoot a
+  shortfall toward 100x the fee when the donor can carry the chunk (else
+  they move the exact shortfall), legs debiting one ledger are funded
+  from the simulated deepest deficit, and an intent whose expected
+  profit cannot cover transfer fees is left unfunded instead of being
+  funded at a guaranteed loss.
 
 ## Sources (official docs used for connector facts)
 

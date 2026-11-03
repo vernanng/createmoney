@@ -2,6 +2,58 @@
 
 use super::*;
 
+/// A two-leg spot spread that already filled once and has not closed since.
+pub(crate) struct BlockedSpread {
+    pub(crate) buy_venue: Venue,
+    pub(crate) sell_venue: Venue,
+    pub(crate) symbol: Symbol,
+}
+
+/// The directional two-leg spot spread in an intent, if it has one.
+fn cross_spread(intent: &Intent) -> Option<(String, BlockedSpread)> {
+    if !intent.roundtrip || intent.legs.len() != 2 {
+        return None;
+    }
+    let buy = intent
+        .legs
+        .iter()
+        .find(|l| l.side == Side::Buy && l.market == MarketKind::Spot)?;
+    let sell = intent
+        .legs
+        .iter()
+        .find(|l| l.side == Side::Sell && l.market == MarketKind::Spot)?;
+    if buy.symbol != sell.symbol || buy.venue == sell.venue {
+        return None;
+    }
+    Some((
+        format!("{:?}->{:?}:{}", buy.venue, sell.venue, buy.symbol),
+        BlockedSpread {
+            buy_venue: buy.venue,
+            sell_venue: sell.venue,
+            symbol: buy.symbol.clone(),
+        },
+    ))
+}
+
+/// Triangular stays off venues whose fee or FX-conversion stack makes a
+/// three-leg taker cycle structurally unpayable.
+fn triangular_venues(venues: &[Venue]) -> Vec<Venue> {
+    venues
+        .iter()
+        .copied()
+        .filter(|v| !matches!(v, Venue::Indodax | Venue::Kraken))
+        .collect()
+}
+
+/// Only symbols with a real DEX quote source can ever reach cex_dex.
+fn cex_dex_symbols(symbols: &[Symbol]) -> Vec<Symbol> {
+    symbols
+        .iter()
+        .filter(|s| matches!(s.base.as_str(), "SOL" | "ETH" | "BNB"))
+        .cloned()
+        .collect()
+}
+
 pub(crate) struct Engine {
     pub(crate) cfg: config::Config,
     pub(crate) symbols: Vec<Symbol>,
@@ -14,6 +66,9 @@ pub(crate) struct Engine {
     /// Tops at the last fill per opportunity key. Paper fills never consume
     /// book depth, so without this the same print refires every tick.
     pub(crate) last_fill_print: BTreeMap<String, String>,
+    /// Cross spreads filled once and not yet observed closed. A mere
+    /// top-of-book flicker inside the same dislocation must not refill it.
+    pub(crate) blocked_spreads: BTreeMap<String, BlockedSpread>,
     pub(crate) live: LiveExecutor,
     pub(crate) session_id: String,
     /// Wall-clock start of this run, surfaced via status for viewer uptime.
@@ -51,7 +106,7 @@ impl Engine {
         if cfg.strategies.triangular {
             strategies.push(Box::new(Triangular::new(
                 params.clone(),
-                cex.clone(),
+                triangular_venues(&cex),
                 Triangular::default_cycles(),
             )));
         }
@@ -63,6 +118,7 @@ impl Engine {
                 .collect();
             strategies.push(Box::new(
                 FundingStrategy::new(params.clone(), cfg.params.min_funding_annualized_bps, pairs)
+                    .with_planned_hold_hours(cfg.params.funding_planned_hold_hours)
                     .with_open_pairs(restored_pairs),
             ));
         }
@@ -70,32 +126,9 @@ impl Engine {
             strategies.push(Box::new(CexDex::new(
                 params.clone(),
                 cex.clone(),
-                symbols.clone(),
+                cex_dex_symbols(&symbols),
             )));
         }
-        // S1 + S3: lead-lag and FX-triangle ride on the cross-exchange flag.
-        // Conservative jump threshold so paper stays quiet until a real
-        // dislocation prints; only wired when both venues exist.
-        if cfg.strategies.cross_exchange
-            && cex.contains(&Venue::Binance)
-            && cex.contains(&Venue::Indodax)
-        {
-            strategies.push(Box::new(LagChase::new(
-                params.clone(),
-                Venue::Binance,
-                Venue::Indodax,
-                symbols.clone(),
-                Decimal::new(30, 0),
-            )));
-            strategies.push(Box::new(FxTriangle::new(
-                params.clone(),
-                Venue::Binance,
-                Venue::Indodax,
-                symbols.clone(),
-                cfg.indodax.usd_idr,
-            )));
-        }
-
         // One clock for the whole run: the viewer renders uptime from it.
         let started_ms = now_ms();
         let shared = Arc::new(Shared {
@@ -211,6 +244,7 @@ impl Engine {
             opportunities: 0,
             per_strategy: BTreeMap::new(),
             last_fill_print: BTreeMap::new(),
+            blocked_spreads: BTreeMap::new(),
             live,
             session_id: new_session_id(),
             started_ms,
@@ -343,7 +377,7 @@ impl Engine {
                                 self.cfg.params.max_book_age_ms,
                             ),
                         ) {
-                            view.put(arb_feed::idr_book_to_usd(&raw, rate.mid));
+                            view.put(arb_feed::idr_book_to_usd(&raw, &rate));
                         }
                     }
                     continue;
@@ -375,9 +409,6 @@ impl Engine {
                     .map(|(r, _)| r.clone()),
             );
         }
-        // Publish the divisor for provenance (FxTriangle records it).
-        view.usdt_idr_mid = fx.rate.map(|r| r.mid);
-        view.usdt_idr_ts_ms = fx.rate.map(|r| r.ts_ms);
         // Venue ledgers backing the share cap, so single-venue strategies
         // size to what the engine's risk gate would accept anyway.
         view.venue_quote = self
@@ -396,6 +427,23 @@ impl Engine {
     pub(crate) fn tick(&mut self) {
         let view = self.build_view();
         let now = view.now_ms;
+        // A blocked spread reopens only after its raw bid/ask dislocation
+        // has actually been observed closed on a later tick.
+        self.blocked_spreads.retain(|_, spread| {
+            let buy = view
+                .books
+                .get(&(spread.buy_venue, spread.symbol.to_string()));
+            let sell = view
+                .books
+                .get(&(spread.sell_venue, spread.symbol.to_string()));
+            match (
+                buy.and_then(|b| b.best_ask()),
+                sell.and_then(|b| b.best_bid()),
+            ) {
+                (Some(ask), Some(bid)) => bid.price > ask.price,
+                _ => true,
+            }
+        });
         // Settle due virtual transfers before pricing new intents, so a
         // delayed rebalance becomes spendable exactly when its delay elapses.
         self.paper.settle_due(now);
@@ -414,21 +462,40 @@ impl Engine {
                 if paused.iter().any(|p| p == st.name()) {
                     continue;
                 }
-                self.per_strategy
-                    .entry(st.name().to_string())
-                    .or_default()
-                    .scans += 1;
-                intents.extend(st.on_tick(&view));
+                let strategy_intents = st.on_tick(&view);
+                let gates = st.gate_rejections();
+                let metrics = self.per_strategy.entry(st.name().to_string()).or_default();
+                metrics.scans += 1;
+                metrics.edge_rejected = gates.edge;
+                metrics.imbalance_rejected = gates.imbalance;
+                metrics.min_notional_rejected = gates.min_notional;
+                metrics.stale_rejected = gates.stale_or_missing;
+                intents.extend(strategy_intents);
             }
         }
         for intent in intents {
-            // Repeat-fill guard: paper fills never consume book depth, so an
-            // unchanged top of book would refill every tick. Drop the intent
-            // when every leg's top matches the last fill's.
-            // shortcut: same-price refills are dropped, not sized down;
+            // Repeat-fill guard: paper fills never consume book depth. A
+            // two-leg spot spread stays blocked until it closes; other
+            // intent shapes keep the exact-top fingerprint guard.
+            // shortcut: same-spread refills are dropped, not sized down;
             // upgrade to paper-local depth consumption when partial fills matter.
             let key = fill_key(&intent);
-            let print = fill_print(&intent, &view.books);
+            let spread = cross_spread(&intent);
+            if let Some((spread_key, _)) = &spread {
+                if self.blocked_spreads.contains_key(spread_key) {
+                    self.per_strategy
+                        .entry(intent.strategy.clone())
+                        .or_default()
+                        .dup_skipped += 1;
+                    tracing::debug!(strategy = %intent.strategy, "same spread still open since last fill; skipped");
+                    continue;
+                }
+            }
+            let print = if spread.is_some() {
+                None
+            } else {
+                fill_print(&intent, &view.books)
+            };
             if let Some(p) = &print {
                 if self.last_fill_print.get(&key) == Some(p) {
                     self.per_strategy
@@ -458,19 +525,23 @@ impl Engine {
                 &self.paper,
                 self.cfg.params.max_venue_quote_share_bps,
             ) {
-                self.per_strategy
+                let metrics = self
+                    .per_strategy
                     .entry(intent.strategy.clone())
-                    .or_default()
-                    .risk_rejected += 1;
+                    .or_default();
+                metrics.share_rejected += 1;
+                metrics.risk_rejected += 1;
                 tracing::debug!(strategy = %intent.strategy, "intent exceeds venue quote share; skipped");
                 continue;
             }
             match self.paper.execute(&intent, &view.books, now) {
                 Ok(result) => {
-                    if let Some(p) = print.clone() {
+                    if let Some((spread_key, spread)) = spread {
+                        self.blocked_spreads.insert(spread_key, spread);
+                    } else if let Some(p) = print.clone() {
                         self.last_fill_print.insert(key.clone(), p);
                     }
-                    self.on_paper_fill(intent, result, now)
+                    self.on_paper_fill(intent, result, now, Decimal::ZERO)
                 }
                 Err(e) => {
                     // Self-rebalance (paper-only, never a live movement):
@@ -511,10 +582,12 @@ impl Engine {
                     }
                     match self.paper.execute(&intent, &view.books, now) {
                         Ok(result) => {
-                            if let Some(p) = print.clone() {
+                            if let Some((spread_key, spread)) = spread {
+                                self.blocked_spreads.insert(spread_key, spread);
+                            } else if let Some(p) = print.clone() {
                                 self.last_fill_print.insert(key.clone(), p);
                             }
-                            self.on_paper_fill(intent, result, now)
+                            self.on_paper_fill(intent, result, now, transfer_cost)
                         }
                         Err(e) => {
                             self.per_strategy
@@ -548,7 +621,13 @@ impl Engine {
 
     /// Paper accounting for one filled intent: metrics, JSONL, and (live
     /// mode only) best-effort testnet sends that can only log, never mutate.
-    pub(crate) fn on_paper_fill(&mut self, intent: Intent, result: PaperFill, now: i64) {
+    pub(crate) fn on_paper_fill(
+        &mut self,
+        intent: Intent,
+        result: PaperFill,
+        now: i64,
+        transfer_fee_quote: Decimal,
+    ) {
         // Live Binance/Bybit legs (testnet): collect while `intent`
         // is still borrowed; sends spawn after the paper accounting
         // below, so a send failure can only log — never lose paper.
@@ -575,16 +654,22 @@ impl Engine {
         // Opens belong to fills, not intents: a strategy tracks a pair
         // only once the executor actually filled it, so failed fills
         // cannot strand phantoms that never close.
-        if let Some(leg) = intent.legs.first() {
-            for st in self.strategies.iter_mut() {
-                if st.name() == intent.strategy {
-                    st.note_filled(leg.venue, &leg.symbol);
-                }
+        for st in self.strategies.iter_mut() {
+            if st.name() == intent.strategy {
+                st.note_filled(&intent);
             }
         }
-        // Funding entries earn per-interval credits on their spot notional.
+        // Funding entries earn per-interval credits on their spot notional;
+        // exits remove the pair so later prints credit nothing.
         if intent.strategy == "funding_rate" {
             if let Some(f) = result
+                .fills
+                .iter()
+                .find(|f| f.market == MarketKind::Spot && f.side == Side::Sell)
+            {
+                self.paper
+                    .close_funding_pair(f.venue, &f.symbol.to_string());
+            } else if let Some(f) = result
                 .fills
                 .iter()
                 .find(|f| f.market == MarketKind::Spot && f.side == Side::Buy)
@@ -597,12 +682,15 @@ impl Engine {
                 );
             }
         }
+        // Aggregate realized PnL was already debited this fee before the
+        // retry; the per-trade record carries the same net figure.
+        let net_pnl = result.realized_pnl_quote.map(|p| p - transfer_fee_quote);
         tracing::info!(strategy = %intent.strategy, edge_bps = %intent.expected_edge_bps,
-            pnl = ?result.realized_pnl_quote, legs = intent.legs.len(), "paper trade");
+            pnl = ?net_pnl, legs = intent.legs.len(), "paper trade");
         let stored = StoredTrade {
             intent,
             fills: result.fills,
-            realized_pnl_quote: result.realized_pnl_quote,
+            realized_pnl_quote: net_pnl,
             ts_ms: now,
             session_id: self.session_id.clone(),
             engine_version: ENGINE_VERSION.into(),
@@ -852,5 +940,38 @@ impl Engine {
                 }
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strategy_wiring_filters_unpayable_venues_and_dead_dex_symbols() {
+        assert_eq!(
+            triangular_venues(&[
+                Venue::Binance,
+                Venue::Bybit,
+                Venue::Okx,
+                Venue::Indodax,
+                Venue::Kraken,
+            ]),
+            vec![Venue::Binance, Venue::Bybit, Venue::Okx]
+        );
+        assert_eq!(
+            cex_dex_symbols(&[
+                Symbol::new("BTC", "USDT"),
+                Symbol::new("SOL", "USDT"),
+                Symbol::new("ETH", "USDT"),
+                Symbol::new("ADA", "USDT"),
+                Symbol::new("BNB", "USDT"),
+            ]),
+            vec![
+                Symbol::new("SOL", "USDT"),
+                Symbol::new("ETH", "USDT"),
+                Symbol::new("BNB", "USDT"),
+            ]
+        );
     }
 }

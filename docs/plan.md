@@ -18,6 +18,15 @@ decision record. Beyond the original four strategies, the S-series shipped:
 
 - `lag_chase` (S1 lead-lag Binance→Indodax) and `fx_triangle` (S3 IDR-FX),
   auto-wired when Binance + Indodax are both configured.
+- 2026-11-03 economics audit correction: the IDR-FX strategy was deleted
+  and `lag_chase` unwired (both duplicated `cross_exchange`); cross now
+  has a $500 notional floor, marginal-depth sizing, amortised rebalance
+  cost, per-gate counters, and no refill until a filled spread closes;
+  stored trade PnL is net of transfer fees; Indodax conversion uses
+  executable FX sides from a fresh corroborated divisor; funding emits
+  real exits and must recover entry + exit costs over a 30-day planned
+  hold; cex_dex is limited to SOL/ETH/BNB with 2-second quote freshness;
+  triangular is not wired on Indodax/Kraken.
 - S2 depth-adaptive sizing inside `cross_exchange`, S4 timed exit inside
   `funding_rate`, S5 multi-size sweep inside `cex_dex`.
 - S6 imbalance gate: wired behind `[params] imbalance_threshold`

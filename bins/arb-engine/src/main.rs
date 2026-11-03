@@ -17,9 +17,7 @@ use arb_feed::{
 };
 use arb_paper::{PaperConfig, PaperExecutor, PaperFill};
 use arb_store::{MemoryStore, SessionStart, Store, StoredTrade, StoredTransfer};
-use arb_strategy::{
-    CexDex, CrossExchange, FundingStrategy, FxTriangle, LagChase, MarketView, Strategy, Triangular,
-};
+use arb_strategy::{CexDex, CrossExchange, FundingStrategy, MarketView, Strategy, Triangular};
 use clap::Parser;
 use rust_decimal::Decimal;
 use std::collections::BTreeMap;
@@ -76,23 +74,47 @@ fn new_session_id() -> String {
     )
 }
 
-/// Pairs with a filled, still-open funding entry in stored history.
-/// There are no closing fills yet, so every stored non-roundtrip
-/// `funding_rate` trade counts as open.
-fn restored_funding_pairs(trades: &[StoredTrade]) -> Vec<(Venue, Symbol)> {
-    let mut out: Vec<(Venue, Symbol)> = Vec::new();
+/// Net open funding quantities rebuilt from stored spot fills: entries
+/// add base, exits subtract it. Legacy records without fills fall back
+/// to their intent legs.
+fn restored_funding_pairs(trades: &[StoredTrade]) -> Vec<(Venue, Symbol, Decimal)> {
+    let mut positions: BTreeMap<(Venue, String), (Symbol, Decimal)> = BTreeMap::new();
     for t in trades {
         if t.intent.strategy != "funding_rate" || t.intent.roundtrip {
             continue;
         }
-        if let Some(leg) = t.intent.legs.first() {
-            let pair = (leg.venue, leg.symbol.clone());
-            if !out.contains(&pair) {
-                out.push(pair);
-            }
+        let spot_fills: Vec<(Venue, Symbol, Side, Decimal)> = t
+            .fills
+            .iter()
+            .filter(|f| f.market == MarketKind::Spot)
+            .map(|f| (f.venue, f.symbol.clone(), f.side, f.qty_base))
+            .collect();
+        let spot_legs: Vec<(Venue, Symbol, Side, Decimal)> = if spot_fills.is_empty() {
+            t.intent
+                .legs
+                .iter()
+                .filter(|l| l.market == MarketKind::Spot)
+                .map(|l| (l.venue, l.symbol.clone(), l.side, l.qty_base))
+                .collect()
+        } else {
+            spot_fills
+        };
+        for (venue, symbol, side, qty) in spot_legs {
+            let delta = match side {
+                Side::Buy => qty,
+                Side::Sell => -qty,
+            };
+            let entry = positions
+                .entry((venue, symbol.to_string()))
+                .or_insert_with(|| (symbol.clone(), Decimal::ZERO));
+            entry.1 += delta;
         }
     }
-    out
+    positions
+        .into_iter()
+        .filter(|(_, (_, qty))| *qty > Decimal::ZERO)
+        .map(|((venue, _), (symbol, qty))| (venue, symbol, qty))
+        .collect()
 }
 
 /// Trades kept in the `/flows` snapshot served to the 3D viewer.
@@ -715,10 +737,10 @@ max_book_age_ms = 2000
     }
 
     #[test]
-    fn restored_funding_pairs_dedupes_and_skips_roundtrips() {
+    fn restored_funding_pairs_net_quantities_and_skip_roundtrips() {
         let trades = vec![
             stored("funding_rate", false, Venue::Bybit, "BTC"),
-            stored("funding_rate", false, Venue::Bybit, "BTC"), // duplicate restart entry
+            stored("funding_rate", false, Venue::Bybit, "BTC"), // second filled entry tops up
             stored("funding_rate", false, Venue::Binance, "ETH"),
             stored("cross_exchange", true, Venue::Bybit, "BTC"),
             stored("funding_rate", true, Venue::Okx, "SOL"), // not a position
@@ -726,8 +748,8 @@ max_book_age_ms = 2000
         assert_eq!(
             restored_funding_pairs(&trades),
             vec![
-                (Venue::Bybit, Symbol::new("BTC", "USDT")),
-                (Venue::Binance, Symbol::new("ETH", "USDT")),
+                (Venue::Binance, Symbol::new("ETH", "USDT"), Decimal::ONE),
+                (Venue::Bybit, Symbol::new("BTC", "USDT"), Decimal::TWO),
             ]
         );
     }
@@ -823,6 +845,67 @@ max_book_age_ms = 2000
         engine.debit_transfer_fees("triangular", Decimal::ZERO);
         assert!(!engine.per_strategy.contains_key("triangular"));
         assert_eq!(engine.paper.realized_pnl, Decimal::new(-250, 2));
+    }
+
+    #[test]
+    fn stored_trade_pnl_includes_rebalance_transfer_fee() {
+        let cfg: config::Config = toml::from_str(
+            r#"
+venues = ["binance", "bybit"]
+symbols = ["BTC/USDT"]
+
+[engine]
+mode = "paper"
+
+[params]
+min_edge_bps = 15
+slip_buffer_bps = 5
+target_notional_quote = 50
+max_book_age_ms = 2000
+"#,
+        )
+        .unwrap();
+        let mut engine = engine::Engine::new(cfg).unwrap();
+        // Bybit can fund the buy and donate the BTC Binance is short for
+        // the sell leg; that donation is a paid paper transfer.
+        engine
+            .paper
+            .seed(Venue::Bybit, "USDT", Decimal::new(10_000, 0));
+        engine.paper.seed(Venue::Bybit, "BTC", Decimal::ONE);
+        let btc = Symbol::new("BTC", "USDT");
+        let qty = Decimal::new(1, 3);
+        engine.shared.live_books.lock().unwrap().insert(
+            (Venue::Binance, "BTC/USDT".into()),
+            book(
+                Venue::Binance,
+                btc.clone(),
+                Decimal::new(82000, 0),
+                Decimal::new(82080, 0),
+                qty,
+                now_ms(),
+            ),
+        );
+        engine.shared.live_books.lock().unwrap().insert(
+            (Venue::Bybit, "BTC/USDT".into()),
+            book(
+                Venue::Bybit,
+                btc,
+                Decimal::new(79850, 0),
+                Decimal::new(79950, 0),
+                qty,
+                now_ms(),
+            ),
+        );
+        engine.tick();
+        assert_eq!(engine.paper.trades, 1);
+        assert_eq!(engine.paper.transfers, 1);
+        let trades = engine.store.trades();
+        assert_eq!(trades.len(), 1);
+        assert_eq!(
+            trades[0].realized_pnl_quote,
+            Some(engine.paper.realized_pnl),
+            "per-trade record must match net aggregate after the $1 transfer fee"
+        );
     }
 
     fn buy_intent(notional: Decimal) -> Intent {
@@ -1052,7 +1135,7 @@ bybit = 0
         // Identical books next tick: the same print must not refill.
         engine.tick();
         assert_eq!(engine.paper.trades, 1, "unchanged tops must not refill");
-        // Moved Bybit ask, edge intact: fires again.
+        // Moved Bybit ask, but the same spread is still open: no refill.
         engine.shared.live_books.lock().unwrap().insert(
             (Venue::Bybit, "BTC/USDT".into()),
             book(
@@ -1065,7 +1148,49 @@ bybit = 0
             ),
         );
         engine.tick();
-        assert_eq!(engine.paper.trades, 2, "moved tops must fill");
+        assert_eq!(
+            engine.paper.trades, 1,
+            "a flicker inside the same open spread must not refill"
+        );
+        // Close the raw spread (Binance bid no longer above Bybit ask).
+        engine.shared.live_books.lock().unwrap().insert(
+            (Venue::Binance, "BTC/USDT".into()),
+            book(
+                Venue::Binance,
+                btc.clone(),
+                Decimal::new(79900, 0),
+                Decimal::new(79950, 0),
+                qty,
+                now_ms(),
+            ),
+        );
+        engine.shared.live_books.lock().unwrap().insert(
+            (Venue::Bybit, "BTC/USDT".into()),
+            book(
+                Venue::Bybit,
+                btc.clone(),
+                Decimal::new(79850, 0),
+                Decimal::new(79950, 0),
+                qty,
+                now_ms(),
+            ),
+        );
+        engine.tick();
+        assert_eq!(engine.paper.trades, 1, "closed spread must not fill");
+        // Reopen the original spread: a new dislocation may fill.
+        engine.shared.live_books.lock().unwrap().insert(
+            (Venue::Binance, "BTC/USDT".into()),
+            book(
+                Venue::Binance,
+                btc.clone(),
+                Decimal::new(80400, 0),
+                Decimal::new(80480, 0),
+                qty,
+                now_ms(),
+            ),
+        );
+        engine.tick();
+        assert_eq!(engine.paper.trades, 2, "reopened spread must fill");
     }
 
     /// Stub strategy that reports one closed funding pair, so the engine
