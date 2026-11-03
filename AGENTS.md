@@ -12,7 +12,6 @@
 - `bins` — application source
 - `crates` — crates
 - `xtask` — dev tooling (`cargo xtask doc-check|install-hooks|ablate`; the post-commit hook is the `xtask` binary, no shell)
-- `docs` — project documentation
 - `.github` — project configuration
 
 ## Conventions
@@ -40,5 +39,5 @@
 
 ## Docs
 
-- After every commit, review and update the affected `.md` docs (`README.md`, `docs/plan.md`) so commands, layout, and behavior stay accurate.
+- After every commit, review and update `README.md` so commands, layout, and behavior stay accurate.
 - Run `cargo xtask doc-check` to list which docs a commit affects; install the reminder hook once with `cargo xtask install-hooks`.
