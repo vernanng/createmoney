@@ -54,6 +54,51 @@ fn cex_dex_symbols(symbols: &[Symbol]) -> Vec<Symbol> {
         .collect()
 }
 
+/// Portfolio marks: fresh live-book mids win; anchors fill the rest.
+/// Non-USDT pairs never mark. Also returns the assets that received a
+/// *live* mark, so callers can tell live prices from anchor fallbacks.
+fn portfolio_marks(
+    live_map: &BTreeMap<(Venue, String), arb_core::OrderBook>,
+    now: i64,
+    max_age_ms: i64,
+) -> (
+    BTreeMap<String, Decimal>,
+    std::collections::BTreeSet<String>,
+) {
+    let mut marks = anchor_marks();
+    let mut live_assets = std::collections::BTreeSet::new();
+    for ((_, sym), book) in live_map {
+        let mut parts = sym.split('/');
+        if let (Some(base), Some("USDT")) = (parts.next(), parts.next()) {
+            if now - book.ts_ms <= max_age_ms && !book.is_crossed() {
+                if let (Some(bid), Some(ask)) = (book.best_bid(), book.best_ask()) {
+                    marks.insert(
+                        base.to_string(),
+                        (bid.price + ask.price) / Decimal::new(2, 0),
+                    );
+                    live_assets.insert(base.to_string());
+                }
+            }
+        }
+    }
+    (marks, live_assets)
+}
+
+/// True when every held non-stable asset has a live mark. The PnL
+/// baseline must wait for this: valuing the seeded basket at static
+/// anchor prices (BTC 80000, SOL 100) against live equity invented a
+/// phantom loss on every restart.
+fn baseline_ready(
+    balances: &arb_core::Balances,
+    live_assets: &std::collections::BTreeSet<String>,
+) -> bool {
+    balances
+        .values()
+        .flat_map(|m| m.iter())
+        .filter(|(asset, amt)| **amt != Decimal::ZERO && !matches!(asset.as_str(), "USDT" | "USDC"))
+        .all(|(asset, _)| live_assets.contains(asset))
+}
+
 pub(crate) struct Engine {
     pub(crate) cfg: config::Config,
     pub(crate) symbols: Vec<Symbol>,
@@ -78,6 +123,8 @@ pub(crate) struct Engine {
     /// Funding interval already credited per open pair. A print's
     /// `next_funding_ms` pays once, when it passes; stale prints pay never.
     pub(crate) funding_credited_through: BTreeMap<(Venue, String), i64>,
+    /// Ticks waited for live marks before forcing the PnL baseline.
+    pub(crate) baseline_wait_ticks: u64,
 }
 
 impl Engine {
@@ -231,9 +278,10 @@ impl Engine {
                 }
             }
         }
-        // Baseline for unrealized P/L: mark the seeded ledger at the reference
-        // prices, the same marks live mids fall back to.
-        paper.starting_equity = paper.equity_quote(&anchor_marks());
+        // Baseline for unrealized P/L is set on the first tick whose
+        // live marks cover every held asset (see `baseline_ready`):
+        // marking the seeded ledger at static anchor prices here would
+        // invent a gain or loss the moment live marks replace them.
         Ok(Self {
             cfg,
             symbols,
@@ -250,6 +298,7 @@ impl Engine {
             started_ms,
             last_fx: RateDecision::default(),
             funding_credited_through: BTreeMap::new(),
+            baseline_wait_ticks: 0,
         })
     }
 
@@ -447,6 +496,25 @@ impl Engine {
         // Settle due virtual transfers before pricing new intents, so a
         // delayed rebalance becomes spendable exactly when its delay elapses.
         self.paper.settle_due(now);
+        // PnL baseline: set once, before the first fills, from live
+        // marks — never from static anchors. If some held asset still
+        // has no live book after ~60 s of ticks, fall back to the
+        // anchor-filled marks rather than report against a zero base.
+        if self.paper.starting_equity == Decimal::ZERO {
+            self.baseline_wait_ticks += 1;
+            let live_map = self
+                .shared
+                .live_books
+                .lock()
+                .map(|m| m.clone())
+                .unwrap_or_default();
+            let (marks, live_assets) =
+                portfolio_marks(&live_map, now, self.cfg.params.max_book_age_ms);
+            if baseline_ready(&self.paper.balances, &live_assets) || self.baseline_wait_ticks > 240
+            {
+                self.paper.starting_equity = self.paper.equity_quote(&marks);
+            }
+        }
         // No pre-trade risk gate: every emitted intent goes to the paper
         // executor, which still enforces inventory. The kill-switch stays:
         // when set, no intents are generated until revived.
@@ -792,22 +860,7 @@ impl Engine {
             .lock()
             .map(|m| m.clone())
             .unwrap_or_default();
-        // Portfolio marks: fresh live-book mids win; anchors fill the rest.
-        // Non-USDT pairs never mark.
-        let mut marks = anchor_marks();
-        for ((_, sym), book) in &live_map {
-            let mut parts = sym.split('/');
-            if let (Some(base), Some("USDT")) = (parts.next(), parts.next()) {
-                if now - book.ts_ms <= self.cfg.params.max_book_age_ms && !book.is_crossed() {
-                    if let (Some(bid), Some(ask)) = (book.best_bid(), book.best_ask()) {
-                        marks.insert(
-                            base.to_string(),
-                            (bid.price + ask.price) / Decimal::new(2, 0),
-                        );
-                    }
-                }
-            }
-        }
+        let (marks, _) = portfolio_marks(&live_map, now, self.cfg.params.max_book_age_ms);
         let equity = self.paper.equity_quote(&marks);
         let portfolio = PortfolioStatus {
             per_venue: self
@@ -946,6 +999,60 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn baseline_waits_for_live_marks_on_held_assets() {
+        use arb_core::{BookLevel, OrderBook};
+        let sym = Symbol::new("BTC", "USDT");
+        let mut fresh = OrderBook::new(Venue::Bybit, sym.clone());
+        fresh.apply_snapshot(
+            vec![BookLevel {
+                price: Decimal::new(99, 0),
+                qty: Decimal::ONE,
+            }],
+            vec![BookLevel {
+                price: Decimal::new(101, 0),
+                qty: Decimal::ONE,
+            }],
+            1,
+            10_000,
+        );
+        let mut stale = OrderBook::new(Venue::Bybit, sym.clone());
+        stale.apply_snapshot(
+            vec![BookLevel {
+                price: Decimal::new(99, 0),
+                qty: Decimal::ONE,
+            }],
+            vec![BookLevel {
+                price: Decimal::new(101, 0),
+                qty: Decimal::ONE,
+            }],
+            1,
+            0,
+        );
+        let mut balances = arb_core::Balances::new();
+        balances
+            .entry(Venue::Binance)
+            .or_default()
+            .insert("USDT".to_string(), Decimal::new(1000, 0));
+        balances
+            .entry(Venue::Binance)
+            .or_default()
+            .insert("BTC".to_string(), Decimal::ONE);
+
+        let live = BTreeMap::from([((Venue::Bybit, sym.to_string()), fresh)]);
+        let (marks, live_assets) = portfolio_marks(&live, 10_500, 2_000);
+        assert!(live_assets.contains("BTC"));
+        assert_eq!(marks.get("BTC"), Some(&Decimal::new(100, 0)));
+        assert!(baseline_ready(&balances, &live_assets));
+
+        let old = BTreeMap::from([((Venue::Bybit, sym.to_string()), stale)]);
+        let (_, live_assets) = portfolio_marks(&old, 10_500, 2_000);
+        assert!(
+            !baseline_ready(&balances, &live_assets),
+            "stale books must not set the baseline"
+        );
+    }
 
     #[test]
     fn strategy_wiring_filters_unpayable_venues_and_dead_dex_symbols() {
