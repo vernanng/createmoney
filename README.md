@@ -463,7 +463,10 @@ manifest to auto-update on Apple Silicon.
 - Cross-exchange assumes pre-funded balances on both venues; rebalancing
   stays out of the strategy loop by design (no pre-trade gate), but every
   virtual transfer burns its sender's per-venue fee and debits strategy +
-  engine realized PnL, so friction shows up in the numbers.
+  engine realized PnL, so friction shows up in the numbers. Transfers
+  overshoot a shortfall to at least 100x the fee, and an intent whose
+  expected profit cannot cover the transfer fees is left unfunded (the
+  fill is skipped) instead of being funded at a guaranteed loss.
 
 ## Sources (official docs used for connector facts)
 

@@ -990,7 +990,9 @@ max_book_age_ms = 2000
 
     /// Repeat-fill guard: paper never consumes book depth, so an unchanged
     /// top of book must not refill every tick. Same tops -> skipped; moved
-    /// tops with the edge intact -> fills again.
+    /// tops with the edge intact -> fills again. Transfer fees are zeroed
+    /// so the rebalance fee gate (a $50 intent cannot pay a $1 flat fee)
+    /// stays out of what this test measures.
     #[test]
     fn unchanged_tops_do_not_refill() {
         let cfg: config::Config = toml::from_str(
@@ -1006,6 +1008,10 @@ min_edge_bps = 15
 slip_buffer_bps = 5
 target_notional_quote = 50
 max_book_age_ms = 2000
+
+[paper.transfer_fees]
+binance = 0
+bybit = 0
 "#,
         )
         .unwrap();

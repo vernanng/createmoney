@@ -383,7 +383,10 @@ impl PaperExecutor {
     /// transfers (paper-only). Loops until every leg is fundable or no donor
     /// covers the next shortfall. Each transfer burns the sending venue's
     /// own friction (flat withdrawal proxy + `transfer_fee_bps`) from the
-    /// sender and honors `transfer_delay_ms` before crediting.
+    /// sender and honors `transfer_delay_ms` before crediting. Moves
+    /// overshoot to at least 100x the fee, and total fees for one intent
+    /// are capped below its expected profit — past that, the intent is
+    /// left unfunded rather than funded at a guaranteed loss.
     pub fn rebalance_for(
         &mut self,
         intent: &Intent,
@@ -404,6 +407,13 @@ impl PaperExecutor {
                 fee_amount(px * leg.qty_base, self.fee_bps(leg.venue)),
             ));
         }
+        // Funding this intent may never cost more than it expects to make:
+        // cumulative transfer fees are capped at the expected profit
+        // (edge on the first leg's notional, quote terms).
+        let profit = priced.first().map_or(Decimal::ZERO, |p| {
+            fee_amount(p.1 * p.0.qty_base, intent.expected_edge_bps)
+        });
+        let mut spent_quote = Decimal::ZERO;
         loop {
             // (venue, asset, short, leg price for fee conversion)
             let mut next: Option<(Venue, String, Decimal, Decimal)> = None;
@@ -416,33 +426,41 @@ impl PaperExecutor {
             let Some((venue, asset, short, px)) = next else {
                 break;
             };
-            // Richest other venue that covers shortfall + ITS OWN fee wins:
-            // withdrawal friction differs per sender.
-            let mut donor: Option<(Venue, Decimal, Decimal)> = None;
+            // Richest other venue that covers the move + ITS OWN fee wins:
+            // withdrawal friction differs per sender. The move overshoots
+            // the shortfall to at least 100x the fee, so a flat withdrawal
+            // fee is paid per chunk of inventory, not per dust top-up.
+            let mut donor: Option<(Venue, Decimal, Decimal, Decimal)> = None;
             let mut best = Decimal::ZERO;
             for (v, m) in &self.balances {
                 if *v == venue {
                     continue;
                 }
                 let have = m.get(&asset).copied().unwrap_or_default();
-                let tfee = self.cfg.transfer_cost(*v, &asset, short, px);
-                if have >= short + tfee && have > best {
+                let fee_on_short = self.cfg.transfer_cost(*v, &asset, short, px);
+                let amount = short.max(fee_on_short * Decimal::new(100, 0));
+                let tfee = self.cfg.transfer_cost(*v, &asset, amount, px);
+                if have >= amount + tfee && have > best {
                     best = have;
-                    donor = Some((*v, tfee, fee_quote_for(&asset, tfee, px)));
+                    donor = Some((*v, amount, tfee, fee_quote_for(&asset, tfee, px)));
                 }
             }
-            let Some((from, tfee, tfee_quote)) = donor else {
+            let Some((from, amount, tfee, tfee_quote)) = donor else {
                 break;
             };
-            adjust(&mut self.balances, from, &asset, -(short + tfee));
+            if tfee_quote > Decimal::ZERO && spent_quote + tfee_quote >= profit {
+                break;
+            }
+            spent_quote += tfee_quote;
+            adjust(&mut self.balances, from, &asset, -(amount + tfee));
             let available_at_ms = ts_ms + self.cfg.transfer_delay_ms.max(0);
             if available_at_ms <= ts_ms {
-                adjust(&mut self.balances, venue, &asset, short);
+                adjust(&mut self.balances, venue, &asset, amount);
             } else {
                 self.pending.push(PendingTransfer {
                     to: venue,
                     asset: asset.clone(),
-                    amount: short,
+                    amount,
                     available_at_ms,
                 });
             }
@@ -451,7 +469,7 @@ impl PaperExecutor {
                 from,
                 to: venue,
                 asset,
-                amount: short,
+                amount,
                 fee: tfee,
                 fee_quote: tfee_quote,
                 ts_ms,
@@ -985,7 +1003,10 @@ mod tests {
 
     #[test]
     fn rebalance_burns_fee_and_honors_delay() {
-        let intent = cross_intent();
+        // 500 bps edge: the 1% transfer burn ($1.02) must stay under the
+        // $5 expected profit or the fee gate rightly refuses to fund it.
+        let mut intent = cross_intent();
+        intent.expected_edge_bps = dec!(500);
         let mut ex = PaperExecutor::new(PaperConfig {
             fee_bps_override: Some(dec!(10)),
             extra_slip_bps: dec!(0),
@@ -1017,6 +1038,24 @@ mod tests {
         let moved = ex.rebalance_for(&intent, &books(), 10);
         assert!(moved.is_empty());
         assert_eq!(ex.transfers, 0);
+    }
+
+    #[test]
+    fn rebalance_skips_when_fee_eats_the_edge() {
+        // Dust intent: 0.01 BTC ≈ $1 notional, 100 bps edge = $0.01 of
+        // expected profit. Paying the documented $1 flat transfer fee to
+        // fund it loses money by construction: no transfer may fire.
+        let mut intent = cross_intent();
+        for leg in &mut intent.legs {
+            leg.qty_base = dec!(0.01);
+        }
+        let mut ex = PaperExecutor::default(); // documented $1 flat schedule
+        ex.seed(Venue::Binance, "USDT", dec!(10000));
+        ex.seed(Venue::Binance, "BTC", dec!(5));
+        let moved = ex.rebalance_for(&intent, &books(), 10);
+        assert!(moved.is_empty());
+        assert_eq!(ex.transfers, 0);
+        assert_eq!(ex.balance(Venue::Binance, "BTC"), dec!(5));
     }
 
     #[test]
@@ -1055,8 +1094,10 @@ mod tests {
     fn rebalance_burns_per_venue_flat_fee_in_quote_terms() {
         // Binance buy leg needs 100.1 USDT; Binance holds 50. Okx is richer
         // but prices itself out with a 500 USDT flat fee, so Bybit — on the
-        // documented 1 USDT schedule — covers.
-        let intent = cross_intent();
+        // documented 1 USDT schedule — covers. 500 bps edge ($5 profit)
+        // keeps the $1 fee under the gate.
+        let mut intent = cross_intent();
+        intent.expected_edge_bps = dec!(500);
         let mut ex = PaperExecutor::new(PaperConfig {
             fee_bps_override: Some(dec!(10)),
             extra_slip_bps: dec!(0),
@@ -1071,18 +1112,22 @@ mod tests {
         assert_eq!(moved.len(), 1);
         assert_eq!((moved[0].from, moved[0].to), (Venue::Bybit, Venue::Binance));
         assert_eq!(moved[0].asset, "USDT");
-        assert_eq!(moved[0].amount, dec!(50.1));
+        // Shortfall is 50.1, but the move overshoots to 100x the $1 fee.
+        assert_eq!(moved[0].amount, dec!(100));
         assert_eq!(moved[0].fee, dec!(1));
         assert_eq!(moved[0].fee_quote, dec!(1));
-        // Donor debited shortfall + its own flat fee.
-        assert_eq!(ex.balance(Venue::Bybit, "USDT"), dec!(200) - dec!(51.1));
+        // Donor debited the chunk + its own flat fee.
+        assert_eq!(ex.balance(Venue::Bybit, "USDT"), dec!(200) - dec!(101));
     }
 
     #[test]
     fn rebalance_converts_flat_fee_to_base_at_leg_price() {
         // Bybit must sell 1 BTC it lacks; Binance covers. The 1 USDT flat
         // converts at the sell leg's fill price: 1/102 BTC, quoted back.
-        let intent = cross_intent();
+        // 500 bps edge ($5 profit) keeps the $1 fee under the gate; the
+        // 1 BTC shortfall already exceeds 100x the fee, so no overshoot.
+        let mut intent = cross_intent();
+        intent.expected_edge_bps = dec!(500);
         let mut ex = PaperExecutor::new(PaperConfig {
             fee_bps_override: Some(dec!(10)),
             extra_slip_bps: dec!(0),
