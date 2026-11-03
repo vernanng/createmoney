@@ -41,13 +41,13 @@ impl Venue {
     /// crypto-spot schedule since the stablecoin is the quote, not base).
     pub fn default_taker_bps(&self) -> Decimal {
         match self {
-            Self::Binance => Decimal::new(10, 2),
-            Self::Bybit => Decimal::new(10, 2),
-            Self::Okx => Decimal::new(10, 2),
-            Self::Indodax => Decimal::new(51, 2),
-            Self::Kraken => Decimal::new(80, 2),
-            Self::Uniswap => Decimal::new(30, 2), // 0.30% pool tier default
-            Self::Pancakeswap => Decimal::new(25, 2), // 0.25%
+            Self::Binance => Decimal::new(10, 0),
+            Self::Bybit => Decimal::new(10, 0),
+            Self::Okx => Decimal::new(10, 0),
+            Self::Indodax => Decimal::new(51, 0),
+            Self::Kraken => Decimal::new(80, 0),
+            Self::Uniswap => Decimal::new(30, 0), // 0.30% pool tier default
+            Self::Pancakeswap => Decimal::new(25, 0), // 0.25%
             Self::Jupiter => Decimal::ZERO,       // fee lives inside the quoted route
         }
     }
@@ -258,6 +258,19 @@ pub fn now_ms() -> i64 {
 mod tests {
     use super::*;
     use rust_decimal_macros::dec;
+
+    #[test]
+    fn taker_fees_are_in_bps() {
+        // 0.10% = 10 bps: the table returns raw bps counts, so the fee on
+        // a $10k notional at Binance is $10, not $0.10.
+        assert_eq!(Venue::Binance.default_taker_bps(), dec!(10));
+        assert_eq!(
+            fee_amount(dec!(10000), Venue::Binance.default_taker_bps()),
+            dec!(10)
+        );
+        assert_eq!(Venue::Indodax.default_taker_bps(), dec!(51));
+        assert_eq!(Venue::Kraken.default_taker_bps(), dec!(80));
+    }
 
     #[test]
     fn symbol_spellings() {
