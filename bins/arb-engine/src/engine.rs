@@ -169,7 +169,13 @@ impl Engine {
             const SEED_BASE_BASKET: [&str; 3] = ["BTC", "ETH", "SOL"];
             for v in venues {
                 for a in &assets {
-                    let amt = if a == "USDT" || a == "USDC" {
+                    // USDC seeds DEX wallets only (SOL/USDC): seeding both
+                    // stables at full amount on every venue double-counted
+                    // the starting capital ($22.6k shown for a "$10k" book).
+                    let amt = if a == "USDT"
+                        || (a == "USDC"
+                            && matches!(v, Venue::Uniswap | Venue::Pancakeswap | Venue::Jupiter))
+                    {
                         cfg.paper.quote_for(v)
                     } else if v == Venue::Binance && SEED_BASE_BASKET.contains(&a.as_str()) {
                         // Exact USDT pair first: a prefix match would catch the
