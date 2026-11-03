@@ -207,7 +207,7 @@ crates/dex-sol   Jupiter quote URL building/parsing (mints, prices, DexQuote con
 crates/store     Store trait + in-memory/JSONL backend + SQL schema for the DB backend
 crates/api       control state, status/metrics/flows rendering, route table, index HTML (flow map + ops panels)
 bins/arb-engine  wiring, config, tick loop, localhost control API
-xtask            dev tooling: doc-check | install-hooks | ablate (cargo xtask <cmd>); post-commit hook is this binary
+xtask            dev tooling: doc-check | install-hooks | ablate | autoloop (cargo xtask <cmd>); post-commit hook is this binary
 ```
 
 Conventions: submodules declared with `pub mod` in each crate's `lib.rs`,
@@ -230,6 +230,31 @@ docker run --rm -p 127.0.0.1:8787:8787 \
 
 Or build locally with `docker compose up --build` (`docker-compose.yml`).
 Live trading is never auto-deployed: promote by hand, keep caps tiny.
+
+### Autoloop (local CI/CD, paper only)
+
+`cargo xtask autoloop` drives the self-tuning soak on this machine —
+no GitHub Actions in the gate, no live mode, no keys:
+
+- `check` — one-line verdict from `GET /status`: `SOAKING` (<24 h
+  since engine start), `PROFITABLE` / `LOSING` (realized + unrealized
+  vs 0 after 24 h; exit code 3 when losing).
+- `ci` — the local gates: `cargo fmt --check`, `clippy -D warnings`,
+  `cargo test --workspace`.
+- `ship "<title>" [body]` — refuses a dirty tree or `main`, runs
+  `ci`, pushes the branch, opens the PR and merges it. The owner has
+  waived the review step for loop branches only; the merge gate is
+  the green local CI.
+- `deploy` — builds `ghcr.io/vernanng/createmoney:latest` from this
+  checkout (run it at the merged commit), rotates the previous
+  `cd-data/paper-trades.jsonl` to a `.bak-<ts>` file so the iteration
+  starts clean, restarts the CD stack, and stops Watchtower so only
+  this loop deploys (restart it with `docker compose -f
+  docker-compose.cd.yml up -d watchtower`).
+
+The loop judges iterations on the 24 h bar above; the 7-day green
+gate below still governs any live promotion — an autoloop "profit"
+is not a live-trading signal.
 
 ### Local continuous deployment (paper)
 
