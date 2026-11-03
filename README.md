@@ -311,11 +311,11 @@ if `API_TOKEN` is set in env, the POST rows below need `?token=<value>`
 | Route | Method | Effect |
 |---|---|---|
 | `/health` | GET | `{"ok":true}` |
-| `/status` | GET | mode, killed, engine start (`started_ms`, viewer shows uptime), trades, realized PnL, opportunities, per-venue connector health (socket state reported separately from fresh-book counts), paused strategies, portfolio (per-venue balances, equity, realized/unrealized PnL), open positions with entry qty/`$` plus live mark and market value |
+| `/status` | GET | mode, killed, engine start (`started_ms`, page shows uptime), trades, realized PnL, opportunities, per-venue connector health (socket state reported separately from fresh-book counts), paused strategies, portfolio (per-venue balances, equity, realized/unrealized PnL), open positions with entry qty/`$` plus live mark and market value |
 | `/metrics` | GET | text metrics incl. per-strategy funnel counters (scans, intents, fill failures, `dup_skipped` same-top refills, trades, PnL; `risk_rejected` stays 0 — the pre-trade gate is removed) and per-venue book freshness |
-| `/flows` | GET | JSON snapshot of the last 200 trades (for the viewer and dashboard) |
-| `/viewer` | GET | unified page: 3D trade-flow viewer + ops drawer (strategy, metrics, trades, PnL, fees, positions with live marks, token-gated controls) |
-| `/dashboard` | GET | same unified page as `/viewer` (kept so old links keep working) |
+| `/flows` | GET | JSON snapshot of the last 200 trades (for the scene and tables) |
+| `/` | GET | strategy-flow page: 2D venue flow map + ops drawer (strategy, metrics, trades, PnL, fees, positions with live marks, token-gated controls), mobile-first, zero dependencies |
+| `/dashboard` | GET | same bytes as `/` |
 | `/strategies` | GET | per-strategy funnel counters as JSON (same data as the Prometheus rows, for the dashboard) |
 | `/kill` | POST | trip the kill-switch |
 | `/revive` | POST | clear the kill-switch |
@@ -365,7 +365,7 @@ crates/exec      live send gate (armed check), env key loading, HMAC-SHA256 sign
 crates/dex-evm   Uniswap + PancakeSwap quoting (exact V2 math; V3 quoter types + addresses)
 crates/dex-sol   Jupiter quote URL building/parsing (mints, prices, DexQuote conversion)
 crates/store     Store trait + in-memory/JSONL backend + SQL schema for the DB backend
-crates/api       control state, status/metrics/flows rendering, route table, unified viewer HTML (scene + ops drawer)
+crates/api       control state, status/metrics/flows rendering, route table, index HTML (scene + ops drawer)
 bins/arb-engine  wiring, config, tick loop, localhost control API
 xtask            dev tooling: doc-check | install-hooks | ablate (cargo xtask <cmd>); post-commit hook is this binary
 ```

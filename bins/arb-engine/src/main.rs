@@ -2,9 +2,9 @@ mod config;
 mod engine;
 
 use arb_api::{
-    render_flows_envelope, render_metrics, render_strategies, route, route_dashboard, route_viewer,
-    ConnectorHealth, Control, EngineStatus, OpenPosition, PortfolioStatus, StrategyMetrics,
-    UsdtIdrHealth, VenueBalance,
+    render_flows_envelope, render_metrics, render_strategies, route, route_pages, ConnectorHealth,
+    Control, EngineStatus, OpenPosition, PortfolioStatus, StrategyMetrics, UsdtIdrHealth,
+    VenueBalance,
 };
 use arb_core::Intent;
 use arb_core::MarketKind;
@@ -205,7 +205,7 @@ async fn serve_api(addr: String, token: Option<String>, shared: Arc<Shared>) {
         // set API_TOKEN. Reads stay open either way.
         tracing::warn!(addr, "control API on a non-loopback bind without API_TOKEN; POST /kill /revive /pause /resume need ?token=");
     }
-    tracing::info!(addr, "control API listening (GET /health /status /metrics /flows /viewer /dashboard /strategies, POST /kill /revive /pause/<s> /resume/<s>)");
+    tracing::info!(addr, "control API listening (GET / /health /status /metrics /flows /dashboard /strategies, POST /kill /revive /pause/<s> /resume/<s>)");
     loop {
         let Ok((mut sock, _)) = listener.accept().await else {
             continue;
@@ -271,9 +271,7 @@ async fn serve_api(addr: String, token: Option<String>, shared: Arc<Shared>) {
                     .map(|f| f.clone())
                     .unwrap_or_else(|_| render_flows_envelope(&[], 0));
                 let strategies = render_strategies(&per);
-                if let Some(hit) = route_viewer(method, path, &flows) {
-                    hit
-                } else if let Some(hit) = route_dashboard(method, path, &strategies) {
+                if let Some(hit) = route_pages(method, path, &flows, &strategies) {
                     hit
                 } else {
                     match shared.control.lock() {

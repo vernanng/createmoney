@@ -1,0 +1,871 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
+<title>createmoney — strategy flow</title>
+<link rel="icon" href="data:,">
+<style>
+  /* Material 3 expressive, dark, seeded blue. Mobile-first: the drawer is a
+     modal bottom sheet; ≥900px it becomes a compact side sheet. Roles follow
+     the official dynamic dark scheme (primary80/on-primary20,
+     containers at tones 30/90, surfaces neutral6→22, outline
+     neutral-variant60; see material-web tokens v0_192 md-sys-color and
+     m3.material.io/styles/color/system/overview). Tonal surfaces carry
+     elevation; state layers (not brightness filters) mark hover/press. */
+  :root {
+    color-scheme: dark;
+    --m-primary: #7dd3fc;
+    --m-on-primary: #062433;
+    --m-primary-container: #0e3a54;
+    --m-on-primary-container: #cde9ff;
+    --m-secondary-container: #243447;
+    --m-on-secondary-container: #d4e3f5;
+    --m-surface: #0a0e15;
+    --m-lowest: #05070f;
+    --m-low: #0f1522;
+    --m-container: #151e30;
+    --m-high: #1b2540;
+    --m-on-surface: #dbe4f3;
+    --m-on-variant: #94a3b8;
+    --m-outline: #2b3a52;
+    --m-outline-variant: #1e2940;
+    --m-error: #f87171;
+    --m-error-container: #4c1215;
+    --m-good: #34d399;
+    --m-warn: #fbbf24;
+  }
+  * { box-sizing: border-box; }
+  :focus-visible { outline: 2px solid var(--m-primary); outline-offset: 2px; }
+  html, body { margin: 0; padding: 0; height: 100%; overflow: hidden; background: var(--m-lowest);
+    font-family: system-ui, -apple-system, "SF Pro Text", Roboto, "Segoe UI", sans-serif;
+    color: var(--m-on-surface); font-size: 14px; line-height: 1.45; }
+  .mono, #strip .up, #sheet table, #sheet .up { font-variant-numeric: tabular-nums; }
+  #scene { position: fixed; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; }
+  /* ---------- M3 small top app bar ---------- */
+  #strip { position: fixed; top: 0; left: 0; right: 0; z-index: 5;
+    display: flex; flex-wrap: wrap; gap: 4px 12px; align-items: center;
+    padding: 10px 16px; padding-top: calc(10px + env(safe-area-inset-top));
+    background: var(--m-surface); border-bottom: 1px solid var(--m-outline);
+    font-size: 13px; }
+  #strip h1 { margin: 0; font-size: 20px; font-weight: 600; color: var(--m-on-surface);
+    letter-spacing: 0; }
+  #strip .up { font-size: 17px; font-weight: 800; color: var(--m-warn); font-variant-numeric: tabular-nums; }
+  #strip .grp { display: flex; flex-wrap: wrap; gap: 4px 10px; align-items: baseline; }
+  #strip button { border: 0; border-radius: 999px; font: inherit; font-size: 13px; font-weight: 600;
+    padding: 10px 18px; min-height: 48px; cursor: pointer;
+    background: var(--m-secondary-container); color: var(--m-on-secondary-container); }
+  #strip button:hover { background-image: linear-gradient(rgba(255,255,255,.08), rgba(255,255,255,.08)); }
+  #strip button:active { background-image: linear-gradient(rgba(255,255,255,.12), rgba(255,255,255,.12)); }
+  #strip button[aria-expanded="false"] { background: var(--m-primary); color: var(--m-on-primary); }
+  .num { font-weight: 700; color: #fff; font-variant-numeric: tabular-nums; }
+  .pos { color: var(--m-good); font-weight: 700; }
+  .neg { color: var(--m-error); font-weight: 700; }
+  .dim { color: var(--m-on-variant); }
+  .stale { color: var(--m-warn); font-weight: 700; }
+  /* ---------- M3 modal bottom sheet → side sheet ---------- */
+  #sheet { position: fixed; z-index: 5; left: 0; right: 0; bottom: 0;
+    padding: 0 16px calc(12px + env(safe-area-inset-bottom));
+    max-height: 36vh; overflow-y: auto; -webkit-overflow-scrolling: touch;
+    background: var(--m-low); border-radius: 28px 28px 0 0;
+    box-shadow: 0 -2px 12px rgba(0, 0, 0, .5); }
+  #sheet.hidden { display: none; }
+  #grab { margin: 0 auto; padding: 22px 16px; cursor: grab; touch-action: none; }
+  #grab::after { content: ""; display: block; width: 32px; height: 4px; border-radius: 999px;
+    margin: 0 auto; background: var(--m-on-variant); opacity: .4; }
+  /* M3 cards: tonal fill, 16px shape, separated — no nested cards, no glow */
+  #sheet details { background: var(--m-container); border-radius: 16px;
+    margin: 8px 0; padding: 0 16px; }
+  #sheet summary { list-style: none; cursor: pointer; display: flex; align-items: center;
+    min-height: 56px; margin: 0; font-size: 15px; font-weight: 600; color: var(--m-on-surface); }
+  #sheet summary::-webkit-details-marker { display: none; }
+  #sheet summary::before { content: "+"; width: 26px; color: var(--m-primary); font-size: 18px; }
+  #sheet details[open] summary::before { content: "–"; }
+  #sheet details > div.body { padding: 0 0 16px; }
+  #sheet .row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+  #sheet .row label { color: var(--m-on-variant); font-size: 13px; }
+  /* M3 filled text fields: tonal container, hairline indicator on focus */
+  #sheet select, #sheet input[type="text"], #sheet input[type="password"] {
+    background: var(--m-high); color: var(--m-on-surface);
+    border: 0; border-bottom: 1px solid var(--m-on-variant);
+    border-radius: 12px 12px 0 0; font: inherit; font-size: 15px; padding: 12px 14px;
+    min-height: 52px; max-width: 100%; }
+  #sheet select:focus, #sheet input:focus { outline: none; border-bottom: 2px solid var(--m-primary); }
+  /* M3 tonal buttons (pill); danger = error container */
+  #sheet button { border: 0; border-radius: 999px; font: inherit; font-size: 13px; font-weight: 600;
+    padding: 10px 18px; min-height: 48px; cursor: pointer;
+    background: var(--m-secondary-container); color: var(--m-on-secondary-container); }
+  #sheet button:hover { background-image: linear-gradient(rgba(255,255,255,.08), rgba(255,255,255,.08)); }
+  #sheet button:active { background-image: linear-gradient(rgba(255,255,255,.12), rgba(255,255,255,.12)); }
+  #sheet button:disabled { opacity: .35; cursor: default; }
+  #sheet button.danger { background: var(--m-error-container); color: var(--m-error); }
+  #sheet button.danger:hover { background-image: linear-gradient(rgba(255,255,255,.08), rgba(255,255,255,.08)); }
+  #sheet button.danger:active { background-image: linear-gradient(rgba(255,255,255,.12), rgba(255,255,255,.12)); }
+  /* M3 filter chips: 8px shape, outline; selected = tonal fill + check */
+  #sheet .chips { display: flex; flex-wrap: wrap; gap: 8px; }
+  #sheet .chips button { border-radius: 8px; border: 1px solid var(--m-outline-variant);
+    background: transparent; color: var(--m-on-surface); font-weight: 500; }
+  #sheet .chips button[aria-pressed="true"] { border: 0; padding: 11px 19px;
+    background: var(--m-secondary-container); color: var(--m-on-secondary-container); }
+  #sheet .chips button[aria-pressed="true"]::before { content: "✓ "; }
+  #sheet .chips button[aria-pressed="false"] { opacity: 1; color: var(--m-on-variant); }
+  #sheet button[aria-pressed="true"] { background: var(--m-primary); color: var(--m-on-primary); }
+  #sheet .note { color: var(--m-on-variant); font-size: 12px; }
+  #sheet .wrap { overflow-x: auto; border-radius: 12px; background: var(--m-low); }
+  #sheet table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  #sheet th, #sheet td { text-align: right; padding: 10px 12px; border-bottom: 1px solid var(--m-outline);
+    white-space: nowrap; font-variant-numeric: tabular-nums; }
+  #sheet th:first-child, #sheet td:first-child { text-align: left; }
+  #sheet th { color: var(--m-on-variant); font-weight: 600; font-size: 12px; }
+  #sheet td.num { color: #fff; }
+  /* M3 switch (live toggle): track + thumb, 52px hit area */
+  #sheet button.switch { display: inline-flex; align-items: center; gap: 10px;
+    background: transparent; border: 0; padding: 6px 8px; min-height: 52px; }
+  #sheet button.switch .trk { width: 52px; height: 32px; border-radius: 999px; flex: none;
+    background: var(--m-high); border: 2px solid var(--m-on-variant);
+    display: inline-flex; align-items: center; padding: 2px;
+    transition: background-color .2s cubic-bezier(0.2, 0, 0, 1), border-color .2s cubic-bezier(0.2, 0, 0, 1); }
+  #sheet button.switch .thm { width: 16px; height: 16px; border-radius: 999px;
+    background: var(--m-on-variant);
+    transition: transform .2s cubic-bezier(0.2, 0, 0, 1), background-color .2s cubic-bezier(0.2, 0, 0, 1), width .2s cubic-bezier(0.2, 0, 0, 1), height .2s cubic-bezier(0.2, 0, 0, 1); }
+  #sheet button.switch[aria-checked="true"] .thm { width: 24px; height: 24px; }
+  #sheet button.switch[aria-checked="true"] .trk { background: var(--m-primary); border-color: var(--m-primary); }
+  #sheet button.switch[aria-checked="true"] .thm { transform: translateX(20px); background: var(--m-on-primary); }
+  #sheet button.switch .lbl { font-weight: 600; }
+  /* M3 slider: thin track, round thumb, full-width touch lane */
+  #sheet input[type="range"] { flex: 1; min-height: 48px; min-width: 120px; accent-color: var(--m-primary); }
+  #detailBody { font-size: 13px; line-height: 1.55; }
+  #detailBody b { color: var(--m-warn); }
+  #tradeTbl tbody tr { cursor: pointer; }
+  /* M3 snackbar: inverse surface, single line action-free */
+  #err { position: fixed; z-index: 9; left: 50%; transform: translateX(-50%);
+    top: auto; bottom: calc(20px + env(safe-area-inset-bottom));
+    background: #e8eef4; color: #101418; border-radius: 4px; padding: 12px 18px;
+    font-size: 13px; display: none; max-width: min(92vw, 640px); box-shadow: 0 4px 12px rgba(0,0,0,.5);
+    min-height: 48px; }
+  @media (min-width: 900px) {
+    #strip button { min-height: 36px; padding: 6px 16px; }
+    #grab { display: none; }
+    #sheet { left: auto; right: 16px; top: 72px; bottom: 16px; width: 340px;
+      max-height: none; border-radius: 16px; padding: 8px 12px calc(12px + env(safe-area-inset-bottom)); }
+    #sheet table { font-size: 12px; }
+    #sheet th, #sheet td { padding: 8px 10px; }
+  }
+  @media (max-width: 640px) {
+    #sheet #tradeTbl thead { display: none; }
+    #sheet #tradeTbl tbody td { display: block; text-align: left; border-bottom: none; padding: 2px 8px; }
+    #sheet #tradeTbl tbody tr { display: block; border-bottom: 1px solid var(--m-outline); padding: 6px 0; }
+    #sheet td.legs { overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2;
+      -webkit-box-orient: vertical; white-space: normal; }
+    #sheet tr.open td.legs { display: block; white-space: normal; }
+  }
+</style>
+</head>
+<body>
+<canvas id="scene"></canvas>
+<header id="strip" aria-label="engine status">
+  <h1>strategy-flow</h1>
+  <button id="panelToggle" aria-expanded="true" aria-controls="sheet">panels</button>
+  <span class="up" id="uptimeVal">—</span>
+  <span class="grp" id="statusLine"><span class="dim">connecting…</span></span>
+  <span class="grp" id="moneyLine"><span class="dim">waiting for status…</span></span>
+</header>
+<div id="sheet" aria-label="flows and operations">
+  <div id="grab" aria-hidden="true"></div>
+  <details id="dFlows" open>
+    <summary>flows · venues · replay</summary>
+    <div class="body">
+      <div class="row chips" id="filters" style="margin-bottom:8px"></div>
+      <div class="row" style="margin-bottom:8px">
+        <button id="liveBtn" class="switch" role="switch" aria-checked="true"><span class="trk"><span class="thm"></span></span><span class="lbl">live</span></button>
+        <span class="note" id="replayLabel">all</span>
+        <button id="stepBack" aria-label="step back">◀</button>
+        <input id="replayRange" type="range" min="0" max="0" value="0" aria-label="replay position">
+        <button id="stepFwd" aria-label="step forward">▶</button>
+      </div>
+      <div id="detailBody">Tap a venue node for detail. Drag to pan, pinch or scroll to zoom.</div>
+    </div>
+  </details>
+  <details id="dPos">
+    <summary>open positions</summary>
+    <div class="body">
+      <div class="wrap"><table id="posTbl" aria-label="open positions">
+        <thead><tr><th>strategy</th><th>venue</th><th>symbol</th><th>qty</th>
+        <th>entry $</th><th>mark $</th><th>value $</th><th>state</th></tr></thead>
+        <tbody><tr><td colspan="8" class="dim">loading…</td></tr></tbody>
+      </table></div>
+      <div class="note">qty + entry from the opening trade; mark + value use live marks. Stale = no fresh mark.</div>
+    </div>
+  </details>
+  <details id="dTrades">
+    <summary>trades</summary>
+    <div class="body">
+      <div class="row" style="margin-bottom:8px">
+        <div class="chips" id="fStrats"></div>
+        <label>venue <select id="fVenue"><option value="">all</option></select></label>
+        <label>outcome <select id="fOutcome">
+          <option value="all">all</option><option value="settled">settled (pnl)</option>
+          <option value="openers">position openers</option>
+        </select></label>
+        <label>symbol <input id="fSym" type="text" placeholder="BTC" size="8"></label>
+        <label>limit <select id="fLimit"><option>50</option><option selected>100</option><option>200</option></select></label>
+        <span class="note" id="fCount"></span>
+      </div>
+      <div class="wrap"><table id="tradeTbl" aria-label="trades">
+        <thead><tr><th>time</th><th>strategy</th><th>legs (qty @ px = $)</th>
+        <th>edge bps</th><th>fees $</th><th>pnl $</th></tr></thead>
+        <tbody><tr><td colspan="6" class="dim">loading…</td></tr></tbody>
+      </table></div>
+      <div class="note">Newest first, capped. Tap a row to expand its legs.</div>
+    </div>
+  </details>
+  <details id="dStrat">
+    <summary>strategies</summary>
+    <div class="body">
+      <div class="wrap"><table id="stratTbl" aria-label="per strategy metrics">
+        <thead><tr><th>strategy</th><th>scans</th><th>emitted</th><th>filled</th>
+        <th>risk rej</th><th>failed</th><th>dup skip</th><th>realized</th><th>state</th></tr></thead>
+        <tbody><tr><td colspan="9" class="dim">loading…</td></tr></tbody>
+      </table></div>
+      <div class="row" id="stratBtns" style="margin-top:8px"></div>
+    </div>
+  </details>
+  <details id="dConn">
+    <summary>connectors · usdt/idr</summary>
+    <div class="body">
+      <div class="wrap"><table id="connTbl" aria-label="connectors">
+        <thead><tr><th>venue</th><th>socket</th><th>books</th><th>fresh</th><th>last book</th><th>error</th></tr></thead>
+        <tbody><tr><td colspan="6" class="dim">loading…</td></tr></tbody>
+      </table></div>
+      <div class="note" id="fxLine" style="margin-top:6px"></div>
+    </div>
+  </details>
+  <details id="dCtl">
+    <summary>controls</summary>
+    <div class="body">
+      <div class="row">
+        <label for="key">api key</label>
+        <input id="key" type="password" autocomplete="off" placeholder="API_TOKEN" size="12">
+        <button id="kill" class="danger">kill</button>
+        <button id="revive">revive</button>
+        <span id="ctlMsg" class="note" role="status"></span>
+      </div>
+    </div>
+  </details>
+</div>
+<div id="err" role="alert"></div>
+<script>
+'use strict';
+// ---------- config ----------
+const STRATS = {
+  cross_exchange: 0x22d3ee,
+  triangular: 0xe879f9,
+  funding_rate: 0xfbbf24,
+  cex_dex: 0x34d399,
+  lag_chase: 0xfb923c,
+  fx_triangle: 0xe2e8f0,
+};
+const STRAT_NAMES = Object.keys(STRATS);
+const CEX = ['binance', 'bybit', 'okx', 'indodax', 'kraken'];
+const DEX = ['uniswap', 'pancakeswap', 'jupiter'];
+const RENDER_CAP = 80;
+const POLL_MS = 2500;
+const REDUCED = matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+// ---------- helpers ----------
+const $ = (id) => document.getElementById(id);
+function showErr(msg) { const e = $('err'); e.style.display = 'block'; e.textContent = msg; }
+window.addEventListener('error', (ev) => showErr('page error: ' + (ev.message || 'unknown')));
+window.addEventListener('unhandledrejection', (ev) => showErr('page error: ' + (ev.reason || 'unknown')));
+const fmt = (n, d = 2) => {
+  const x = Number(n);
+  return Number.isFinite(x) ? x.toLocaleString('en-US', { maximumFractionDigits: d }) : '—';
+};
+const cls = (n) => Number(n) < 0 ? 'neg' : (Number(n) > 0 ? 'pos' : '');
+const symText = (s) => typeof s === 'string' ? s : (s && s.base ? `${s.base}/${s.quote}` : '—');
+const legText = (l) => {
+  const q = Number(l.qty_base), p = Number(l.price);
+  return `${l.venue} ${symText(l.symbol)} ${l.side} ${fmt(q, 6)} @ ${fmt(p)} = $${fmt(q * p)}`;
+};
+const tradeFees = (t) => (t.fills || []).reduce((a, f) => a + Number(f.fee_quote || 0), 0);
+// venue base positions in unit space; layout() maps them onto the canvas
+function venueBase(name) {
+  const ci = CEX.indexOf(name), di = DEX.indexOf(name);
+  if (ci >= 0) { const a = ci * Math.PI * 2 / CEX.length - Math.PI / 2; return [Math.cos(a), Math.sin(a), 1]; }
+  if (di >= 0) { const a = di * Math.PI * 2 / 3 + Math.PI / 6; return [Math.cos(a) * 0.45, Math.sin(a) * 0.45, 0]; }
+  return [0, 0, 0];
+}
+
+// ---------- 2d canvas, pan/zoom view, layout ----------
+const canvas = $('scene');
+const ctx = canvas.getContext('2d');
+let DPR = 1;
+const view = { s: 1, ox: 0, oy: 0 }; // screen = (world - center) * s + center + o
+let venues = []; // {name, dex, bx, by, x, y, r}
+function resize() {
+  DPR = Math.min(devicePixelRatio || 1, 2);
+  canvas.width = Math.round(innerWidth * DPR);
+  canvas.height = Math.round(innerHeight * DPR);
+  layout();
+  draw(0);
+}
+function layout() {
+  const w = canvas.width / DPR, h = canvas.height / DPR;
+  const R = Math.min(w, h);
+  const cx = w / 2, cy = h / 2 - (h > w ? 20 : 0);
+  venues = [...CEX, ...DEX].map((name) => {
+    const [bx, by, ring] = venueBase(name);
+    const rr = ring ? R * 0.36 : R * 0.16;
+    return { name, dex: !ring, bx: cx + bx * rr, by: cy + by * rr, r: ring ? 26 : 20 };
+  });
+  applyView();
+}
+function applyView() {
+  const w = canvas.width / DPR, h = canvas.height / DPR;
+  for (const v of venues) {
+    v.x = (v.bx - w / 2) * view.s + w / 2 + view.ox;
+    v.y = (v.by - h / 2) * view.s + h / 2 + view.oy;
+    v.r = (v.dex ? 20 : 26) * Math.sqrt(view.s);
+  }
+}
+function zoomAt(mx, my, f) {
+  const s1 = Math.min(Math.max(view.s * f, 0.5), 3);
+  const k = s1 / view.s;
+  view.ox = mx - (mx - view.ox) * k;
+  view.oy = my - (my - view.oy) * k;
+  view.s = s1;
+  applyView();
+}
+addEventListener('resize', resize);
+
+// ---------- painted backdrop: vignette, grid, drift, far ring ----------
+// All decoration is drawn in code each frame; no images, no libraries.
+let driftSeeds = [];
+function paintBackdrop(t) {
+  const w = canvas.width / DPR, h = canvas.height / DPR;
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  const cx = w / 2, cy = h / 2;
+  const R = Math.hypot(w, h) / 2;
+  const g = ctx.createRadialGradient(cx, cy, 10, cx, cy, R);
+  g.addColorStop(0, '#0d1528'); g.addColorStop(0.6, '#080d1a'); g.addColorStop(1, '#05070f');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, w, h);
+  // faint survey grid, panning and zooming with the view
+  const step = 56 * view.s;
+  const ox = (((view.ox % step) + step) % step + step) % step;
+  const oy = (((view.oy % step) + step) % step + step) % step;
+  ctx.strokeStyle = 'rgba(45, 80, 130, 0.28)';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  for (let x = ox; x < w; x += step) { ctx.moveTo(x, 0); ctx.lineTo(x, h); }
+  for (let y = oy; y < h; y += step) { ctx.moveTo(0, y); ctx.lineTo(w, y); }
+  ctx.stroke();
+  // far silhouette blocks: dark slabs fading into the backdrop
+  ctx.fillStyle = '#0d1730';
+  const n = 36, rr = Math.min(w, h) * 0.47;
+  for (let i = 0; i < n; i++) {
+    const a = i / n * Math.PI * 2;
+    const bx = (cx + Math.cos(a) * rr - w / 2) * view.s + w / 2 + view.ox;
+    const by = (cy + Math.sin(a) * rr - h / 2) * view.s + h / 2 + view.oy;
+    const hh = (2 + (i * 37 % 9)) * view.s;
+    ctx.globalAlpha = 0.8;
+    ctx.fillRect(bx - 4 * view.s, by - hh, 8 * view.s, hh);
+  }
+  ctx.globalAlpha = 1;
+  // slow drift specks: the one moving background layer
+  if (!driftSeeds.length) for (let i = 0; i < 120; i++) driftSeeds.push([Math.random(), Math.random(), 0.5 + Math.random()]);
+  ctx.fillStyle = 'rgba(148, 197, 255, 0.5)';
+  const dx = REDUCED ? 0 : (t * 0.004) % 1;
+  for (const [fx, fy, fr] of driftSeeds) {
+    ctx.fillRect(((fx + dx) % 1) * w, fy * h, fr, fr);
+  }
+}
+
+// ---------- venue nodes ----------
+// CEX discs on the outer ring, DEX discs on the inner rise: a flat body,
+// a glowing base ring and a painted name tag. Positions come from layout().
+function hexStr(n) {
+  return '#' + n.toString(16).padStart(6, '0');
+}
+function stratColor(name) { return '#' + (STRATS[name] ?? 0x94a3b8).toString(16).padStart(6, '0'); }
+// ---------- venue nodes ----------
+// CEX discs on the outer ring, DEX discs on the inner rise: a flat body with
+// a top-light gradient, a glowing base ring and a painted name tag.
+function drawNode(v, t) {
+  const body = v.dex ? '#0f766e' : '#1d4ed8';
+  const ring = v.dex ? '#2dd4bf' : '#60a5fa';
+  const r = v.r * (v.dex ? 0.72 : 1);
+  // soft glow
+  const glow = ctx.createRadialGradient(v.x, v.y, r * 0.4, v.x, v.y, r * 2.1);
+  glow.addColorStop(0, v.dex ? 'rgba(45, 212, 191, 0.30)' : 'rgba(96, 165, 250, 0.30)');
+  glow.addColorStop(1, 'rgba(0, 0, 0, 0)');
+  ctx.fillStyle = glow;
+  ctx.beginPath(); ctx.arc(v.x, v.y, r * 2.1, 0, Math.PI * 2); ctx.fill();
+  // body with top light
+  const bg = ctx.createLinearGradient(v.x, v.y - r, v.x, v.y + r);
+  bg.addColorStop(0, v.dex ? '#14b8a6' : '#3b82f6');
+  bg.addColorStop(1, body);
+  ctx.fillStyle = bg;
+  ctx.beginPath(); ctx.arc(v.x, v.y, r, 0, Math.PI * 2); ctx.fill();
+  // base ring
+  ctx.strokeStyle = ring; ctx.lineWidth = 2.5;
+  ctx.beginPath(); ctx.arc(v.x, v.y, r + 4, 0, Math.PI * 2); ctx.stroke();
+  if (selected === v.name) {
+    ctx.strokeStyle = '#ffffff'; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(v.x, v.y, r + 9, 0, Math.PI * 2); ctx.stroke();
+  }
+  // name tag
+  ctx.font = `700 ${Math.max(11, r * 0.5)}px ui-monospace, monospace`;
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.lineWidth = 4; ctx.strokeStyle = 'rgba(0,0,0,0.85)';
+  const label = v.name.toUpperCase();
+  ctx.strokeText(label, v.x, v.y - r - 14);
+  ctx.fillStyle = v.dex ? '#5eead4' : '#93c5fd';
+  ctx.fillText(label, v.x, v.y - r - 14);
+}
+
+// ---------- picking + venue detail ----------
+// Tap selects a node; a drag that moves more than a few pixels pans instead.
+// Pinch and wheel zoom around the gesture point.
+let selected = null;
+function venueStats(name) {
+  const rel = state.flows.filter((t) =>
+    (t.intent.legs || []).some((l) => String(l.venue || '').toLowerCase() === name));
+  const byStrat = {};
+  let lastEdge = null;
+  for (const t of rel) {
+    const s = t.intent.strategy;
+    byStrat[s] = (byStrat[s] || 0) + 1;
+    lastEdge = t.intent.expected_edge_bps;
+  }
+  return { n: rel.length, byStrat, lastEdge };
+}
+function selectVenue(name) {
+  selected = name;
+  const box = $('detailBody');
+  if (!name) { box.innerHTML = 'Tap a venue node for detail. Drag to pan, pinch or scroll to zoom.'; return; }
+  const s = venueStats(name);
+  const rows = Object.entries(s.byStrat).map(([k, v]) => `${k}: ${v}`).join('<br>') || 'no flows yet';
+  const edge = s.lastEdge == null ? '—' : Number(s.lastEdge).toFixed(2);
+  box.innerHTML = `<b>${name}</b> — ${DEX.includes(name) ? 'DEX' : 'CEX'}<br>` +
+    `flows: ${s.n}<br>${rows}<br>last edge: ${edge} bps`;
+  $('dFlows').open = true;
+}
+function pickAt(cx, cy) {
+  let best = null, bd = Infinity;
+  for (const v of venues) {
+    const d = Math.hypot(cx - v.x, cy - v.y);
+    if (d < v.r + 16 && d < bd) { bd = d; best = v.name; }
+  }
+  selectVenue(best);
+}
+const pointers = new Map();
+let pinchD0 = 0, panning = false, downXY = null;
+canvas.addEventListener('contextmenu', (ev) => ev.preventDefault());
+canvas.addEventListener('pointerdown', (ev) => {
+  try { canvas.setPointerCapture(ev.pointerId); } catch { /* synthetic event: no capture */ }
+  pointers.set(ev.pointerId, [ev.clientX, ev.clientY]);
+  if (pointers.size === 1) { downXY = [ev.clientX, ev.clientY]; panning = false; }
+  else if (pointers.size === 2) {
+    const p = [...pointers.values()];
+    pinchD0 = Math.hypot(p[0][0] - p[1][0], p[0][1] - p[1][1]);
+  }
+});
+canvas.addEventListener('pointermove', (ev) => {
+  if (!pointers.has(ev.pointerId)) return;
+  const prev = pointers.get(ev.pointerId);
+  pointers.set(ev.pointerId, [ev.clientX, ev.clientY]);
+  if (pointers.size === 1) {
+    if (downXY && Math.hypot(ev.clientX - downXY[0], ev.clientY - downXY[1]) > 6) panning = true;
+    if (panning) { view.ox += ev.clientX - prev[0]; view.oy += ev.clientY - prev[1]; applyView(); }
+  } else if (pointers.size === 2) {
+    const p = [...pointers.values()];
+    const d = Math.hypot(p[0][0] - p[1][0], p[0][1] - p[1][1]);
+    if (pinchD0 > 0 && d > 0) zoomAt((p[0][0] + p[1][0]) / 2, (p[0][1] + p[1][1]) / 2, d / pinchD0);
+    pinchD0 = d;
+  }
+});
+function endPointer(ev) {
+  const tap = pointers.size === 1 && !panning && downXY;
+  const x = ev.clientX, y = ev.clientY;
+  pointers.delete(ev.pointerId);
+  if (pointers.size < 2) pinchD0 = 0;
+  if (tap) pickAt(x, y);
+  downXY = null; panning = false;
+}
+canvas.addEventListener('pointerup', endPointer);
+canvas.addEventListener('pointercancel', (ev) => { pointers.delete(ev.pointerId); });
+canvas.addEventListener('wheel', (ev) => {
+  ev.preventDefault();
+  zoomAt(ev.clientX, ev.clientY, ev.deltaY < 0 ? 1.12 : 1 / 1.12);
+}, { passive: false });
+
+// ---------- flow state, arcs, pulses, replay ----------
+// Flows are plain data (screen-space quadratic segments); the frame loop
+// draws them every frame. No geometry is allocated per trade.
+const state = { flows: [], total: 0, enabled: new Set(STRAT_NAMES), replayHead: -1, live: true,
+  status: null, strategies: {}, fStrats: new Set(STRAT_NAMES), fVenue: '', fOutcome: 'all', fSym: '', fLimit: 100 };
+let arcs = []; // {a, b, color, w} venue names; endpoints resolve per frame
+let pulses = []; // {a, b, color, r, t, speed} venue names + progress
+function venueByName(name) {
+  return venues.find((v) => v.name === name) || null;
+}
+function arcPoints(aName, bName) {
+  const a = venueByName(aName), b = venueByName(bName);
+  if (!a || !b) return null;
+  if (a === b) { // same-venue loop (funding legs)
+    return [a.x, a.y - a.r, a.x + a.r * 1.6, a.y - a.r * 0.4,
+      a.x + a.r * 0.4, a.y - a.r * 2.6];
+  }
+  const mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2;
+  const dx = b.x - a.x, dy = b.y - a.y;
+  const len = Math.hypot(dx, dy) || 1;
+  const lift = Math.min(120, len * 0.25);
+  return [a.x, a.y, b.x, b.y, mx - dy / len * lift, my + dx / len * lift];
+}
+function qpoint(p, t) {
+  const u = 1 - t;
+  return [u * u * p[0] + 2 * u * t * p[4] + t * t * p[2],
+    u * u * p[1] + 2 * u * t * p[5] + t * t * p[3]];
+}
+function tradeVisible(t) { return state.enabled.has(t.intent.strategy); }
+const chipBtns = {};
+function rebuildFlows() {
+  arcs = [];
+  pulses = [];
+  let list = state.flows.filter(tradeVisible);
+  if (state.replayHead >= 0) list = list.slice(0, state.replayHead + 1);
+  list = list.slice(-RENDER_CAP);
+  for (const t of list) {
+    const strat = t.intent.strategy;
+    const edge = parseFloat(t.intent.expected_edge_bps || '0');
+    const w = 1 + Math.min(edge, 150) / 150 * 4;
+    const legs = t.intent.legs || [];
+    for (let i = 0; i + 1 < legs.length; i++) {
+      const a = String(legs[i].venue || '').toLowerCase();
+      const b = String(legs[i + 1].venue || '').toLowerCase();
+      if (!venueByName(a) || !venueByName(b)) continue;
+      const color = stratColor(strat);
+      arcs.push({ a, b, color, w });
+      if (!REDUCED && pulses.length < 240) {
+        pulses.push({ a, b, color, r: 2 + w * 0.5, t: Math.random(), speed: 0.4 + Math.random() * 0.4 });
+      }
+    }
+  }
+  const range = $('replayRange');
+  range.max = String(Math.max(state.flows.length - 1, 0));
+  if (state.replayHead < 0) range.value = range.max;
+  $('replayLabel').textContent = state.replayHead < 0
+    ? `all · ${list.length} shown`
+    : `#${state.replayHead + 1}/${state.flows.length}`;
+  $('liveBtn').querySelector('.lbl').textContent = state.live ? 'live' : 'paused';
+  $('liveBtn').setAttribute('aria-checked', String(state.live));
+  refreshChips();
+  draw(0);
+}
+function refreshChips() {
+  const counts = {};
+  for (const t of state.flows) counts[t.intent.strategy] = (counts[t.intent.strategy] || 0) + 1;
+  for (const [name, b] of Object.entries(chipBtns)) b.textContent = `${name} (${counts[name] || 0})`;
+}
+function applyReplay(v) {
+  state.replayHead = v >= state.flows.length - 1 ? -1 : v;
+  state.live = state.replayHead < 0;
+  $('liveBtn').setAttribute('aria-checked', String(state.live));
+  rebuildFlows();
+}
+function stepReplay(d) {
+  const max = Math.max(state.flows.length - 1, 0);
+  const cur = state.replayHead < 0 ? max : state.replayHead;
+  const v = Math.min(Math.max(cur + d, 0), max);
+  $('replayRange').value = v;
+  applyReplay(v);
+}
+
+// ---------- top strip: uptime, status, money ----------
+function renderStrip() {
+  const s = state.status; if (!s) return;
+  const up = s.started_ms ? ((Date.now() - s.started_ms) / 1000) : null;
+  $('uptimeVal').textContent = up == null ? '—' : (up < 90 ? `${Math.floor(up)}s` : `${Math.floor(up / 60)}m ${Math.floor(up % 60)}s`);
+  const cx = (s.connectors || []).filter((c) => c.connected).length;
+  $('statusLine').innerHTML = `<span class="dim">mode</span> <span>${s.mode}</span>` +
+    `<span class="${s.killed ? 'neg' : 'pos'}">${s.killed ? 'KILLED' : 'armed'}</span>` +
+    `<span class="dim">trades</span> <span class="num">${s.trades}</span>` +
+    `<span class="dim">conns</span> <span class="num">${cx}/${(s.connectors || []).length}</span>` +
+    `<span class="dim">opps</span> <span class="num">${s.opportunities_seen}</span>`;
+  const p = s.portfolio || {};
+  $('moneyLine').innerHTML = `<span class="dim">equity</span> <span class="num">$${fmt(p.equity_quote)}</span>` +
+    `<span class="dim">real</span> <span class="${cls(p.realized_pnl_quote)}">$${fmt(p.realized_pnl_quote)}</span>` +
+    `<span class="dim">unreal</span> <span class="${cls(p.unrealized_pnl_quote)}">$${fmt(p.unrealized_pnl_quote)}</span>`;
+}
+
+// ---------- ops: summary, strategies, positions, trades, connectors, controls ----------
+function renderSummary() {
+  const s = state.status; if (!s) return;
+  const fees = state.flows.reduce((a, t) => a + tradeFees(t), 0);
+  const settled = state.flows.filter((t) => t.realized_pnl_quote != null);
+  const tot = settled.reduce((a, t) => a + Number(t.realized_pnl_quote), 0);
+  return { fees, settled: settled.length, tot };
+}
+function renderStrats() {
+  const tb = $('stratTbl').querySelector('tbody');
+  const rows = STRAT_NAMES.map((name) => {
+    const m = state.strategies[name];
+    const paused = (state.status?.paused_strategies || []).includes(name);
+    if (!m) return `<tr><td>${name}</td><td colspan="7" class="dim">—</td><td>${paused ? 'paused' : 'live'}</td></tr>`;
+    return `<tr><td>${name}</td><td class="num">${m.scans ?? 0}</td><td class="num">${m.emitted ?? 0}</td>` +
+      `<td class="num">${m.filled ?? 0}</td><td class="num">${m.risk_rejected ?? 0}</td>` +
+      `<td class="num">${m.fill_failed ?? 0}</td><td class="num">${m.dup_skipped ?? 0}</td>` +
+      `<td class="${cls(m.realized_pnl_quote)}">${fmt(m.realized_pnl_quote)}</td>` +
+      `<td>${paused ? 'paused' : 'live'}</td></tr>`;
+  });
+  tb.innerHTML = rows.join('');
+  for (const b of $('stratBtns').children) {
+    const paused = (state.status?.paused_strategies || []).includes(b.dataset.strat);
+    b.setAttribute('aria-pressed', String(paused));
+    b.textContent = paused ? `${b.dataset.strat} (paused)` : b.dataset.strat;
+  }
+}
+function renderPositions() {
+  const tb = $('posTbl').querySelector('tbody');
+  const ops = state.status?.open_positions || [];
+  if (!ops.length) { tb.innerHTML = `<tr><td colspan="8" class="dim">none open</td></tr>`; return; }
+  tb.innerHTML = ops.map((o) => {
+    const stale = o.mark_price_quote == null || o.market_value_quote == null;
+    return `<tr><td>${o.strategy}</td><td>${o.venue}</td><td>${o.symbol}</td>` +
+      `<td class="num">${fmt(o.qty_base, 6)}</td><td class="num">${o.entry_price_quote != null ? '$' + fmt(o.entry_price_quote) : '—'}</td>` +
+      `<td class="num">${stale ? '—' : '$' + fmt(o.mark_price_quote)}</td>` +
+      `<td class="num">${stale ? '—' : '$' + fmt(o.market_value_quote)}</td>` +
+      `<td class="${stale ? 'stale' : 'pos'}">${stale ? 'stale' : 'live'}</td></tr>`;
+  }).join('');
+}
+function filteredTrades() {
+  let list = state.flows.filter((t) => state.fStrats.has(t.intent?.strategy));
+  if (state.fVenue) list = list.filter((t) => (t.intent?.legs || []).some((l) => String(l.venue).toLowerCase() === state.fVenue));
+  if (state.fOutcome === 'settled') list = list.filter((t) => t.realized_pnl_quote != null);
+  if (state.fOutcome === 'openers') list = list.filter((t) => t.intent && t.intent.roundtrip === false);
+  if (state.fSym) list = list.filter((t) => (t.intent?.legs || []).some((l) => symText(l.symbol).toUpperCase().includes(state.fSym)));
+  return list.slice().sort((a, b) => (b.ts_ms || 0) - (a.ts_ms || 0));
+}
+function renderTrades() {
+  const tb = $('tradeTbl').querySelector('tbody');
+  const list = filteredTrades();
+  $('fCount').textContent = `${list.length}/${state.flows.length} shown`;
+  const rows = list.slice(0, state.fLimit).map((t) => {
+    const legs = (t.intent?.legs || []).map(legText).join('<br>');
+    const time = t.ts_ms ? new Date(t.ts_ms).toLocaleTimeString('en-GB') : '—';
+    const pnl = t.realized_pnl_quote != null ? `<span class="${cls(t.realized_pnl_quote)}">${fmt(t.realized_pnl_quote)}</span>` : `<span class="dim">—</span>`;
+    return `<tr><td>${time}</td><td>${t.intent?.strategy ?? '—'}</td><td class="legs" style="text-align:left">${legs}</td>` +
+      `<td class="num">${t.intent?.expected_edge_bps ?? '—'}</td><td class="num">${fmt(tradeFees(t))}</td><td>${pnl}</td></tr>`;
+  });
+  tb.innerHTML = rows.length ? rows.join('') : `<tr><td colspan="6" class="dim">no trades match</td></tr>`;
+}
+function renderConns() {
+  const s = state.status; if (!s) return;
+  const tb = $('connTbl').querySelector('tbody');
+  const venues = new Set([...(s.connectors || []).map((c) => c.venue)]);
+  for (const t of state.flows) for (const l of (t.intent?.legs || [])) venues.add(String(l.venue).toLowerCase());
+  const sel = $('fVenue');
+  const next = [''].concat([...venues].sort());
+  const cur = [...sel.options].map((o) => o.value);
+  if (JSON.stringify(cur) !== JSON.stringify(next)) {
+    sel.innerHTML = `<option value="">all</option>` + [...venues].sort().map((v) => `<option value="${v}">${v}</option>`).join('');
+    sel.value = state.fVenue;
+  }
+  tb.innerHTML = (s.connectors || []).map((c) => `<tr><td>${c.venue}</td>` +
+    `<td class="${c.connected ? 'pos' : 'neg'}">${c.connected}</td><td class="num">${c.books}</td>` +
+    `<td class="num">${c.fresh_books}</td><td class="dim">${c.last_book_ms ?? '—'}</td>` +
+    `<td class="dim">${c.last_error ?? ''}</td></tr>`).join('') || `<tr><td colspan="6" class="dim">—</td></tr>`;
+  const fx = s.usdt_idr || {};
+  $('fxLine').textContent = `usdt/idr: ${fx.state ?? '—'} mid=${fx.mid ?? '—'} fresh=${fx.fresh} degraded=${fx.degraded} sources=${fx.independent_sources ?? 0}`;
+}
+function renderOps() {
+  renderSummary();
+  renderStrats();
+  renderPositions();
+  renderTrades();
+  renderConns();
+}
+// ---------- token-gated controls ----------
+function token() { return $('key').value.trim(); }
+async function post(path) {
+  const t = token();
+  if (!t) { $('ctlMsg').textContent = 'enter api key first'; return; }
+  $('ctlMsg').textContent = '';
+  const res = await fetch(path + '?token=' + encodeURIComponent(t), { method: 'POST' });
+  if (res.status === 401) { $('ctlMsg').textContent = 'wrong key (401)'; return; }
+  if (!res.ok) { $('ctlMsg').textContent = 'failed: ' + res.status; return; }
+  await loadStatus();
+}
+
+// ---------- ui wiring: chips, replay, filters, controls ----------
+// All series start visible; a chip toggles its strategy in the 3D scene
+// and in the trades table together.
+for (const s of STRAT_NAMES) {
+  for (const [boxId, setKey] of [['filters', 'enabled'], ['fStrats', 'fStrats']]) {
+    const b = document.createElement('button');
+    b.textContent = s; b.dataset.strat = s; b.setAttribute('aria-pressed', 'true');
+    b.addEventListener('click', () => {
+      if (state[setKey].has(s)) { state[setKey].delete(s); b.setAttribute('aria-pressed', 'false'); }
+      else { state[setKey].add(s); b.setAttribute('aria-pressed', 'true'); }
+      syncChipPair(s);
+      rebuildFlows();
+      renderTrades();
+    });
+    $(boxId).appendChild(b);
+    if (boxId === 'filters') chipBtns[s] = b;
+  }
+}
+function syncChipPair(s) {
+  for (const boxId of ['filters', 'fStrats']) {
+    const b = $(boxId).querySelector(`[data-strat="${s}"]`);
+    if (!b) continue;
+    const on = (boxId === 'filters' ? state.enabled : state.fStrats).has(s);
+    b.setAttribute('aria-pressed', String(on));
+  }
+}
+$('liveBtn').addEventListener('click', () => {
+  if (state.replayHead >= 0) { $('replayRange').value = $('replayRange').max; applyReplay(state.flows.length); }
+});
+$('stepBack').addEventListener('click', () => stepReplay(-1));
+$('stepFwd').addEventListener('click', () => stepReplay(1));
+$('replayRange').addEventListener('input', (e) => applyReplay(Number(e.target.value)));
+{
+  const box = $('stratBtns');
+  for (const s of STRAT_NAMES) {
+    const b = document.createElement('button');
+    b.textContent = s; b.dataset.strat = s; b.setAttribute('aria-pressed', 'false');
+    b.addEventListener('click', async () => {
+      const paused = (state.status?.paused_strategies || []).includes(s);
+      await post(paused ? `/resume/${s}` : `/pause/${s}`);
+    });
+    box.appendChild(b);
+  }
+}
+$('fVenue').addEventListener('change', (e) => { state.fVenue = e.target.value; renderTrades(); });
+$('fOutcome').addEventListener('change', (e) => { state.fOutcome = e.target.value; renderTrades(); });
+$('fSym').addEventListener('input', (e) => { state.fSym = e.target.value.toUpperCase(); renderTrades(); });
+$('fLimit').addEventListener('change', (e) => { state.fLimit = Number(e.target.value) || 100; renderTrades(); });
+$('tradeTbl').querySelector('tbody').addEventListener('click', (e) => {
+  const tr = e.target.closest('tr');
+  if (tr) tr.classList.toggle('open');
+});
+$('key').value = sessionStorage.getItem('apiKey') || '';
+$('key').addEventListener('input', (e) => sessionStorage.setItem('apiKey', e.target.value));
+$('kill').addEventListener('click', () => post('/kill'));
+$('revive').addEventListener('click', () => post('/revive'));
+// Wide screens get the full drawer open; phones open Flows only.
+if (innerWidth >= 900) for (const d of document.querySelectorAll('#sheet details')) d.open = true;
+// The strip toggle hides the whole drawer for a fullscreen canvas; the
+// choice survives reloads. Narrower drawer + toggle = less chrome everywhere.
+{
+  const btn = $('panelToggle'), sheet = $('sheet');
+  const apply = (open) => {
+    sheet.classList.toggle('hidden', !open);
+    btn.setAttribute('aria-expanded', String(open));
+    btn.textContent = open ? 'panels' : 'show';
+  };
+  const saved = sessionStorage.getItem('panelsOpen');
+  apply(saved === null ? true : saved === '1');
+  btn.addEventListener('click', () => {
+    const open = sheet.classList.contains('hidden');
+    sessionStorage.setItem('panelsOpen', open ? '1' : '0');
+    apply(open);
+    resize();
+  });
+}
+// Drag the handle down to dismiss the sheet (M3 modal-sheet gesture);
+// the strip toggle brings it back. 72px dismiss threshold.
+{
+  const grab = $('grab');
+  let gy0 = null, gdy = 0;
+  grab.addEventListener('pointerdown', (ev) => {
+    gy0 = ev.clientY; gdy = 0;
+    try { grab.setPointerCapture(ev.pointerId); } catch {}
+  });
+  grab.addEventListener('pointermove', (ev) => { if (gy0 != null) gdy = ev.clientY - gy0; });
+  const endGrab = () => {
+    if (gdy > 72 && !$('sheet').classList.contains('hidden')) $('panelToggle').click();
+    gy0 = null; gdy = 0;
+  };
+  grab.addEventListener('pointerup', endGrab);
+  grab.addEventListener('pointercancel', () => { gy0 = null; });
+}
+
+// ---------- loaders, main loop, boot ----------
+async function loadStatus() {
+  const res = await fetch('/status', { cache: 'no-store' });
+  if (!res.ok) throw new Error('GET /status -> ' + res.status);
+  state.status = await res.json();
+  const pr = await fetch('/strategies', { cache: 'no-store' });
+  if (pr.ok) state.strategies = await pr.json();
+  renderStrip();
+  renderOps();
+}
+async function loadFlows() {
+  const res = await fetch('/flows', { cache: 'no-store' });
+  if (!res.ok) throw new Error('GET /flows -> ' + res.status);
+  const data = await res.json();
+  state.flows = (data.flows || []).slice().sort((a, b) => (a.ts_ms || 0) - (b.ts_ms || 0));
+  state.total = data.count ?? state.flows.length;
+  rebuildFlows();
+  renderTrades();
+  renderConns();
+}
+// ---------- frame ----------
+function drawArc(a, b, color, w) {
+  const p = arcPoints(a, b);
+  if (!p) return;
+  ctx.strokeStyle = color;
+  ctx.globalAlpha = 0.75;
+  ctx.lineWidth = w;
+  ctx.beginPath();
+  ctx.moveTo(p[0], p[1]);
+  ctx.quadraticCurveTo(p[4], p[5], p[2], p[3]);
+  ctx.stroke();
+  ctx.globalAlpha = 1;
+}
+function draw(t, dt) {
+  paintBackdrop(t);
+  for (const s of arcs) drawArc(s.a, s.b, s.color, s.w);
+  for (const v of venues) drawNode(v, t);
+  for (const p of pulses) {
+    if (!REDUCED) {
+      p.t += dt * p.speed;
+      if (p.t >= 1) p.t -= 1;
+    }
+    const pts = arcPoints(p.a, p.b);
+    if (!pts) continue;
+    const [x, y] = qpoint(pts, p.t);
+    ctx.fillStyle = p.color;
+    ctx.beginPath(); ctx.arc(x, y, p.r, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = 'rgba(255,255,255,0.85)';
+    ctx.beginPath(); ctx.arc(x, y, p.r * 0.4, 0, Math.PI * 2); ctx.fill();
+  }
+  if (selected) {
+    const v = venueByName(selected);
+    if (v) {
+      ctx.strokeStyle = '#ffffff'; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.arc(v.x, v.y, v.r + 9, 0, Math.PI * 2); ctx.stroke();
+    }
+  }
+}
+let lastT = 0;
+function tick(ts) {
+  requestAnimationFrame(tick);
+  const t = ts / 1000;
+  const dt = Math.min(t - (lastT || t), 0.1);
+  lastT = t;
+  if (REDUCED) return; // static frame; rebuildFlows/resize redraw on demand
+  draw(t, dt);
+}
+resize();
+requestAnimationFrame(tick);
+(async function boot() {
+  try { await loadStatus(); await loadFlows(); $('err').style.display = 'none'; }
+  catch (e) { showErr('page unavailable (' + e.message + '): serve the engine, then open /'); return; }
+  setInterval(async () => { try { await loadStatus(); await loadFlows(); $('err').style.display = 'none'; } catch { /* keep last frame */ } }, POLL_MS);
+})();
+</script>
+</body>
+</html>
