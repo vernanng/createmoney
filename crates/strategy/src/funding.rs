@@ -123,8 +123,14 @@ impl FundingStrategy {
     }
 
     /// S4: record one annualized print, keeping the last `exit_window`.
+    /// `on_tick` calls this every tick with the latest print, so repeats
+    /// of the same print are dropped — the window spans distinct prints,
+    /// not the last few hundred milliseconds of one print.
     pub fn record(&mut self, venue: Venue, symbol: &Symbol, ann_bps: Decimal) {
         let h = self.history.entry((venue, symbol.to_string())).or_default();
+        if h.last() == Some(&ann_bps) {
+            return;
+        }
         h.push(ann_bps);
         while h.len() > self.exit_window {
             h.remove(0);
@@ -260,6 +266,13 @@ impl Strategy for FundingStrategy {
                     }
                     notional = notional.min(cap);
                 }
+            }
+            // The share cap shrinks with the venue's remaining quote, so
+            // successive entries would drain it in geometric dust slices
+            // (500, 375, 281, ...) that can never repay their round trip.
+            // Below the shared min-notional floor, don't enter at all.
+            if notional < self.params.min_notional_quote {
+                continue;
             }
             let qty = size_for_notional(notional, ask.price);
             if qty <= Decimal::ZERO {
@@ -419,6 +432,68 @@ mod tests {
             next_funding_ms: 0,
         });
         assert!(st.on_tick(&v).is_empty());
+    }
+
+    #[test]
+    fn share_capped_entry_below_min_notional_is_skipped() {
+        // Venue holds 1200 quote; the 25% share cap shrinks the entry to
+        // 300, under the 500 min-notional floor. Emitting it would drain
+        // the venue in shrinking dust slices (500, 375, 281, ...).
+        let s = Symbol::new("BTC", "USDT");
+        let params = StrategyParams {
+            target_notional_quote: dec!(500),
+            min_notional_quote: dec!(500),
+            max_venue_quote_share_bps: dec!(2500),
+            ..Default::default()
+        };
+        let mut st = FundingStrategy::new(params, dec!(500), vec![(Venue::Bybit, s.clone())]);
+        let mut v = MarketView {
+            now_ms: 1_000,
+            ..Default::default()
+        };
+        let mut b = OrderBook::new(Venue::Bybit, s.clone());
+        b.apply_snapshot(
+            vec![BookLevel {
+                price: dec!(100),
+                qty: dec!(10),
+            }],
+            vec![BookLevel {
+                price: dec!(100.1),
+                qty: dec!(10),
+            }],
+            1,
+            1_000,
+        );
+        v.put(b);
+        v.venue_quote.insert(Venue::Bybit, dec!(1200));
+        v.funding.push(FundingRate {
+            venue: Venue::Bybit,
+            symbol: s.clone(),
+            rate_per_interval: dec!(0.0005),
+            interval_hours: dec!(8),
+            next_funding_ms: 0,
+        });
+        assert!(st.on_tick(&v).is_empty(), "dust entry must not fire");
+        // A funded venue still fires at full size.
+        v.venue_quote.insert(Venue::Bybit, dec!(10000));
+        assert_eq!(st.on_tick(&v).len(), 1);
+    }
+
+    #[test]
+    fn record_dedupes_repeated_prints() {
+        // on_tick records the latest print every tick (250ms); without
+        // dedupe the exit window is the last ~1s of identical prints.
+        let s = Symbol::new("BTC", "USDT");
+        let mut st = FundingStrategy::new(
+            StrategyParams::default(),
+            dec!(500),
+            vec![(Venue::Bybit, s.clone())],
+        );
+        for _ in 0..5 {
+            st.record(Venue::Bybit, &s, dec!(1000));
+        }
+        st.record(Venue::Bybit, &s, dec!(0));
+        assert_eq!(st.ema(Venue::Bybit, &s), Some(dec!(500)));
     }
 
     #[test]

@@ -142,6 +142,10 @@ pub struct PaperExecutor {
     /// Quote notional held per open funding pair, keyed (venue, "BASE/QUOTE")
     /// with its quote asset. Recorded on fills; credited per interval.
     pub funding_open: BTreeMap<(Venue, String), (Decimal, String)>,
+    /// Open perp positions keyed (venue, "BASE/QUOTE"): (base asset, signed
+    /// qty (+long / -short), average entry price). Recorded on fills so
+    /// equity can mark the hedge leg of a spot/perp pair.
+    pub perp_open: BTreeMap<(Venue, String), (String, Decimal, Decimal)>,
 }
 
 impl Default for PaperExecutor {
@@ -161,6 +165,7 @@ impl PaperExecutor {
             pending: Vec::new(),
             starting_equity: Decimal::ZERO,
             funding_open: BTreeMap::new(),
+            perp_open: BTreeMap::new(),
         }
     }
 
@@ -213,14 +218,69 @@ impl PaperExecutor {
         self.balances.clone()
     }
 
+    /// Record one perp fill. Adding in the position's direction
+    /// re-averages the entry; reducing it cash-settles the closed
+    /// portion's P/L into the quote balance (and realized P/L) at the
+    /// fill price, like a venue settlement — otherwise the MTM that
+    /// equity carried would vanish at close.
+    fn note_perp_fill(&mut self, f: &Fill) {
+        let key = (f.venue, f.symbol.to_string());
+        let delta = match f.side {
+            Side::Buy => f.qty_base,
+            Side::Sell => -f.qty_base,
+        };
+        let Some((_, qty, avg)) = self.perp_open.get(&key).cloned() else {
+            self.perp_open
+                .insert(key, (f.symbol.base.clone(), delta, f.price));
+            return;
+        };
+        let new_qty = qty + delta;
+        let opposing = (qty > Decimal::ZERO) != (delta > Decimal::ZERO);
+        if opposing {
+            let closed = delta.abs().min(qty.abs());
+            let gain = if qty > Decimal::ZERO {
+                closed * (f.price - avg)
+            } else {
+                closed * (avg - f.price)
+            };
+            adjust(&mut self.balances, f.venue, &f.symbol.quote, gain);
+            self.realized_pnl += gain;
+        }
+        if new_qty == Decimal::ZERO {
+            self.perp_open.remove(&key);
+            return;
+        }
+        let new_avg = if !opposing {
+            (avg * qty.abs() + f.price * delta.abs()) / new_qty.abs()
+        } else if (new_qty > Decimal::ZERO) != (qty > Decimal::ZERO) {
+            f.price
+        } else {
+            avg
+        };
+        self.perp_open
+            .insert(key, (f.symbol.base.clone(), new_qty, new_avg));
+    }
+
     /// Mark-to-market equity in quote terms. Assets with no mark are skipped
     /// (stale venue, unknown token) so a missing feed never invents value.
+    /// Open perps contribute signed MTM against their average entry, so a
+    /// hedged spot/perp pair reports its basis, not the spot leg's drift.
     pub fn equity_quote(&self, marks: &BTreeMap<String, Decimal>) -> Decimal {
-        self.balances
+        let spot: Decimal = self
+            .balances
             .values()
             .flat_map(|m| m.iter())
             .map(|(asset, amt)| marks.get(asset).copied().unwrap_or(Decimal::ZERO) * *amt)
-            .sum()
+            .sum();
+        let perp: Decimal = self
+            .perp_open
+            .values()
+            .map(|(base, qty, avg)| {
+                let mark = marks.get(base).copied().unwrap_or(*avg);
+                *qty * (mark - *avg)
+            })
+            .sum();
+        spot + perp
     }
 
     /// Open-position P/L: what the ledger gained or lost beyond closed trades.
@@ -279,6 +339,11 @@ impl PaperExecutor {
             });
         }
         self.balances = ledger;
+        for f in &fills {
+            if f.market == MarketKind::Perp {
+                self.note_perp_fill(f);
+            }
+        }
         // Position-opening intents (e.g. funding entries) accrue PnL over time;
         // never mark them as an instant round-trip.
         let pnl = if intent.roundtrip {
@@ -724,6 +789,114 @@ mod tests {
         // Unknown assets mark at zero, never invented.
         p.seed(Venue::Binance, "MYST", dec!(9));
         assert_eq!(p.equity_quote(&up), dec!(1200));
+    }
+
+    #[test]
+    fn equity_counts_open_perp_short_mtm_against_spot_long() {
+        // Funding entry: long 1 BTC spot + short 1 BTC perp at 100.
+        // When BTC falls to 90 the hedge must offset the spot loss;
+        // counting only the spot leg would report a phantom -10.
+        let s = Symbol::new("BTC", "USDT");
+        let mut p = PaperExecutor::default();
+        p.seed(Venue::Bybit, "USDT", dec!(1000));
+        let marks = BTreeMap::from([
+            ("USDT".to_string(), dec!(1)),
+            ("BTC".to_string(), dec!(100)),
+        ]);
+        p.starting_equity = p.equity_quote(&marks);
+        let mut book = OrderBook::new(Venue::Bybit, s.clone());
+        book.apply_snapshot(
+            vec![BookLevel {
+                price: dec!(99),
+                qty: dec!(10),
+            }],
+            vec![BookLevel {
+                price: dec!(100),
+                qty: dec!(10),
+            }],
+            1,
+            0,
+        );
+        let books = BTreeMap::from([(book_key(Venue::Bybit, &s), book)]);
+        let intent = Intent {
+            strategy: "funding_rate".into(),
+            expected_edge_bps: dec!(500),
+            ttl_ms: 1000,
+            created_ms: 0,
+            roundtrip: false,
+            legs: vec![
+                TradeLeg {
+                    venue: Venue::Bybit,
+                    symbol: s.clone(),
+                    side: Side::Buy,
+                    price: dec!(100),
+                    qty_base: dec!(1),
+                    market: MarketKind::Spot,
+                },
+                TradeLeg {
+                    venue: Venue::Bybit,
+                    symbol: s,
+                    side: Side::Sell,
+                    price: dec!(100),
+                    qty_base: dec!(1),
+                    market: MarketKind::Perp,
+                },
+            ],
+        };
+        p.execute(&intent, &books, 0).unwrap();
+        let down = BTreeMap::from([("USDT".to_string(), dec!(1)), ("BTC".to_string(), dec!(90))]);
+        // Only fees + slip (~0.24) are lost; the -10 spot move is hedged.
+        assert!(
+            p.unrealized_pnl_quote(&down) > dec!(-1),
+            "hedged unrealized was {}",
+            p.unrealized_pnl_quote(&down)
+        );
+        // Closing at 90 settles the perp gain in cash: total P/L stays at
+        // entry + exit fees, with no equity cliff when the position drops.
+        let s = Symbol::new("BTC", "USDT");
+        let mut book = OrderBook::new(Venue::Bybit, s.clone());
+        book.apply_snapshot(
+            vec![BookLevel {
+                price: dec!(90),
+                qty: dec!(10),
+            }],
+            vec![BookLevel {
+                price: dec!(91),
+                qty: dec!(10),
+            }],
+            2,
+            0,
+        );
+        let books = BTreeMap::from([(book_key(Venue::Bybit, &s), book)]);
+        let exit = Intent {
+            strategy: "funding_rate".into(),
+            expected_edge_bps: dec!(0),
+            ttl_ms: 1000,
+            created_ms: 0,
+            roundtrip: false,
+            legs: vec![
+                TradeLeg {
+                    venue: Venue::Bybit,
+                    symbol: s.clone(),
+                    side: Side::Sell,
+                    price: dec!(90),
+                    qty_base: dec!(1),
+                    market: MarketKind::Spot,
+                },
+                TradeLeg {
+                    venue: Venue::Bybit,
+                    symbol: s,
+                    side: Side::Buy,
+                    price: dec!(90),
+                    qty_base: dec!(1),
+                    market: MarketKind::Perp,
+                },
+            ],
+        };
+        p.execute(&exit, &books, 0).unwrap();
+        assert!(p.perp_open.is_empty());
+        let total = p.realized_pnl + p.unrealized_pnl_quote(&down);
+        assert!(total > dec!(-1) && total < dec!(0), "total pnl was {total}");
     }
 
     #[test]

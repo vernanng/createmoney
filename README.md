@@ -113,7 +113,7 @@ skips that venue only — never the whole scan.
 | `min_edge_bps` | 15 | Minimum **net** edge (after fees + slippage buffer) to emit |
 | `slip_buffer_bps` | 5 | Extra bps subtracted from every edge before comparing |
 | `target_notional_quote` | 500 | Base order size in quote (USD/USDT) terms |
-| `min_notional_quote` | 500 | `cross_exchange` hard floor; smaller prints cannot cover fixed transfer friction |
+| `min_notional_quote` | 500 | `cross_exchange` + funding-entry hard floor; smaller prints cannot cover fixed transfer friction, and share-capped funding entries would drain a venue in dust slices |
 | `rebalance_cost_bps` | 20 | Eventual inventory-transfer friction amortised into the `cross_exchange` edge gate |
 | `max_venue_quote_share_bps` | 2500 | One intent may spend at most this share (bps) of a venue's USDT+USDC ledger; 0 = off |
 | `dex_max_quote_age_ms` | 2000 | Polled DEX quotes older than this never reach `cex_dex` |
@@ -129,7 +129,10 @@ result can be attributed to the gate that blocked it.
 - **Paper fills** (`crates/paper`) walk the book (VWAP), pay real taker
   fees plus a 2 bps extra-slippage haircut, against balances seeded from
   `[paper]`. Inventory is enforced: an unfunded buy or a sell of an unheld
-  asset aborts the **whole** intent with no partial mutation. Realized PnL
+  asset aborts the **whole** intent with no partial mutation. Open perp
+  positions are marked to market in portfolio equity (a hedged spot/perp
+  pair reports its basis, not the spot leg's drift) and cash-settled into
+  realized PnL when a fill closes them. Realized PnL
   is computed only for round-trip intents (net of transfer fees); funding
   entries accrue over time.
 - **Rebalancing** stays out of the strategy loop by design, but it is not
