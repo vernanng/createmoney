@@ -622,10 +622,16 @@ binance = 10000
         )
         .unwrap();
         let engine = engine::Engine::new(cfg).unwrap();
-        // Quote side honors the capital map (USDT and USDC each).
+        // Quote side honors the capital map (USDT; USDC seeds DEX
+        // wallets only, so CEX books are not double-counted).
         assert_eq!(
             engine.paper.balance(Venue::Binance, "USDT"),
             Decimal::new(10_000, 0)
+        );
+        assert_eq!(engine.paper.balance(Venue::Binance, "USDC"), Decimal::ZERO);
+        assert_eq!(
+            engine.paper.balance(Venue::Jupiter, "USDC"),
+            Decimal::new(200, 0)
         );
         assert_eq!(
             engine.paper.balance(Venue::Bybit, "USDT"),

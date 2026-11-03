@@ -36,7 +36,7 @@
 ## Viewer
 
 - `crates/api/src/viewer.html` is baked into the binary via `include_str!`. A viewer change is done only after rebuild + engine restart + Ego reload.
-- After every viewer edit, verify in Ego and quote three numbers: sideways overflow (`#money` scrollWidth − clientWidth, must be 0), panel height vs viewport (must fit or scroll), all blocks reachable.
+- After every viewer edit, verify in Ego and quote three numbers: sideways overflow (document scrollWidth − clientWidth, must be 0), panel height vs viewport (must fit or scroll), all blocks reachable.
 
 ## Docs
 

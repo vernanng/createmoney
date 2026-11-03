@@ -83,7 +83,7 @@ Settled Q8: two EVM pools plus SOL on Jupiter — ETH/USDT Uniswap V2 plus BNB/U
 Settled Q9: green soak is 7 days, net positive after fees, zero stale-book fills, plus clean kill and pause drill. Reason: long enough to see weekends and funding prints, short enough to ship.
 Unresolved: none — accepted.
 Execution (all stages approved): owner approved all six implementation stages. One branch per stage; no commits without an explicit ask.
-Shipped: per-venue `[paper.capital]` ($10k Binance); paper self-rebalance with fee/delay + JSONL `transfer` events + `/status` transfers; target 500 with 25% venue-share guard; Jupiter + Uniswap-V2 + PancakeSwap-V2 DEX pollers with `dex_max_quote_age_ms`; Binance/Bybit/OKX funding streams; `outage_and_stale_books_never_partially_fill` drill; soak gate (7d, net positive, zero stale fills, kill+pause drill) in README going-live.
+Shipped: per-venue `[paper.capital]` ($10k total; concentrated-on-Binance layout superseded 2026-11-03 — at $200/venue the 25% guard capped buys at $50 and median fills were $19 dust, so the shipped config spreads $3k/$2k/$2k/$2k/$1k across the five CEX venues); paper self-rebalance with fee/delay + JSONL `transfer` events + `/status` transfers; target 500 with 25% venue-share guard; Jupiter + Uniswap-V2 + PancakeSwap-V2 DEX pollers with `dex_max_quote_age_ms`; Binance/Bybit/OKX funding streams; `outage_and_stale_books_never_partially_fill` drill; soak gate (7d, net positive, zero stale fills, kill+pause drill) in README going-live.
 
 ## Draft: ponytail codebase audit — what to remove (one-shot report, no code changed)
 
