@@ -50,8 +50,10 @@ pub struct StrategyParams {
     pub min_edge_bps: Decimal,
     pub slip_buffer_bps: Decimal,
     pub target_notional_quote: Decimal,
-    /// Hard floor for cross-exchange intents: below it, fixed transfer
-    /// friction dwarfs any spread the edge gate can clear. 0 = off.
+    /// Hard floor for cross-exchange intents and funding entries: below
+    /// it, fixed transfer friction dwarfs any edge the gate can clear,
+    /// and share-capped funding entries would drain a venue in dust
+    /// slices. 0 = off.
     pub min_notional_quote: Decimal,
     /// Eventual inventory-rebalance friction, amortised into the edge
     /// gate. 0 = assume rebalancing is free (it is not).

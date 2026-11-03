@@ -28,7 +28,10 @@ ttl_ms = 1500
 min_funding_annualized_bps = 500
 funding_planned_hold_hours = 720  # entry+exit fees must be recovered within 30 days
 dex_max_quote_age_ms = 2000  # DEX quotes are executable only while as fresh as CEX books
-imbalance_threshold = 0.1  # S6 gate on cross_exchange; off unless set
+# imbalance_threshold = 0.1  # S6 gate on cross_exchange; off unless set.
+                             # Autoloop iter 1: at 0.1 it rejected ~20k pair
+                             # scans with 0 fills in 27s — no round-trip
+                             # strategy could ever trade or profit.
 
 [indodax]
 rate_max_age_ms = 2000         # divisor no older than the books it converts
