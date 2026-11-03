@@ -353,32 +353,6 @@ impl PaperExecutor {
             .sum()
     }
 
-    /// What one leg needs that its venue ledger lacks, if anything.
-    /// Returns (asset, shortfall) in asset units. Counts in-flight delayed
-    /// credits alongside settled balances.
-    fn shortfall(
-        &self,
-        ledger: &Balances,
-        leg: &arb_core::TradeLeg,
-        px: Decimal,
-        fee: Decimal,
-    ) -> Option<(String, Decimal)> {
-        let (base, quote) = (leg.symbol.base.clone(), leg.symbol.quote.clone());
-        let (asset, need) = match leg.market {
-            MarketKind::Perp => (quote, fee),
-            MarketKind::Spot => match leg.side {
-                Side::Buy => (quote, px * leg.qty_base + fee),
-                Side::Sell => (base, leg.qty_base),
-            },
-        };
-        let have = bal(ledger, leg.venue, &asset) + self.pending_to(leg.venue, &asset);
-        if have < need {
-            Some((asset, need - have))
-        } else {
-            None
-        }
-    }
-
     /// Cover an intent's inventory shortfalls with virtual venue-to-venue
     /// transfers (paper-only). Loops until every leg is fundable or no donor
     /// covers the next shortfall. Each transfer burns the sending venue's
@@ -415,11 +389,24 @@ impl PaperExecutor {
         });
         let mut spent_quote = Decimal::ZERO;
         loop {
+            // Aggregate gross needs per (venue, asset): legs debiting the
+            // same ledger (spot buy + perp fee on one venue) get ONE
+            // transfer, and per-leg checks cannot each pass against a
+            // balance their sum exceeds.
+            let mut needs: BTreeMap<(Venue, String), (Decimal, Decimal)> = BTreeMap::new();
+            for (leg, px, fee) in &priced {
+                let (asset, need) = leg_need(leg, *px, *fee);
+                needs
+                    .entry((leg.venue, asset))
+                    .or_insert((Decimal::ZERO, *px))
+                    .0 += need;
+            }
             // (venue, asset, short, leg price for fee conversion)
             let mut next: Option<(Venue, String, Decimal, Decimal)> = None;
-            for (leg, px, fee) in &priced {
-                if let Some((asset, short)) = self.shortfall(&self.balances, leg, *px, *fee) {
-                    next = Some((leg.venue, asset, short, *px));
+            for ((venue, asset), (need, px)) in &needs {
+                let have = bal(&self.balances, *venue, asset) + self.pending_to(*venue, asset);
+                if have < *need {
+                    next = Some((*venue, asset.clone(), *need - have, *px));
                     break;
                 }
             }
@@ -477,6 +464,17 @@ impl PaperExecutor {
             });
         }
         out
+    }
+}
+
+/// Gross amount of one asset a leg debits at execution.
+fn leg_need(leg: &arb_core::TradeLeg, px: Decimal, fee: Decimal) -> (String, Decimal) {
+    match leg.market {
+        MarketKind::Perp => (leg.symbol.quote.clone(), fee),
+        MarketKind::Spot => match leg.side {
+            Side::Buy => (leg.symbol.quote.clone(), px * leg.qty_base + fee),
+            Side::Sell => (leg.symbol.base.clone(), leg.qty_base),
+        },
     }
 }
 
@@ -1056,6 +1054,51 @@ mod tests {
         assert!(moved.is_empty());
         assert_eq!(ex.transfers, 0);
         assert_eq!(ex.balance(Venue::Binance, "BTC"), dec!(5));
+    }
+
+    #[test]
+    fn rebalance_aggregates_same_venue_asset_shortfalls() {
+        // Funding-shaped intent: spot buy and perp short on the SAME venue
+        // both debit USDT (103.103 + 0.102 fee). Funding them leg by leg
+        // pays the $1 flat fee twice — a $100 min-chunk for the $0.102
+        // margin shortfall, then the real move. One intent, one venue,
+        // one asset must mean one transfer.
+        let s = Symbol::new("BTC", "USDT");
+        let intent = Intent {
+            strategy: "funding_rate".into(),
+            expected_edge_bps: dec!(1000),
+            ttl_ms: 1000,
+            created_ms: 0,
+            roundtrip: false,
+            legs: vec![
+                TradeLeg {
+                    venue: Venue::Bybit,
+                    symbol: s.clone(),
+                    side: Side::Buy,
+                    price: dec!(103),
+                    qty_base: dec!(1),
+                    market: MarketKind::Spot,
+                },
+                TradeLeg {
+                    venue: Venue::Bybit,
+                    symbol: s,
+                    side: Side::Sell,
+                    price: dec!(102),
+                    qty_base: dec!(1),
+                    market: MarketKind::Perp,
+                },
+            ],
+        };
+        let mut ex = PaperExecutor::new(PaperConfig {
+            fee_bps_override: Some(dec!(10)),
+            extra_slip_bps: dec!(0),
+            ..Default::default() // documented $1 flat schedule
+        });
+        ex.seed(Venue::Binance, "USDT", dec!(10000));
+        let moved = ex.rebalance_for(&intent, &books(), 10);
+        assert_eq!(moved.len(), 1, "one transfer per (venue, asset)");
+        assert!(moved[0].amount >= dec!(103.205));
+        assert_eq!(moved[0].fee, dec!(1));
     }
 
     #[test]

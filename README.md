@@ -349,7 +349,7 @@ Top-level `venues` / `symbols` must stay above the first `[table]` header.
 | `[indodax] rate_max_age_ms` | 30000 | max age of the live USDT/IDR book used as divisor |
 | `[indodax] rate_max_spread_bps` | 50 | max USDT/IDR top-of-book spread (bps of mid) |
 | `[indodax] rate_max_deviation_bps` | 300 | max deviation vs independent consensus before Indodax is withheld |
-| `[paper] start_quote_per_venue` | 200 | seeded USDT/USDC per venue incl. DEX wallets. Base is seeded only on Binance (BTC/ETH/SOL, one fill each at the reference price) so the portfolio fits the starting capital. `[paper.capital] <venue>` overrides one venue, e.g. `binance = 10000` |
+| `[paper] start_quote_per_venue` | 200 | seeded USDT/USDC per venue incl. DEX wallets. Base is seeded only on Binance (BTC/ETH/SOL, one fill each at the reference price) so the portfolio fits the starting capital. `[paper.capital] <venue>` overrides one venue; the shipped config spreads $10k across the five CEX venues so the 25% share guard admits target-size prints |
 
 Before going live, set `[paper]` amounts to your real planned capital per
 venue so the paper soak behaves like the live book.
@@ -464,9 +464,10 @@ manifest to auto-update on Apple Silicon.
   stays out of the strategy loop by design (no pre-trade gate), but every
   virtual transfer burns its sender's per-venue fee and debits strategy +
   engine realized PnL, so friction shows up in the numbers. Transfers
-  overshoot a shortfall to at least 100x the fee, and an intent whose
-  expected profit cannot cover the transfer fees is left unfunded (the
-  fill is skipped) instead of being funded at a guaranteed loss.
+  overshoot a shortfall to at least 100x the fee, legs debiting the same
+  venue ledger are funded by one aggregated transfer, and an intent
+  whose expected profit cannot cover the transfer fees is left unfunded
+  (the fill is skipped) instead of being funded at a guaranteed loss.
 
 ## Sources (official docs used for connector facts)
 
