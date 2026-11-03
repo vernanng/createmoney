@@ -6,6 +6,13 @@
 //! - `install-hooks` — install this binary as the `.git/hooks/post-commit`
 //!   hook (a symlink; no shell shim).
 //! - `ablate` — S8 ablation test matrix, then the full workspace suite.
+//! - `autoloop check|ci|ship <title> [body]|deploy` — local paper-soak
+//!   loop: judge the running engine's PnL after a 24 h soak (`check`,
+//!   exit 3 when losing), run the local CI gates (`ci`), push + PR +
+//!   merge the current branch on green local CI (`ship`), and rebuild +
+//!   redeploy the local Docker soak from this checkout (`deploy`).
+//!   Paper only: config mode stays `paper`, no keys are passed to the
+//!   CD stack, and Watchtower is stopped so only this loop deploys.
 //!
 //! Invoking the binary as `post-commit` runs `doc-check`.
 
@@ -26,8 +33,11 @@ fn run() -> i32 {
         Some("doc-check") => doc_check(args.get(2).map(String::as_str)),
         Some("install-hooks") => install_hooks(),
         Some("ablate") => ablate(),
+        Some("autoloop") => autoloop(&args[2..]),
         _ => {
-            eprintln!("usage: cargo xtask <doc-check [commit]|install-hooks|ablate>");
+            eprintln!(
+                "usage: cargo xtask <doc-check [commit]|install-hooks|ablate|autoloop <check|ci|ship|deploy>>"
+            );
             2
         }
     }
@@ -194,6 +204,257 @@ fn ablate() -> i32 {
     run_cargo(&root, &["test", "--workspace"])
 }
 
+/// Soak length before PnL judges an iteration (owner-set profit bar).
+const SOAK_HOURS: f64 = 24.0;
+
+fn autoloop(args: &[String]) -> i32 {
+    match args.first().map(String::as_str) {
+        Some("check") => autoloop_check(),
+        Some("ci") => autoloop_ci(&workspace_root()),
+        Some("ship") => match args.get(1) {
+            Some(title) => autoloop_ship(title, args.get(2).map(String::as_str)),
+            None => {
+                eprintln!("usage: cargo xtask autoloop ship <title> [body]");
+                2
+            }
+        },
+        Some("deploy") => autoloop_deploy(&workspace_root()),
+        _ => {
+            eprintln!("usage: cargo xtask autoloop <check|ci|ship <title> [body]|deploy>");
+            2
+        }
+    }
+}
+
+/// Run a command in `root`, inheriting stdio; return its exit code.
+fn run_cmd(root: &Path, cmd: &str, args: &[&str]) -> i32 {
+    println!("$ {cmd} {}", args.join(" "));
+    match Command::new(cmd).args(args).current_dir(root).status() {
+        Ok(s) => s.code().unwrap_or(1),
+        Err(e) => {
+            eprintln!("{cmd}: {e}");
+            1
+        }
+    }
+}
+
+/// Capture a git command's stdout in `root` (None on failure).
+fn git_out(root: &Path, args: &[&str]) -> Option<String> {
+    let out = Command::new("git")
+        .args(args)
+        .current_dir(root)
+        .output()
+        .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// The three AGENTS.md gates, in CI order. Stops at the first failure.
+fn autoloop_ci(root: &Path) -> i32 {
+    for args in [
+        vec!["fmt", "--check"],
+        vec![
+            "clippy",
+            "--locked",
+            "--workspace",
+            "--all-targets",
+            "--",
+            "-D",
+            "warnings",
+        ],
+        vec!["test", "--locked", "--workspace"],
+    ] {
+        let code = run_cargo(root, &args);
+        if code != 0 {
+            eprintln!("autoloop ci: FAILED at cargo {}", args.join(" "));
+            return code;
+        }
+    }
+    println!("autoloop ci: all gates green");
+    0
+}
+
+/// Field extractors over the `/status` JSON (xtask stays dependency-free;
+/// these keys are unique or first-occurrence by construction).
+fn extract_num(body: &str, key: &str) -> Option<f64> {
+    let pat = format!("\"{key}\":");
+    let rest = body.split(&pat).nth(1)?;
+    let num: String = rest
+        .trim_start()
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '-')
+        .collect();
+    num.parse().ok()
+}
+
+fn extract_str(body: &str, key: &str) -> Option<f64> {
+    let pat = format!("\"{key}\":\"");
+    let rest = body.split(&pat).nth(1)?;
+    rest.split('"').next()?.parse().ok()
+}
+
+/// Profit bar: an iteration is judged only after the soak; before that
+/// it is neither winning nor losing.
+fn verdict(pnl: f64, soak_h: f64) -> &'static str {
+    if soak_h < SOAK_HOURS {
+        "SOAKING"
+    } else if pnl > 0.0 {
+        "PROFITABLE"
+    } else {
+        "LOSING"
+    }
+}
+
+fn http_get_status() -> Option<String> {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+    let mut stream = TcpStream::connect("127.0.0.1:8787").ok()?;
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .ok()?;
+    stream
+        .write_all(b"GET /status HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n")
+        .ok()?;
+    let mut buf = String::new();
+    stream.read_to_string(&mut buf).ok()?;
+    buf.split("\r\n\r\n").nth(1).map(str::to_string)
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// One-line soak verdict. Exit 3 = LOSING (caller should iterate),
+/// 2 = engine unreachable, 0 = SOAKING or PROFITABLE.
+/// shortcut: PnL parsed as f64 for the verdict only; money paths stay
+/// Decimal. Upgrade if sub-cent verdicts ever matter.
+fn autoloop_check() -> i32 {
+    let Some(body) = http_get_status() else {
+        eprintln!("autoloop check: engine unreachable at 127.0.0.1:8787");
+        return 2;
+    };
+    let (Some(realized), Some(unrealized), Some(started), Some(trades)) = (
+        extract_str(&body, "realized_pnl_quote"),
+        extract_str(&body, "unrealized_pnl_quote"),
+        extract_num(&body, "started_ms"),
+        extract_num(&body, "trades"),
+    ) else {
+        eprintln!("autoloop check: /status fields missing");
+        return 2;
+    };
+    let pnl = realized + unrealized;
+    let soak_h = (now_ms() - started as i64) as f64 / 3_600_000.0;
+    let v = verdict(pnl, soak_h);
+    println!(
+        "autoloop: verdict={v} pnl={pnl:.2} (realized {realized:.2} + unrealized {unrealized:.2}) trades={trades:.0} soak_h={soak_h:.1} bar={SOAK_HOURS:.0}h"
+    );
+    if v == "LOSING" {
+        3
+    } else {
+        0
+    }
+}
+
+/// Local CI, then push + PR + merge. The merge gate is the local CI
+/// above (owner instruction overrides the review step for loop
+/// branches; AGENTS.md still governs everything else).
+fn autoloop_ship(title: &str, body: Option<&str>) -> i32 {
+    let root = workspace_root();
+    if run_cmd(&root, "git", &["status", "--porcelain"]) != 0 {
+        return 1;
+    }
+    if git_out(&root, &["status", "--porcelain"]).is_some_and(|s| !s.is_empty()) {
+        eprintln!("autoloop ship: working tree dirty; commit first");
+        return 1;
+    }
+    let Some(branch) = git_out(&root, &["branch", "--show-current"]) else {
+        return 1;
+    };
+    if branch.is_empty() || branch == "main" {
+        eprintln!("autoloop ship: on '{branch}'; loop work needs its own branch");
+        return 1;
+    }
+    let code = autoloop_ci(&root);
+    if code != 0 {
+        return code;
+    }
+    if run_cmd(&root, "git", &["push", "-u", "origin", &branch]) != 0 {
+        return 1;
+    }
+    let body = body.unwrap_or(
+        "Autoloop iteration. Local CI green (fmt/clippy/test); paper soak judges it over 24h.",
+    );
+    if run_cmd(
+        &root,
+        "gh",
+        &["pr", "create", "--title", title, "--body", body],
+    ) != 0
+    {
+        return 1;
+    }
+    run_cmd(&root, "gh", &["pr", "merge", "--merge"])
+}
+
+/// Local-only CD: build the soak image from this checkout (must hold
+/// the merged commit), rotate the previous paper-trade log aside so
+/// the iteration starts clean, restart the CD stack, and stop
+/// Watchtower so only this loop deploys.
+fn autoloop_deploy(root: &Path) -> i32 {
+    let code = run_cmd(
+        root,
+        "docker",
+        &["build", "-t", "ghcr.io/vernanng/createmoney:latest", "."],
+    );
+    if code != 0 {
+        return code;
+    }
+    let jsonl = root.join("cd-data/paper-trades.jsonl");
+    if jsonl.exists() {
+        let bak = root.join(format!(
+            "cd-data/paper-trades.jsonl.bak-{}",
+            now_ms() / 1000
+        ));
+        if let Err(e) = std::fs::rename(&jsonl, &bak) {
+            eprintln!("autoloop deploy: rotate {}: {e}", jsonl.display());
+            return 1;
+        }
+        println!("rotated previous soak log to {}", bak.display());
+    }
+    let code = run_cmd(
+        root,
+        "docker",
+        &["compose", "-f", "docker-compose.cd.yml", "up", "-d"],
+    );
+    if code != 0 {
+        return code;
+    }
+    // Loop owns deploys now; GHCR auto-update would revert local builds.
+    run_cmd(
+        root,
+        "docker",
+        &[
+            "compose",
+            "-f",
+            "docker-compose.cd.yml",
+            "stop",
+            "watchtower",
+        ],
+    );
+    for _ in 0..30 {
+        if http_get_status().is_some() {
+            println!("autoloop deploy: engine healthy at 127.0.0.1:8787");
+            return 0;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    }
+    eprintln!("autoloop deploy: engine did not answer /status within 60s");
+    1
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -257,6 +518,22 @@ mod tests {
             )
         );
         assert_eq!(render(&DocNeeds::default()), None);
+    }
+
+    #[test]
+    fn autoloop_status_fields_and_verdict() {
+        let body = r#"{"started_ms":1000,"trades":17,"realized_pnl_quote":"0","portfolio":{"realized_pnl_quote":"1.5","unrealized_pnl_quote":"-2.25"}}"#;
+        assert_eq!(extract_num(body, "started_ms"), Some(1000.0));
+        assert_eq!(extract_num(body, "trades"), Some(17.0));
+        // First occurrence wins: top-level realized, not the portfolio copy.
+        assert_eq!(extract_str(body, "realized_pnl_quote"), Some(0.0));
+        assert_eq!(extract_str(body, "unrealized_pnl_quote"), Some(-2.25));
+        assert_eq!(extract_str(body, "missing"), None);
+        assert_eq!(verdict(-5.0, 1.0), "SOAKING");
+        assert_eq!(verdict(5.0, 1.0), "SOAKING");
+        assert_eq!(verdict(0.01, 24.0), "PROFITABLE");
+        assert_eq!(verdict(0.0, 24.0), "LOSING");
+        assert_eq!(verdict(-0.01, 48.0), "LOSING");
     }
 
     #[test]

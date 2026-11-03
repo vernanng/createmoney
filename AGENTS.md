@@ -11,7 +11,7 @@
 
 - `bins` — application source
 - `crates` — crates
-- `xtask` — dev tooling (`cargo xtask doc-check|install-hooks|ablate`; the post-commit hook is the `xtask` binary, no shell)
+- `xtask` — dev tooling (`cargo xtask doc-check|install-hooks|ablate|autoloop`; the post-commit hook is the `xtask` binary, no shell)
 - `.github` — project configuration
 
 ## Conventions
