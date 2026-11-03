@@ -282,40 +282,30 @@ pub fn render_flows_envelope(items: &[serde_json::Value], total: usize) -> Strin
     serde_json::json!({"flows": items, "count": total}).to_string()
 }
 
-/// The viewer page, served as `GET /viewer` by the engine binary.
-pub const VIEWER_HTML: &str = include_str!("viewer.html");
-/// The ops dashboard, served as `GET /dashboard`. Merged into the viewer
-/// page: both routes serve the same unified HTML (3D scene + ops drawer).
-pub const DASHBOARD_HTML: &str = VIEWER_HTML;
+/// The strategy-flow page (3D scene + ops drawer), served as `GET /` by the
+/// engine binary.
+pub const INDEX_HTML: &str = include_str!("index.html");
+/// The ops dashboard. Same bytes as the root page: one page, two paths.
+pub const DASHBOARD_HTML: &str = INDEX_HTML;
 
 /// Per-strategy funnel counters as JSON (read-open, like `/status`).
 pub fn render_strategies(per_strategy: &BTreeMap<String, StrategyMetrics>) -> String {
     serde_json::to_string(per_strategy).unwrap_or_else(|_| "{}".into())
 }
 
-/// Viewer routes. Returns (status_code, body, content_type) when matched.
-/// `flows_body` is the snapshot rendered by [`render_flows_envelope`].
-pub fn route_viewer(
+/// Page + data routes. Returns (status_code, body, content_type) when matched.
+/// `flows_body` is the snapshot rendered by [`render_flows_envelope`];
+/// `strategies_body` by [`render_strategies`]. `/viewer` is retired.
+pub fn route_pages(
     method: &str,
     path: &str,
     flows_body: &str,
-) -> Option<(u16, String, &'static str)> {
-    match (method, path) {
-        ("GET", "/flows") => Some((200, flows_body.to_string(), "application/json")),
-        ("GET", "/viewer") => Some((200, VIEWER_HTML.to_string(), "text/html")),
-        _ => None,
-    }
-}
-
-/// Dashboard routes. Returns (status_code, body, content_type) when matched.
-/// `strategies_body` is the snapshot rendered by [`render_strategies`].
-pub fn route_dashboard(
-    method: &str,
-    path: &str,
     strategies_body: &str,
 ) -> Option<(u16, String, &'static str)> {
     match (method, path) {
+        ("GET", "/") => Some((200, INDEX_HTML.to_string(), "text/html")),
         ("GET", "/dashboard") => Some((200, DASHBOARD_HTML.to_string(), "text/html")),
+        ("GET", "/flows") => Some((200, flows_body.to_string(), "application/json")),
         ("GET", "/strategies") => Some((200, strategies_body.to_string(), "application/json")),
         _ => None,
     }
@@ -555,36 +545,10 @@ mod tests {
     }
 
     #[test]
-    fn viewer_flows_and_page() {
+    fn pages_serve_root_flows_and_strategies() {
         let items = vec![serde_json::json!({"intent": {"strategy": "triangular"}})];
-        let body = render_flows_envelope(&items, 42);
-        assert!(body.contains("\"count\":42"), "flows body: {body}");
-        let (code, out, ctype) = route_viewer("GET", "/flows", &body).unwrap();
-        assert_eq!(code, 200);
-        assert_eq!(ctype, "application/json");
-        assert!(out.contains("triangular"), "flows out: {out}");
-        let (code, page, ctype) = route_viewer("GET", "/viewer", &body).unwrap();
-        assert_eq!(code, 200);
-        assert_eq!(ctype, "text/html");
-        assert!(page.contains("strategy-flow"), "viewer page");
-        // All six engine strategies must have a viewer series; otherwise
-        // their flows fetch but never draw.
-        for s in [
-            "cross_exchange",
-            "triangular",
-            "funding_rate",
-            "cex_dex",
-            "lag_chase",
-            "fx_triangle",
-        ] {
-            assert!(page.contains(s), "viewer page hides {s}");
-        }
-        assert!(route_viewer("GET", "/nope", &body).is_none());
-        assert!(route_viewer("POST", "/flows", &body).is_none());
-    }
-
-    #[test]
-    fn dashboard_and_strategies() {
+        let flows = render_flows_envelope(&items, 42);
+        assert!(flows.contains("\"count\":42"), "flows body: {flows}");
         let per = BTreeMap::from([(
             "cross_exchange".to_string(),
             StrategyMetrics {
@@ -597,22 +561,43 @@ mod tests {
                 realized_pnl_quote: dec!(1.5),
             },
         )]);
-        let body = render_strategies(&per);
-        assert!(body.contains("cross_exchange"), "strategies body: {body}");
-        assert!(body.contains("\"filled\":3"), "strategies body: {body}");
-        let (code, page, ctype) = route_dashboard("GET", "/dashboard", &body).unwrap();
+        let strat = render_strategies(&per);
+        assert!(strat.contains("cross_exchange"), "strategies: {strat}");
+        assert!(strat.contains("\"filled\":3"), "strategies: {strat}");
+        let (code, out, ctype) = route_pages("GET", "/flows", &flows, &strat).unwrap();
         assert_eq!(code, 200);
-        assert_eq!(ctype, "text/html");
-        assert!(page.contains("dashboard"), "dashboard page");
-        // Both routes serve the same unified page (scene + ops drawer).
-        let (_, viewer, _) = route_viewer("GET", "/viewer", "").unwrap();
-        assert!(viewer.contains("strategy-flow"), "viewer page");
-        assert!(viewer.contains("dashboard"), "unified page keeps ops");
-        let (code, out, ctype) = route_dashboard("GET", "/strategies", &body).unwrap();
+        assert_eq!(ctype, "application/json");
+        assert!(out.contains("triangular"), "flows out: {out}");
+        let (code, out, ctype) = route_pages("GET", "/strategies", &flows, &strat).unwrap();
         assert_eq!(code, 200);
         assert_eq!(ctype, "application/json");
         assert!(out.contains("cross_exchange"), "strategies out: {out}");
-        assert!(route_dashboard("GET", "/nope", &body).is_none());
-        assert!(route_dashboard("POST", "/strategies", &body).is_none());
+        // Root page and /dashboard serve the same bytes.
+        let (code, root, ctype) = route_pages("GET", "/", &flows, &strat).unwrap();
+        assert_eq!(code, 200);
+        assert_eq!(ctype, "text/html");
+        let (code, dash, _) = route_pages("GET", "/dashboard", &flows, &strat).unwrap();
+        assert_eq!(code, 200);
+        assert_eq!(dash, root);
+        assert!(root.contains("strategy-flow"), "page heading");
+        // All six engine strategies must have a scene series; otherwise
+        // their flows fetch but never draw.
+        for s in [
+            "cross_exchange",
+            "triangular",
+            "funding_rate",
+            "cex_dex",
+            "lag_chase",
+            "fx_triangle",
+        ] {
+            assert!(root.contains(s), "page hides {s}");
+        }
+        // Token-gated controls ship on the page.
+        assert!(root.contains("kill"), "page hides controls");
+        // /viewer is retired; POSTs and unknown paths miss.
+        assert!(route_pages("GET", "/viewer", &flows, &strat).is_none());
+        assert!(route_pages("GET", "/nope", &flows, &strat).is_none());
+        assert!(route_pages("POST", "/flows", &flows, &strat).is_none());
+        assert!(route_pages("POST", "/", &flows, &strat).is_none());
     }
 }
