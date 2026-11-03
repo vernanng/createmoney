@@ -180,6 +180,14 @@ impl PaperExecutor {
         e.0 += notional_quote;
     }
 
+    /// Remove a filled funding exit from the credit registry. Returns
+    /// whether the pair was open.
+    pub fn close_funding_pair(&mut self, venue: Venue, symbol: &str) -> bool {
+        self.funding_open
+            .remove(&(venue, symbol.to_string()))
+            .is_some()
+    }
+
     /// Credit one funding interval on an open pair. Positive rates pay our
     /// short perp; negative rates charge it. Unknown pairs credit nothing.
     /// The payout lands straight in the quote balance (and realized P/L),
@@ -916,6 +924,13 @@ mod tests {
         );
         assert_eq!(ex.realized_pnl, dec!(0));
         assert_eq!(ex.balance(Venue::Bybit, "USDT"), dec!(1000));
+        // A filled exit removes the pair from the credit registry.
+        assert!(ex.close_funding_pair(Venue::Bybit, "BTC/USDT"));
+        assert_eq!(
+            ex.credit_funding(Venue::Bybit, "BTC/USDT", dec!(0.0001)),
+            dec!(0)
+        );
+        assert!(!ex.close_funding_pair(Venue::Bybit, "BTC/USDT"));
     }
 
     #[test]

@@ -24,13 +24,17 @@ pub struct ConnectorHealth {
     pub last_error: Option<String>,
 }
 
-/// Engine-boundary funnel counters for one strategy: how many intents it
-/// emitted, and where they stopped. Decisions inside a strategy (for
-/// example stale-book skips before emitting) are not counted here.
+/// Funnel counters for one strategy: pair evaluations rejected by each
+/// strategy gate, plus how many emitted intents stopped at the engine.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct StrategyMetrics {
     pub scans: u64,
     pub emitted: u64,
+    pub edge_rejected: u64,
+    pub imbalance_rejected: u64,
+    pub min_notional_rejected: u64,
+    pub stale_rejected: u64,
+    pub share_rejected: u64,
     pub risk_rejected: u64,
     pub fill_failed: u64,
     pub filled: u64,
@@ -210,6 +214,26 @@ pub fn render_metrics(
         s.push_str(&format!(
             "arb_strategy_intents_total{{strategy=\"{k}\"}} {}\n",
             m.emitted
+        ));
+        s.push_str(&format!(
+            "arb_strategy_gate_rejected_total{{strategy=\"{k}\",gate=\"edge\"}} {}\n",
+            m.edge_rejected
+        ));
+        s.push_str(&format!(
+            "arb_strategy_gate_rejected_total{{strategy=\"{k}\",gate=\"imbalance\"}} {}\n",
+            m.imbalance_rejected
+        ));
+        s.push_str(&format!(
+            "arb_strategy_gate_rejected_total{{strategy=\"{k}\",gate=\"min_notional\"}} {}\n",
+            m.min_notional_rejected
+        ));
+        s.push_str(&format!(
+            "arb_strategy_gate_rejected_total{{strategy=\"{k}\",gate=\"stale\"}} {}\n",
+            m.stale_rejected
+        ));
+        s.push_str(&format!(
+            "arb_strategy_gate_rejected_total{{strategy=\"{k}\",gate=\"share\"}} {}\n",
+            m.share_rejected
         ));
         s.push_str(&format!(
             "arb_strategy_risk_rejected_total{{strategy=\"{k}\"}} {}\n",
@@ -444,6 +468,11 @@ mod tests {
                 StrategyMetrics {
                     scans: 10,
                     emitted: 5,
+                    edge_rejected: 7,
+                    imbalance_rejected: 3,
+                    min_notional_rejected: 2,
+                    stale_rejected: 4,
+                    share_rejected: 1,
                     risk_rejected: 1,
                     fill_failed: 1,
                     filled: 3,
@@ -455,6 +484,15 @@ mod tests {
         assert!(m.contains("arb_trades_total 3"));
         assert!(m.contains("arb_strategy_intents_total{strategy=\"cross_exchange\"} 5"));
         assert!(m.contains("arb_strategy_risk_rejected_total{strategy=\"cross_exchange\"} 1"));
+        assert!(m.contains(
+            "arb_strategy_gate_rejected_total{strategy=\"cross_exchange\",gate=\"edge\"} 7"
+        ));
+        assert!(m.contains(
+            "arb_strategy_gate_rejected_total{strategy=\"cross_exchange\",gate=\"imbalance\"} 3"
+        ));
+        assert!(m.contains(
+            "arb_strategy_gate_rejected_total{strategy=\"cross_exchange\",gate=\"share\"} 1"
+        ));
         assert!(m.contains("arb_strategy_dup_skipped_total{strategy=\"cross_exchange\"} 2"));
         assert!(
             m.contains("arb_connector_fresh_books{venue=\"binance\"} 1"),
@@ -559,6 +597,7 @@ mod tests {
                 filled: 3,
                 dup_skipped: 2,
                 realized_pnl_quote: dec!(1.5),
+                ..Default::default()
             },
         )]);
         let strat = render_strategies(&per);
@@ -580,16 +619,9 @@ mod tests {
         assert_eq!(code, 200);
         assert_eq!(dash, root);
         assert!(root.contains("strategy-flow"), "page heading");
-        // All six engine strategies must have a scene series; otherwise
+        // All active engine strategies must have a scene series; otherwise
         // their flows fetch but never draw.
-        for s in [
-            "cross_exchange",
-            "triangular",
-            "funding_rate",
-            "cex_dex",
-            "lag_chase",
-            "fx_triangle",
-        ] {
+        for s in ["cross_exchange", "triangular", "funding_rate", "cex_dex"] {
             assert!(root.contains(s), "page hides {s}");
         }
         // Token-gated controls ship on the page.

@@ -33,8 +33,8 @@ pub struct FundingStrategy {
     pub min_annualized_bps: Decimal,
     /// venue -> spot symbols to pair against perps
     pub pairs: Vec<(Venue, Symbol)>,
-    /// Pairs with an open position; each fires once until closed via `mark_closed`.
-    open: Vec<(Venue, Symbol)>,
+    /// Open positions by pair, with the filled spot quantity an exit must sell.
+    open: BTreeMap<(Venue, String), (Symbol, Decimal)>,
     /// Pairs closed this tick; drained by the engine via `take_closed`
     /// so venue-cap exposure is released.
     closed: Vec<(Venue, Symbol)>,
@@ -42,6 +42,8 @@ pub struct FundingStrategy {
     history: BTreeMap<(Venue, String), Vec<Decimal>>,
     pub exit_window: usize,
     pub exit_threshold_bps: Decimal,
+    /// Horizon over which entry + exit taker/slip costs must be recovered.
+    pub planned_hold_hours: Decimal,
 }
 
 impl FundingStrategy {
@@ -53,10 +55,11 @@ impl FundingStrategy {
         Self {
             exit_window: 5,
             exit_threshold_bps: min_annualized_bps,
+            planned_hold_hours: Decimal::new(720, 0),
             params,
             min_annualized_bps,
             pairs,
-            open: Vec::new(),
+            open: BTreeMap::new(),
             closed: Vec::new(),
             history: BTreeMap::new(),
         }
@@ -68,21 +71,23 @@ impl FundingStrategy {
         self
     }
 
-    /// Seed pairs already opened by earlier engine runs (rebuilt from
+    pub fn with_planned_hold_hours(mut self, hours: Decimal) -> Self {
+        self.planned_hold_hours = hours.max(Decimal::ONE);
+        self
+    }
+
+    /// Seed positions already opened by earlier engine runs (rebuilt from
     /// stored fills) so a restart or redeploy does not open duplicates.
     /// Pairs outside the configured set are ignored.
-    pub fn with_open_pairs(mut self, pairs: Vec<(Venue, Symbol)>) -> Self {
-        for p in pairs {
-            if self.pairs.contains(&p) && !self.open.contains(&p) {
-                self.open.push(p);
-            }
+    pub fn with_open_pairs(mut self, pairs: Vec<(Venue, Symbol, Decimal)>) -> Self {
+        for (venue, symbol, qty) in pairs {
+            self.note_opened(venue, &symbol, qty);
         }
         self
     }
 
     pub fn mark_closed(&mut self, venue: Venue, symbol: &Symbol) {
-        let was_open = self.open.iter().any(|(v, s)| *v == venue && s == symbol);
-        self.open.retain(|(v, s)| !(*v == venue && s == symbol));
+        let was_open = self.open.remove(&(venue, symbol.to_string())).is_some();
         if was_open && !self.closed.iter().any(|(v, s)| *v == venue && s == symbol) {
             self.closed.push((venue, symbol.clone()));
         }
@@ -92,18 +97,29 @@ impl FundingStrategy {
         std::mem::take(&mut self.closed)
     }
 
-    pub fn open_pairs(&self) -> &[(Venue, Symbol)] {
-        &self.open
+    pub fn open_pairs(&self) -> Vec<(Venue, Symbol, Decimal)> {
+        self.open
+            .iter()
+            .map(|((venue, _), (symbol, qty))| (*venue, symbol.clone(), *qty))
+            .collect()
     }
 
-    /// Record a filled entry. Unknown or duplicate pairs are ignored so
-    /// restarts and retries cannot double-open.
-    pub fn note_opened(&mut self, venue: Venue, symbol: &Symbol) {
-        if self.pairs.contains(&(venue, symbol.clone()))
-            && !self.open.contains(&(venue, symbol.clone()))
-        {
-            self.open.push((venue, symbol.clone()));
+    fn open_qty(&self, venue: Venue, symbol: &Symbol) -> Option<Decimal> {
+        self.open
+            .get(&(venue, symbol.to_string()))
+            .map(|(_, qty)| *qty)
+            .filter(|qty| *qty > Decimal::ZERO)
+    }
+
+    /// Record a filled entry. Unknown pairs are ignored; duplicate fills
+    /// for one position do not double its quantity.
+    pub fn note_opened(&mut self, venue: Venue, symbol: &Symbol, qty: Decimal) {
+        if qty <= Decimal::ZERO || !self.pairs.contains(&(venue, symbol.clone())) {
+            return;
         }
+        self.open
+            .entry((venue, symbol.to_string()))
+            .or_insert_with(|| (symbol.clone(), qty));
     }
 
     /// S4: record one annualized print, keeping the last `exit_window`.
@@ -143,52 +159,93 @@ impl Strategy for FundingStrategy {
     }
 
     fn open_positions(&self) -> Vec<(Venue, Symbol)> {
-        self.open.clone()
+        self.open_pairs()
+            .into_iter()
+            .map(|(venue, symbol, _qty)| (venue, symbol))
+            .collect()
     }
 
-    fn note_filled(&mut self, venue: Venue, symbol: &Symbol) {
-        self.note_opened(venue, symbol);
+    fn note_filled(&mut self, intent: &Intent) {
+        let Some(spot) = intent
+            .legs
+            .iter()
+            .find(|leg| leg.market == MarketKind::Spot)
+        else {
+            return;
+        };
+        match spot.side {
+            Side::Buy => self.note_opened(spot.venue, &spot.symbol, spot.qty_base),
+            Side::Sell => self.mark_closed(spot.venue, &spot.symbol),
+        }
     }
 
     fn on_tick(&mut self, view: &MarketView) -> Vec<Intent> {
         let mut out = Vec::new();
-        // Clone pairs so we can mutate `open` while iterating.
+        // Clone pairs so we can inspect open state while iterating.
         for (venue, sym) in self.pairs.clone() {
             let (venue, sym) = (&venue, &sym);
-            let is_open = self.open.iter().any(|(v, s)| v == venue && s == sym);
-            let Some(fr) = view
+            let open_qty = self.open_qty(*venue, sym);
+            let fresh_book = view
+                .book(*venue, sym)
+                .filter(|b| fresh(b, view.now_ms, self.params.max_book_age_ms));
+            let print = view
                 .funding
                 .iter()
-                .find(|f| f.venue == *venue && f.symbol == *sym)
-            else {
-                // No print this tick: an open pair can still exit on its
-                // stored history instead of persisting on a dead feed.
-                if is_open && self.should_exit(*venue, sym) {
-                    self.mark_closed(*venue, sym);
-                }
-                continue;
-            };
-            let ann = fr.annualized_bps();
-            self.record(*venue, sym, ann);
-            if is_open {
-                // S4: time the exit — flip below threshold closes, no churn.
+                .find(|f| f.venue == *venue && f.symbol == *sym);
+            if let Some(fr) = print {
+                self.record(*venue, sym, fr.annualized_bps());
+            }
+            if let Some(qty) = open_qty {
+                // S4 exit is a real closing intent, emitted until a fill
+                // is noted back. Without a fresh book there is no honest
+                // exit price, so the position stays open.
                 if self.should_exit(*venue, sym) {
-                    self.mark_closed(*venue, sym);
+                    if let Some(book) = fresh_book {
+                        if let (Some(bid), Some(ask)) = (book.best_bid(), book.best_ask()) {
+                            out.push(Intent {
+                                strategy: self.name().into(),
+                                expected_edge_bps: Decimal::ZERO,
+                                ttl_ms: self.params.ttl_ms,
+                                created_ms: view.now_ms,
+                                roundtrip: false,
+                                legs: vec![
+                                    TradeLeg {
+                                        venue: *venue,
+                                        symbol: sym.clone(),
+                                        side: Side::Sell,
+                                        price: bid.price,
+                                        qty_base: qty,
+                                        market: MarketKind::Spot,
+                                    },
+                                    TradeLeg {
+                                        venue: *venue,
+                                        symbol: sym.clone(),
+                                        side: Side::Buy,
+                                        price: ask.price,
+                                        qty_base: qty,
+                                        market: MarketKind::Perp,
+                                    },
+                                ],
+                            });
+                        }
+                    }
                 }
                 continue;
             }
-            // Entry cost: two taker fees + slip, amortized must stay well below funding.
+            let Some(fr) = print else { continue };
+            let ann = fr.annualized_bps();
+            // Reserve both crossings. Annualizing the round-trip cost over
+            // the planned hold makes it comparable with annualized funding.
             let entry_cost_bps =
                 venue.default_taker_bps() * Decimal::TWO + self.params.slip_buffer_bps;
-            if ann < self.min_annualized_bps + entry_cost_bps {
+            let round_trip_cost_bps = entry_cost_bps * Decimal::TWO;
+            let expected_edge_bps = ann
+                - round_trip_cost_bps * Decimal::new(8_760, 0)
+                    / self.planned_hold_hours.max(Decimal::ONE);
+            if ann < self.min_annualized_bps || expected_edge_bps <= Decimal::ZERO {
                 continue;
             }
-            let Some(book) = view.book(*venue, sym) else {
-                continue;
-            };
-            if !fresh(book, view.now_ms, self.params.max_book_age_ms) {
-                continue;
-            }
+            let Some(book) = fresh_book else { continue };
             let Some(ask) = book.best_ask() else { continue };
             // Single-venue entry: shrink to the venue-share cap instead of
             // emitting an intent the engine's risk gate would only reject.
@@ -208,11 +265,9 @@ impl Strategy for FundingStrategy {
             if qty <= Decimal::ZERO {
                 continue;
             }
-            // Legs: Spot buy + Perp sell on the same venue. Edge reported is
-            // annualized funding net of entry costs.
             out.push(Intent {
                 strategy: self.name().into(),
-                expected_edge_bps: ann - entry_cost_bps,
+                expected_edge_bps,
                 ttl_ms: self.params.ttl_ms,
                 created_ms: view.now_ms,
                 roundtrip: false,
@@ -316,15 +371,104 @@ mod tests {
         // Regression: the intent alone must not open the pair — only a
         // fill may, or failed fills strand phantoms that never close.
         assert!(st.open_pairs().is_empty());
-        st.note_opened(Venue::Bybit, &s);
+        st.note_opened(Venue::Bybit, &s, hits[0].legs[0].qty_base);
         assert_eq!(st.open_pairs().len(), 1);
-        st.note_opened(Venue::Bybit, &s);
+        st.note_opened(Venue::Bybit, &s, hits[0].legs[0].qty_base);
         assert_eq!(st.open_pairs().len(), 1, "retries must not double-open");
         // Regression: must not re-fire every tick while the position is open.
         assert!(st.on_tick(&v).is_empty(), "open pair must not churn");
         assert_eq!(st.open_pairs().len(), 1);
         st.mark_closed(Venue::Bybit, &s);
         assert_eq!(st.on_tick(&v).len(), 1, "closed pair may re-enter");
+    }
+
+    #[test]
+    fn entry_reserves_round_trip_fees_over_planned_hold() {
+        // 547.5 bps/yr clears the old annualized gate, but over a 30-day
+        // planned hold it accrues only ~45 bps, less than the ~50 bps
+        // entry + exit taker/slip round trip on a 10bp venue.
+        let s = Symbol::new("BTC", "USDT");
+        let mut st = FundingStrategy::new(
+            StrategyParams::default(),
+            dec!(500),
+            vec![(Venue::Bybit, s.clone())],
+        );
+        let mut v = MarketView {
+            now_ms: 1_000,
+            ..Default::default()
+        };
+        let mut b = OrderBook::new(Venue::Bybit, s.clone());
+        b.apply_snapshot(
+            vec![BookLevel {
+                price: dec!(100),
+                qty: dec!(10),
+            }],
+            vec![BookLevel {
+                price: dec!(100.1),
+                qty: dec!(10),
+            }],
+            1,
+            1_000,
+        );
+        v.put(b);
+        v.funding.push(FundingRate {
+            venue: Venue::Bybit,
+            symbol: s,
+            rate_per_interval: dec!(0.00005),
+            interval_hours: dec!(8),
+            next_funding_ms: 0,
+        });
+        assert!(st.on_tick(&v).is_empty());
+    }
+
+    #[test]
+    fn exit_emits_sell_spot_and_buy_perp_legs() {
+        let s = Symbol::new("BTC", "USDT");
+        let mut st = FundingStrategy::new(
+            StrategyParams::default(),
+            dec!(500),
+            vec![(Venue::Bybit, s.clone())],
+        )
+        .with_exit(1, dec!(500));
+        let mut v = MarketView {
+            now_ms: 1_000,
+            ..Default::default()
+        };
+        let mut b = OrderBook::new(Venue::Bybit, s.clone());
+        b.apply_snapshot(
+            vec![BookLevel {
+                price: dec!(100),
+                qty: dec!(10),
+            }],
+            vec![BookLevel {
+                price: dec!(100.1),
+                qty: dec!(10),
+            }],
+            1,
+            1_000,
+        );
+        v.put(b);
+        v.funding.push(FundingRate {
+            venue: Venue::Bybit,
+            symbol: s.clone(),
+            rate_per_interval: dec!(0.0005),
+            interval_hours: dec!(8),
+            next_funding_ms: 0,
+        });
+        let entry = st.on_tick(&v);
+        assert_eq!(entry.len(), 1);
+        let qty = entry[0].legs[0].qty_base;
+        st.note_opened(Venue::Bybit, &s, qty);
+
+        v.funding[0].rate_per_interval = dec!(0.00001);
+        let exit = st.on_tick(&v);
+        assert_eq!(exit.len(), 1, "exit must be a real closing intent");
+        assert_eq!(exit[0].legs[0].market, MarketKind::Spot);
+        assert_eq!(exit[0].legs[0].side, Side::Sell);
+        assert_eq!(exit[0].legs[0].qty_base, qty);
+        assert_eq!(exit[0].legs[1].market, MarketKind::Perp);
+        assert_eq!(exit[0].legs[1].side, Side::Buy);
+        assert_eq!(exit[0].legs[1].qty_base, qty);
     }
 
     #[test]
@@ -391,9 +535,9 @@ mod tests {
             vec![(Venue::Bybit, s.clone())],
         )
         .with_open_pairs(vec![
-            (Venue::Bybit, s.clone()),
-            (Venue::Bybit, s.clone()), // duplicate is deduped
-            (Venue::Okx, Symbol::new("ETH", "USDT")), // unconfigured: ignored
+            (Venue::Bybit, s.clone(), dec!(1)),
+            (Venue::Bybit, s.clone(), dec!(1)), // duplicate is deduped
+            (Venue::Okx, Symbol::new("ETH", "USDT"), dec!(1)), // unconfigured: ignored
         ]);
         assert_eq!(st.open_pairs().len(), 1);
         let mut v = MarketView {
@@ -430,7 +574,7 @@ mod tests {
     }
 
     #[test]
-    fn open_pair_exits_without_fresh_print() {
+    fn open_pair_without_fresh_book_stays_open() {
         use crate::Strategy;
         let s = Symbol::new("BTC", "USDT");
         let mut st = FundingStrategy::new(
@@ -441,15 +585,16 @@ mod tests {
         .with_exit(2, dec!(500));
         st.record(Venue::Bybit, &s, dec!(100));
         st.record(Venue::Bybit, &s, dec!(100));
-        st.open.push((Venue::Bybit, s.clone()));
-        // No funding print in view: exit must still fire from history.
+        st.note_opened(Venue::Bybit, &s, dec!(1));
+        // History says exit, but with no executable book the position
+        // cannot honestly close, so it remains open for a later tick.
         let v = MarketView {
             now_ms: 1_000,
             ..Default::default()
         };
         assert!(st.on_tick(&v).is_empty());
-        assert!(st.open_pairs().is_empty());
-        assert_eq!(st.drain_closed(), vec![(Venue::Bybit, s)]);
+        assert_eq!(st.open_pairs(), vec![(Venue::Bybit, s, dec!(1))]);
+        assert!(st.drain_closed().is_empty());
     }
 
     #[test]

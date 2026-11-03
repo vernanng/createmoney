@@ -183,8 +183,9 @@ pub fn resolve_usdt_idr(
         };
     };
     let Some(consensus) = consensus_mid else {
+        // A single-source divisor is evidence for health reporting only;
+        // it must never convert executable books.
         return RateDecision {
-            rate: Some(rate),
             state: RateState::Unchecked,
             ..base
         };
@@ -337,11 +338,14 @@ mod tests {
     }
 
     #[test]
-    fn primary_without_crosscheck_is_flagged_unchecked() {
+    fn primary_without_crosscheck_is_withheld_unchecked() {
         let b = book(dec!(18111), dec!(18112), NOW);
         let d = resolve(Some(&b), &[]);
         assert_eq!(d.state, RateState::Unchecked);
-        assert!(d.rate.is_some());
+        assert!(
+            d.rate.is_none(),
+            "single-source divisor must not convert books"
+        );
         assert!(d.degraded());
     }
 

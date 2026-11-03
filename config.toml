@@ -20,16 +20,18 @@ cex_dex = true
 min_edge_bps = 15
 slip_buffer_bps = 5
 target_notional_quote = 500  # base size; S2/S5 grow it while depth stays profitable
+min_notional_quote = 500     # cross_exchange hard floor: below this, fixed transfer friction wins
+rebalance_cost_bps = 20      # $1 eventual transfer amortised over a $500 inventory batch
 max_venue_quote_share_bps = 2500  # one intent may spend <=25% of a venue's USDT+USDC; 0 = off
 max_book_age_ms = 2000
 ttl_ms = 1500
 min_funding_annualized_bps = 500
-dex_max_quote_age_ms = 30000  # polled DEX quotes older than this never reach cex_dex
+funding_planned_hold_hours = 720  # entry+exit fees must be recovered within 30 days
+dex_max_quote_age_ms = 2000  # DEX quotes are executable only while as fresh as CEX books
 imbalance_threshold = 0.1  # S6 gate on cross_exchange; off unless set
 
 [indodax]
-usd_idr = 18000        # fallback reference for the FX-triangle strategy; book conversion always uses the streamed live rate
-rate_max_age_ms = 30000        # live USDT/IDR book older than this stops being the divisor
+rate_max_age_ms = 2000         # divisor no older than the books it converts
 rate_max_spread_bps = 50       # live USDT/IDR top-of-book spread cap (bps of mid)
 rate_max_deviation_bps = 300   # vs independent consensus (Upbit ID + implied crosses); beyond it Indodax is withheld
 

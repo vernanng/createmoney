@@ -125,11 +125,17 @@ pub struct ParamsCfg {
     pub min_edge_bps: Decimal,
     pub slip_buffer_bps: Decimal,
     pub target_notional_quote: Decimal,
+    #[serde(default)]
+    pub min_notional_quote: Decimal,
+    #[serde(default)]
+    pub rebalance_cost_bps: Decimal,
     pub max_book_age_ms: i64,
     #[serde(default = "default_ttl")]
     pub ttl_ms: i64,
     #[serde(default = "default_min_funding")]
     pub min_funding_annualized_bps: Decimal,
+    #[serde(default = "default_funding_planned_hold_hours")]
+    pub funding_planned_hold_hours: Decimal,
     /// S6 gate: None = off (legacy behavior). Some(t) requires both-sided
     /// imbalance agreement at threshold t before `cross_exchange` emits.
     #[serde(default)]
@@ -145,10 +151,13 @@ pub struct ParamsCfg {
     pub dex_max_quote_age_ms: i64,
 }
 fn default_dex_max_quote_age() -> i64 {
-    30_000
+    2_000
 }
 fn default_max_venue_share() -> Decimal {
     Decimal::new(2500, 0)
+}
+fn default_funding_planned_hold_hours() -> Decimal {
+    Decimal::new(720, 0)
 }
 fn default_ttl() -> i64 {
     1_500
@@ -163,6 +172,8 @@ impl ParamsCfg {
             min_edge_bps: self.min_edge_bps,
             slip_buffer_bps: self.slip_buffer_bps,
             target_notional_quote: self.target_notional_quote,
+            min_notional_quote: self.min_notional_quote,
+            rebalance_cost_bps: self.rebalance_cost_bps,
             max_book_age_ms: self.max_book_age_ms,
             ttl_ms: self.ttl_ms,
             dex_max_quote_age_ms: self.dex_max_quote_age_ms,
@@ -262,12 +273,6 @@ fn default_true() -> bool {
 
 #[derive(Debug, Deserialize)]
 pub struct IndodaxCfg {
-    /// Fallback USD/IDR reference for the FX-triangle strategy's own math.
-    /// Book conversion itself always uses the streamed live rate
-    /// (see `arb_feed::fx`) and withholds Indodax books when no live
-    /// rate is acceptable.
-    #[serde(default = "default_usdidr")]
-    pub usd_idr: Decimal,
     /// Max age of the Indodax USDT/IDR book before it stops being a divisor.
     #[serde(default = "default_rate_max_age_ms")]
     pub rate_max_age_ms: i64,
@@ -285,18 +290,14 @@ pub struct IndodaxCfg {
 impl Default for IndodaxCfg {
     fn default() -> Self {
         Self {
-            usd_idr: default_usdidr(),
             rate_max_age_ms: default_rate_max_age_ms(),
             rate_max_spread_bps: default_rate_max_spread_bps(),
             rate_max_deviation_bps: default_rate_max_deviation_bps(),
         }
     }
 }
-fn default_usdidr() -> Decimal {
-    Decimal::new(16_000, 0)
-}
 fn default_rate_max_age_ms() -> i64 {
-    30_000
+    2_000
 }
 fn default_rate_max_spread_bps() -> Decimal {
     Decimal::new(50, 0)
@@ -347,10 +348,10 @@ max_book_age_ms = 2000
         // No [indodax] table at all: live-rate guards still get real
         // defaults, not zeroes (serde field defaults do not run when the
         // whole table is defaulted).
-        assert_eq!(cfg.indodax.rate_max_age_ms, 30_000);
+        assert_eq!(cfg.params.dex_max_quote_age_ms, 2_000);
+        assert_eq!(cfg.indodax.rate_max_age_ms, 2_000);
         assert_eq!(cfg.indodax.rate_max_spread_bps, Decimal::new(50, 0));
         assert_eq!(cfg.indodax.rate_max_deviation_bps, Decimal::new(300, 0));
-        assert_eq!(cfg.indodax.usd_idr, Decimal::new(16_000, 0));
     }
 
     #[test]

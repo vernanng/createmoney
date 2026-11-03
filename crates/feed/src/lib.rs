@@ -347,20 +347,30 @@ fn kraken_levels(arr: &Value) -> Result<Vec<BookLevel>, FeedError> {
     Ok(out)
 }
 
-/// Convert an IDR-quoted book to USD terms with a reference USD/IDR rate.
-/// Returns a new book; quantities (base asset) are unchanged, prices divided by rate.
-pub fn idr_book_to_usd(book: &OrderBook, usd_idr: Decimal) -> OrderBook {
+/// Convert an IDR-quoted book to executable USDT terms: bids divide by
+/// the FX ask (buying USDT with received IDR), asks by the FX bid
+/// (selling USDT for IDR to pay). Quantities are unchanged; the output
+/// is only as fresh as the older of book and divisor.
+pub fn idr_book_to_usd(book: &OrderBook, rate: &UsdtIdrRate) -> OrderBook {
     let mut out = OrderBook::new(book.venue, Symbol::new(&book.symbol.base, "USDT"));
-    if usd_idr <= Decimal::ZERO {
+    if rate.bid <= Decimal::ZERO || rate.ask <= Decimal::ZERO {
         return out;
     }
-    let conv = |l: BookLevel| BookLevel {
-        price: l.price / usd_idr,
-        qty: l.qty,
+    let conv = |levels: Vec<BookLevel>, divisor: Decimal| {
+        levels
+            .into_iter()
+            .map(|l| BookLevel {
+                price: l.price / divisor,
+                qty: l.qty,
+            })
+            .collect::<Vec<_>>()
     };
-    let bids: Vec<_> = book.bids_vec().into_iter().map(conv).collect();
-    let asks: Vec<_> = book.asks_vec().into_iter().map(conv).collect();
-    out.apply_snapshot(bids, asks, book.last_update_id, book.ts_ms);
+    out.apply_snapshot(
+        conv(book.bids_vec(), rate.ask),
+        conv(book.asks_vec(), rate.bid),
+        book.last_update_id,
+        book.ts_ms.min(rate.ts_ms),
+    );
     out
 }
 
@@ -435,8 +445,20 @@ mod tests {
             10,
         )
         .unwrap();
-        let usd = idr_book_to_usd(&b, dec!(16000));
-        assert_eq!(usd.best_bid().unwrap().price, dec!(100000));
+        let rate =
+            UsdtIdrRate::from_bid_ask(dec!(15840), dec!(16160), 9, 10, 2_000, dec!(300)).unwrap();
+        let usd = idr_book_to_usd(&b, &rate);
+        // Executable sides cross the FX spread: bid at the FX ask, ask at
+        // the FX bid. The converted book is only as fresh as its divisor.
+        assert_eq!(
+            usd.best_bid().unwrap().price,
+            dec!(1600000000) / dec!(16160)
+        );
+        assert_eq!(
+            usd.best_ask().unwrap().price,
+            dec!(1616000000) / dec!(15840)
+        );
+        assert_eq!(usd.ts_ms, 9);
         assert_eq!(usd.symbol.quote, "USDT");
     }
 

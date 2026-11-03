@@ -1,7 +1,9 @@
 //! Cross-exchange spot: buy the cheap venue, sell the rich venue.
 //! Assumes pre-funded inventory on every venue (no transfers in the loop).
 
-use crate::{fresh, imbalance::both_sided_agrees, MarketView, Strategy, StrategyParams};
+use crate::{
+    fresh, imbalance::both_sided_agrees, GateRejections, MarketView, Strategy, StrategyParams,
+};
 use arb_core::{net_edge_bps, Intent, MarketKind, Side, Symbol, TradeLeg, Venue};
 use rust_decimal::Decimal;
 
@@ -12,6 +14,7 @@ pub struct CrossExchange {
     /// S6: None = off (default, preserves legacy behavior). Some(t) requires
     /// both-sided imbalance agreement at threshold t before emitting.
     pub imbalance_threshold: Option<Decimal>,
+    gate_rejections: GateRejections,
 }
 
 impl CrossExchange {
@@ -21,6 +24,7 @@ impl CrossExchange {
             venues,
             symbols,
             imbalance_threshold: None,
+            gate_rejections: GateRejections::default(),
         }
     }
 
@@ -31,8 +35,8 @@ impl CrossExchange {
 }
 
 /// S2 dynamic sizing: no fixed grid. For each venue pair, walk the two books
-/// level by level and keep the largest quantity whose combined VWAP still
-/// clears `min_edge_bps` net of fees. Size follows the opportunity.
+/// level by level and stop at the first marginal chunk that does not clear
+/// `min_edge_bps` net of fees. Size follows the opportunity.
 fn max_profitable_qty(
     asks: &[arb_core::BookLevel],
     bids: &[arb_core::BookLevel],
@@ -52,6 +56,18 @@ fn max_profitable_qty(
     while ai < asks.len() && bi < bids.len() {
         let q = aq.min(bq);
         if q <= Decimal::ZERO {
+            break;
+        }
+        // Marginal depth must clear the same floor; a passing average must
+        // not drag in loss-making tail chunks.
+        if net_edge_bps(
+            asks[ai].price,
+            bids[bi].price,
+            buy_fee_bps,
+            sell_fee_bps,
+            slip_buffer_bps,
+        ) < min_edge_bps
+        {
             break;
         }
         cost += q * asks[ai].price;
@@ -88,19 +104,25 @@ impl Strategy for CrossExchange {
 
     fn on_tick(&mut self, view: &MarketView) -> Vec<Intent> {
         let mut out = Vec::new();
-        for sym in &self.symbols {
+        let symbols = self.symbols.clone();
+        for sym in &symbols {
             if let Some(intent) = self.best_sized_intent(view, sym) {
                 out.push(intent);
             }
         }
         out
     }
+
+    fn gate_rejections(&self) -> GateRejections {
+        self.gate_rejections
+    }
 }
 
 impl CrossExchange {
     /// S2: size each venue pair to its profitable depth, keep the best edge.
     /// Returns None when no pair clears `min_edge_bps` at any quantity.
-    fn best_sized_intent(&self, view: &MarketView, sym: &Symbol) -> Option<Intent> {
+    fn best_sized_intent(&mut self, view: &MarketView, sym: &Symbol) -> Option<Intent> {
+        let effective_slip_bps = self.params.slip_buffer_bps + self.params.rebalance_cost_bps;
         // (buy_v, sell_v, qty, buy_px, sell_px, edge)
         let mut best: Option<(Venue, Venue, Decimal, Decimal, Decimal, Decimal)> = None;
         for buy_v in &self.venues {
@@ -110,19 +132,23 @@ impl CrossExchange {
                 }
                 let (Some(buy_b), Some(sell_b)) = (view.book(*buy_v, sym), view.book(*sell_v, sym))
                 else {
+                    self.gate_rejections.stale_or_missing += 1;
                     continue;
                 };
                 if !fresh(buy_b, view.now_ms, self.params.max_book_age_ms)
                     || !fresh(sell_b, view.now_ms, self.params.max_book_age_ms)
                 {
+                    self.gate_rejections.stale_or_missing += 1;
                     continue;
                 }
                 // S6 gate: require both-sided imbalance agreement when enabled.
                 if let Some(t) = self.imbalance_threshold {
                     let (Some(bq), Some(sq)) = (buy_b.quote(), sell_b.quote()) else {
+                        self.gate_rejections.stale_or_missing += 1;
                         continue;
                     };
                     if !both_sided_agrees(&bq, &sq, t) {
+                        self.gate_rejections.imbalance += 1;
                         continue;
                     }
                 }
@@ -131,17 +157,23 @@ impl CrossExchange {
                     &sell_b.bids_vec(),
                     buy_v.default_taker_bps(),
                     sell_v.default_taker_bps(),
-                    self.params.slip_buffer_bps,
+                    effective_slip_bps,
                     self.params.min_edge_bps,
                 ) else {
+                    self.gate_rejections.edge += 1;
                     continue;
                 };
+                // Dust cannot cover fixed transfer friction, even at a real spread.
+                if qty * buy_px < self.params.min_notional_quote {
+                    self.gate_rejections.min_notional += 1;
+                    continue;
+                }
                 let edge = net_edge_bps(
                     buy_px,
                     sell_px,
                     buy_v.default_taker_bps(),
                     sell_v.default_taker_bps(),
-                    self.params.slip_buffer_bps,
+                    effective_slip_bps,
                 );
                 let replace = best
                     .map(|(_, _, q, _, _, e)| edge > e || (edge == e && qty > q))
@@ -240,6 +272,23 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].legs[0].venue, Venue::Binance);
         assert_eq!(hits[0].legs[1].venue, Venue::Bybit);
+    }
+
+    #[test]
+    fn below_min_notional_is_rejected() {
+        let params = StrategyParams {
+            min_notional_quote: dec!(2000),
+            ..StrategyParams::default()
+        };
+        let mut st = CrossExchange::new(
+            params,
+            vec![Venue::Binance, Venue::Bybit],
+            vec![Symbol::new("BTC", "USDT")],
+        );
+        assert!(
+            st.on_tick(&view(dec!(1.00))).is_empty(),
+            "a $1,000.50 opportunity must not emit below the $2,000 target floor"
+        );
     }
 
     #[test]
@@ -343,6 +392,104 @@ mod tests {
         let hits = st.on_tick(&v);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].legs[0].qty_base, dec!(100));
+    }
+
+    #[test]
+    fn marginal_depth_below_edge_stops_sizing() {
+        // First 9 units clear the edge; the 10th is loss-making at the
+        // margin even though the 10-unit average still passes. Sizing
+        // must stop at 9 instead of diluting into negative marginal depth.
+        let s = Symbol::new("BTC", "USDT");
+        let mut v = MarketView {
+            now_ms: 1_000,
+            ..Default::default()
+        };
+        let mut a = OrderBook::new(Venue::Binance, s.clone());
+        a.apply_snapshot(
+            vec![BookLevel {
+                price: dec!(100),
+                qty: dec!(10),
+            }],
+            vec![
+                BookLevel {
+                    price: dec!(100.05),
+                    qty: dec!(9),
+                },
+                BookLevel {
+                    price: dec!(100.90),
+                    qty: dec!(1),
+                },
+            ],
+            1,
+            1_000,
+        );
+        let mut b = OrderBook::new(Venue::Bybit, s.clone());
+        b.apply_snapshot(
+            vec![BookLevel {
+                price: dec!(101),
+                qty: dec!(10),
+            }],
+            vec![BookLevel {
+                price: dec!(101.05),
+                qty: dec!(10),
+            }],
+            1,
+            1_000,
+        );
+        v.put(a);
+        v.put(b);
+        let mut st = CrossExchange::new(
+            StrategyParams::default(),
+            vec![Venue::Binance, Venue::Bybit],
+            vec![s],
+        );
+        let hits = st.on_tick(&v);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].legs[0].qty_base, dec!(9));
+    }
+
+    #[test]
+    fn amortised_rebalance_cost_can_block_thin_edge() {
+        let symbols = vec![Symbol::new("BTC", "USDT")];
+        let venues = vec![Venue::Binance, Venue::Bybit];
+        let mut free =
+            CrossExchange::new(StrategyParams::default(), venues.clone(), symbols.clone());
+        assert_eq!(free.on_tick(&view(dec!(0.60))).len(), 1);
+
+        let params = StrategyParams {
+            rebalance_cost_bps: dec!(50),
+            ..StrategyParams::default()
+        };
+        let mut priced = CrossExchange::new(params, venues, symbols);
+        assert!(
+            priced.on_tick(&view(dec!(0.60))).is_empty(),
+            "60bps gross cannot clear fees + slip + 50bps amortised rebalance"
+        );
+    }
+
+    #[test]
+    fn gate_rejections_attribute_edge_imbalance_and_min_notional() {
+        let venues = vec![Venue::Binance, Venue::Bybit];
+        let symbols = vec![Symbol::new("BTC", "USDT")];
+
+        let mut edge =
+            CrossExchange::new(StrategyParams::default(), venues.clone(), symbols.clone());
+        assert!(edge.on_tick(&view(dec!(0.10))).is_empty());
+        assert!(edge.gate_rejections().edge > 0);
+
+        let mut imbalance =
+            CrossExchange::new(StrategyParams::default(), venues.clone(), symbols.clone())
+                .with_imbalance(Decimal::new(2, 1));
+        assert!(imbalance.on_tick(&view(dec!(1.00))).is_empty());
+        assert!(imbalance.gate_rejections().imbalance > 0);
+
+        let params = StrategyParams {
+            min_notional_quote: dec!(2000),
+            ..StrategyParams::default()
+        };
+        let mut min_notional = CrossExchange::new(params, venues, symbols);
+        assert!(min_notional.on_tick(&view(dec!(1.00))).is_empty());
+        assert!(min_notional.gate_rejections().min_notional > 0);
     }
 
     #[test]
