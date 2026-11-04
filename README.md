@@ -248,9 +248,9 @@ no GitHub Actions in the gate, no live mode, no keys:
 - `deploy` — builds `ghcr.io/vernanng/createmoney:latest` from this
   checkout (run it at the merged commit), rotates the previous
   `cd-data/paper-trades.jsonl` to a `.bak-<ts>` file so the iteration
-  starts clean, restarts the CD stack, and stops Watchtower so only
-  this loop deploys (restart it with `docker compose -f
-  docker-compose.cd.yml up -d watchtower`).
+  starts clean, and restarts the CD stack. Watchtower is paused
+  during the swap and resumed before `deploy` returns, so GHCR CD
+  stays on afterwards.
 
 The loop judges iterations on the 24 h bar above; the 7-day green
 gate below still governs any live promotion — an autoloop "profit"
