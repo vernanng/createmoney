@@ -401,8 +401,8 @@ fn autoloop_ship(title: &str, body: Option<&str>) -> i32 {
 
 /// Local-only CD: build the soak image from this checkout (must hold
 /// the merged commit), rotate the previous paper-trade log aside so
-/// the iteration starts clean, restart the CD stack, and stop
-/// Watchtower so only this loop deploys.
+/// the iteration starts clean, and restart the CD stack. Watchtower
+/// is paused during the swap and resumed before returning.
 fn autoloop_deploy(root: &Path) -> i32 {
     let code = run_cmd(
         root,
@@ -432,7 +432,7 @@ fn autoloop_deploy(root: &Path) -> i32 {
     if code != 0 {
         return code;
     }
-    // Loop owns deploys now; GHCR auto-update would revert local builds.
+    // Pause Watchtower during the swap so a poll cannot race the retag.
     run_cmd(
         root,
         "docker",
@@ -444,15 +444,31 @@ fn autoloop_deploy(root: &Path) -> i32 {
             "watchtower",
         ],
     );
+    let mut code = 1;
     for _ in 0..30 {
         if http_get_status().is_some() {
             println!("autoloop deploy: engine healthy at 127.0.0.1:8787");
-            return 0;
+            code = 0;
+            break;
         }
         std::thread::sleep(std::time::Duration::from_secs(2));
     }
-    eprintln!("autoloop deploy: engine did not answer /status within 60s");
-    1
+    if code != 0 {
+        eprintln!("autoloop deploy: engine did not answer /status within 60s");
+    }
+    // Resume Watchtower either way: stopped, it silently disables GHCR CD.
+    run_cmd(
+        root,
+        "docker",
+        &[
+            "compose",
+            "-f",
+            "docker-compose.cd.yml",
+            "start",
+            "watchtower",
+        ],
+    );
+    code
 }
 
 #[cfg(test)]
